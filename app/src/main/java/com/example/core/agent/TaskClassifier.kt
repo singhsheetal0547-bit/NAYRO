@@ -25,7 +25,10 @@ data class ResolvedIntent(
 object TaskClassifier {
 
     fun classify(prompt: String): ResolvedIntent {
-        val trimmed = prompt.trim()
+        val stripped = prompt.trim()
+            .replaceFirst(Regex("^(?i)(hey babu|hi babu|babu|hey nayro|hi nayro|nayro|hey cutie)\\s*,?\\s*"), "")
+            .trim()
+        val trimmed = if (stripped.isNotBlank()) stripped else prompt.trim()
         val lower = trimmed.lowercase()
 
         // 1. Memory Save Intent
@@ -61,6 +64,22 @@ object TaskClassifier {
                 type = UserIntentType.LOCAL_TIME,
                 rawPrompt = prompt
             )
+        }
+
+        // 4b. Local Calculator Intent (e.g. "calculate (25 + 15) * 2", "hisab karo: 100 / 4", "(25 + 15) * 2")
+        val isExplicitCalc = lower.startsWith("calculate") || lower.startsWith("hisab karo") || lower.startsWith("solve") || lower.startsWith("math:")
+        val isPureMathExpr = trimmed.matches(Regex("^[\\s\\(\\)\\d\\+\\-\\*/\\.\\^xX÷×]+$")) &&
+                (trimmed.contains("+") || trimmed.contains("-") || trimmed.contains("*") || trimmed.contains("/") || trimmed.contains("×") || trimmed.contains("÷"))
+
+        if (isExplicitCalc || isPureMathExpr) {
+            val expr = trimmed.replaceFirst(Regex("^(?i)(calculate:|calculate|hisab karo:|hisab karo|solve:|solve|math:)\\s*"), "").trim()
+            if (expr.isNotEmpty()) {
+                return ResolvedIntent(
+                    type = UserIntentType.LOCAL_CALCULATOR,
+                    searchQueryOrContent = expr,
+                    rawPrompt = prompt
+                )
+            }
         }
 
         // 5. Message Draft Intent (e.g. WhatsApp kholo aur Rahul ke liye message likho: ...)

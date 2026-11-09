@@ -492,8 +492,8 @@ fun NayroAppContent(
             pendingConfirmation?.let { conf ->
                 com.example.ui.components.ConfirmationDialog(
                     confirmation = conf,
-                    onConfirm = { agentRuntime.confirmationManager.approve() },
-                    onReject = { agentRuntime.confirmationManager.reject() }
+                    onConfirm = { agentRuntime.confirmationManager.approve(conf.actionId, conf.parameters) },
+                    onReject = { agentRuntime.confirmationManager.reject(conf.actionId) }
                 )
             }
         }

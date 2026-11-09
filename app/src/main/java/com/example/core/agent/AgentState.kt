@@ -14,5 +14,6 @@ sealed class AgentState {
     data class ExecutingTask(val task: AgentTask, val currentAction: AgentAction, val step: Int, val totalSteps: Int) : AgentState()
     data class ExecutingAction(val toolName: String) : AgentState()
     data class Completed(val responseText: String) : AgentState()
+    data class Cancelled(val reason: String) : AgentState()
     data class Error(val message: String) : AgentState()
 }

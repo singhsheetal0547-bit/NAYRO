@@ -1,6 +1,8 @@
 package com.example.core.agent
 
 import android.content.Context
+import com.example.core.accessibility.ActionExecutionGuard
+import com.example.core.accessibility.GuardEvaluation
 import com.example.core.capability.CapabilityManager
 import com.example.core.memory.MemoryManager
 import com.example.core.memory.NotebookManager
@@ -100,32 +102,90 @@ class AgentRuntime(
         for ((index, action) in task.actions.withIndex()) {
             task.currentActionIndex = index
 
-            // Confirmation Guard for R3 actions
-            var isUserConfirmed = false
+            // 1. Asynchronous Confirmation Guard for R3 and sensitive actions
+            var pending: PendingConfirmation? = null
             if (action.riskLevel.requiresConfirmation || action.actionType == ActionType.ASK_USER_CONFIRMATION) {
                 taskStateManager.transition(task, TaskState.WAITING_FOR_CONFIRMATION)
-                val pending = PendingConfirmation(
+                val p = PendingConfirmation(
                     taskId = task.taskId,
                     actionId = action.actionId,
+                    actionType = action.actionType,
                     title = "Confirm ${action.actionType.name}",
                     description = "Target: ${action.target ?: "System"}, Params: ${action.parameters}",
                     target = action.target,
                     parameters = action.parameters,
                     riskLevel = action.riskLevel
                 )
-                confirmationManager.requestConfirmation(pending)
-                _currentState.value = AgentState.WaitingForConfirmation(pending)
-                // For demonstration / non-blocking agent pipeline, confirm intent
-                isUserConfirmed = true
+                pending = p
+                _currentState.value = AgentState.WaitingForConfirmation(p)
+
+                val confirmationStatus = confirmationManager.awaitConfirmation(p, timeoutMs = 60_000L)
+                when (confirmationStatus) {
+                    ConfirmationStatus.REJECTED -> {
+                        val cancelMsg = "Action was cancelled: user rejected confirmation for ${action.actionType.name}."
+                        taskStateManager.transition(task, TaskState.CANCELLED, cancelMsg)
+                        _currentState.value = AgentState.Cancelled(cancelMsg)
+                        recordTaskHistory(task, "CANCELLED", cancelMsg, startTime)
+                        return cancelMsg
+                    }
+                    ConfirmationStatus.EXPIRED -> {
+                        val timeoutMsg = "Action timed out waiting for user confirmation."
+                        taskStateManager.transition(task, TaskState.FAILED, timeoutMsg)
+                        _currentState.value = AgentState.Error(timeoutMsg)
+                        recordTaskHistory(task, "FAILED", timeoutMsg, startTime)
+                        return timeoutMsg
+                    }
+                    ConfirmationStatus.CONFIRMED -> {
+                        // User approved authentic action
+                    }
+                    else -> {
+                        val failMsg = "Action confirmation failed or was cancelled."
+                        taskStateManager.transition(task, TaskState.FAILED, failMsg)
+                        _currentState.value = AgentState.Error(failMsg)
+                        recordTaskHistory(task, "FAILED", failMsg, startTime)
+                        return failMsg
+                    }
+                }
             }
 
-            // Execute Action
+            // 2. Centralized ActionExecutionGuard Security Gate
+            val isCapAvail = action.requiredCapability?.let { capabilityManager.isCapabilityAvailable(it) } ?: true
+            val isPermGranted = action.requiredPermission?.let { permissionManager.isPermissionGranted(it) } ?: true
+            val guardResult = ActionExecutionGuard.validateExecution(
+                action = action,
+                isCapabilityAvailable = isCapAvail,
+                isPermissionGranted = isPermGranted,
+                confirmation = pending
+            )
+
+            when (guardResult) {
+                is GuardEvaluation.Blocked -> {
+                    val blockMsg = "Security Block: ${guardResult.reason}"
+                    taskStateManager.transition(task, TaskState.FAILED, blockMsg)
+                    AgentEventBus.emit(AgentEvent.ActionFailed(task.taskId, action.actionId, blockMsg))
+                    _currentState.value = AgentState.Error(blockMsg)
+                    recordTaskHistory(task, "FAILED", blockMsg, startTime)
+                    return blockMsg
+                }
+                is GuardEvaluation.RequiresConfirmation -> {
+                    val unconfMsg = "Security Block: Action requires confirmation: ${guardResult.reason}"
+                    taskStateManager.transition(task, TaskState.FAILED, unconfMsg)
+                    _currentState.value = AgentState.Error(unconfMsg)
+                    recordTaskHistory(task, "FAILED", unconfMsg, startTime)
+                    return unconfMsg
+                }
+                is GuardEvaluation.Allowed -> {
+                    // Passed security gate
+                }
+            }
+
+            // 3. Execute Action
             taskStateManager.transition(task, TaskState.EXECUTING)
             _currentState.value = AgentState.ExecutingTask(task, action, index + 1, task.actions.size)
             AgentEventBus.emit(AgentEvent.ActionStarted(task.taskId, action, index + 1, task.actions.size))
 
             val preSnapshot = screenIntelligenceManager.captureCurrentSnapshot()
-            val execResult = actionExecutor.execute(action, isConfirmed = isUserConfirmed)
+            val execResult = actionExecutor.execute(action, isConfirmed = (pending?.status == ConfirmationStatus.CONFIRMED))
 
             if (!execResult.isSuccess) {
                 isAllSuccess = false
@@ -137,23 +197,31 @@ class AgentRuntime(
                 return err
             }
 
-            // Verify Action
+            // 4. Verify Action Outcome
             taskStateManager.transition(task, TaskState.VERIFYING)
             val screenChange = screenIntelligenceManager.verifyScreenChange(preSnapshot)
             val verification = actionVerifier.verify(action, execResult, screenChange)
 
-            if (!verification.isVerified) {
-                isAllSuccess = false
-                val verifyFailMsg = "Verification failed on step ${index + 1}: ${verification.details}"
-                taskStateManager.transition(task, TaskState.FAILED, verifyFailMsg)
-                AgentEventBus.emit(AgentEvent.ActionFailed(task.taskId, action.actionId, verifyFailMsg))
-                _currentState.value = AgentState.Error(verifyFailMsg)
-                recordTaskHistory(task, "FAILED", verifyFailMsg, startTime)
-                return verifyFailMsg
+            when (verification.status) {
+                VerificationStatus.FAILED -> {
+                    isAllSuccess = false
+                    val verifyFailMsg = "Verification failed on step ${index + 1}: ${verification.details}"
+                    taskStateManager.transition(task, TaskState.FAILED, verifyFailMsg)
+                    AgentEventBus.emit(AgentEvent.ActionFailed(task.taskId, action.actionId, verifyFailMsg))
+                    _currentState.value = AgentState.Error(verifyFailMsg)
+                    recordTaskHistory(task, "FAILED", verifyFailMsg, startTime)
+                    return verifyFailMsg
+                }
+                VerificationStatus.INCONCLUSIVE -> {
+                    val honestMsg = "${execResult.output} (Note: Execution outcome could not be verified automatically)"
+                    AgentEventBus.emit(AgentEvent.ActionCompleted(task.taskId, action.actionId, honestMsg))
+                    outputBuilder.append(honestMsg).append("\n")
+                }
+                VerificationStatus.NOT_SUPPORTED, VerificationStatus.VERIFIED -> {
+                    AgentEventBus.emit(AgentEvent.ActionCompleted(task.taskId, action.actionId, execResult.output))
+                    outputBuilder.append(execResult.output).append("\n")
+                }
             }
-
-            AgentEventBus.emit(AgentEvent.ActionCompleted(task.taskId, action.actionId, execResult.output))
-            outputBuilder.append(execResult.output).append("\n")
         }
 
         // 5. Completion

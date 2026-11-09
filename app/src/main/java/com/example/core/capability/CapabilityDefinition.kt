@@ -51,4 +51,7 @@ data class CapabilityEvaluation(
     val statusReason: String,
     val isActionable: Boolean,
     val actionLabel: String? = null
-)
+) {
+    val isAvailable: Boolean get() = status == CapabilityStatus.AVAILABLE
+}
+

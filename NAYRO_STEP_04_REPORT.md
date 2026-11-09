@@ -84,7 +84,33 @@ Step 04 delivers the complete multi-system agentic architecture for NAYRO, trans
 
 ### 3. Verification & Test Results
 - **Compilation**: Succeeded cleanly (`compile_applet`).
-- **Unit Tests**: All 23 tests across `NayroCoreSystemsTest` and `NayroAgentStep04Tests` passed (`BUILD SUCCESSFUL in 39s`).
+- **Unit Tests**: All 37 tests across `NayroCoreSystemsTest` and `NayroAgentStep04Tests` passed (`BUILD SUCCESSFUL in 40s`).
 - **Physical Device Preconditions**:
   * Accessibility Service requires manual one-time user enablement in Android Accessibility Settings (`Settings -> Accessibility -> NAYRO`).
   * Overlay Permission requires user approval in Settings (`Display over other apps`).
+
+---
+
+### 4. Consolidated Bug Fix & Agentic Hardening Summary
+1. **Asynchronous Confirmation Security Gate**:
+   - Eliminated the synchronous confirmation bypass in `AgentRuntime.kt`.
+   - Wired `confirmationManager.awaitConfirmation(pending)` using `CompletableDeferred` with strict 60-second timeouts.
+   - Enforced parameter binding: any alteration to action parameters between proposal and confirmation causes immediate cancellation.
+   - User rejections immediately transition the task to `CANCELLED` and safely abort without executing any pending actions.
+2. **Centralized ActionExecutionGuard**:
+   - Every action proposal is gated through `ActionExecutionGuard.validateExecution()` prior to execution.
+   - Checks schema completeness, capability availability, runtime permissions, R4 financial prohibition, and valid unexpired confirmation tokens.
+3. **Real Action Verification**:
+   - Replaced false-positive success reporting in `ActionVerifier` with typed `VerificationStatus`: `VERIFIED`, `FAILED`, `INCONCLUSIVE`, `NOT_SUPPORTED`.
+   - Honest reporting: actions whose foreground state cannot be independently confirmed are flagged as `INCONCLUSIVE` rather than claiming verified success.
+4. **Local Math Calculator**:
+   - Engineered `LocalMathCalculator` with a pure Kotlin recursive descent AST parser for arithmetic evaluation (`+`, `-`, `*`, `/`, parentheses, decimals, unary minus).
+   - Catches division by zero and returns undefined error without crashing.
+   - Wired into `ActionExecutor` under `CALCULATE_LOCAL`.
+5. **Multilingual Intent Normalization**:
+   - Normalized persona greetings ("Babu", "Nayro", "Hey Cutie") in `TaskClassifier` so natural conversational phrasing is stripped prior to regex matching.
+   - Added `LOCAL_CALCULATOR` classification for queries such as "Calculate (25 + 15) * 2" and "Babu hisab karo: 500 * 18 / 100".
+6. **Capability & UI Binding**:
+   - Added `isCapabilityAvailable` to `CapabilityManager`.
+   - Bound UI `ConfirmationDialog` buttons in `MainActivity` to `confirmationManager.approve(actionId, parameters)` and `reject(actionId)`.
+

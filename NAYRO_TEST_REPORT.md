@@ -1,10 +1,11 @@
 # NAYRO Step 04 Test Report
+## Consolidated Bug Fix & Agentic Hardening Verification
 
 ## 1. Test Suite Summary
-- **Total Tests Executed**: 23
-- **Passing**: 23
+- **Total Tests Executed**: 37
+- **Passing**: 37
 - **Failing**: 0
-- **Duration**: 39 seconds
+- **Duration**: 40 seconds
 - **Command**: `gradle :app:testDebugUnitTest`
 
 ## 2. Test Breakdown
@@ -33,3 +34,18 @@
 - `testActionExecutionGuardR4Prohibited`: PASSED (Blocks financial transactions)
 - `testMemoryPrivacyGuardRejectsCredentials`: PASSED (Rejects passwords, OTPs, API keys)
 - `testMemoryClassifierExtractsPreference`: PASSED
+- `testLocalMathCalculatorBasicArithmetic`: PASSED (Addition, subtraction, multiplication, division)
+- `testLocalMathCalculatorOperatorPrecedenceAndParentheses`: PASSED (`(25 + 15) * 2 = 80`, precedence)
+- `testLocalMathCalculatorDecimalsAndUnaryMinus`: PASSED (`12.5 * 2 = 25`, `-5 + 15 = 10`)
+- `testLocalMathCalculatorDivisionByZero`: PASSED (Catches division by zero and reports undefined)
+- `testIntentClassificationCalculator`: PASSED ("Calculate (25 + 15) * 2", "Babu hisab karo: 500 * 18 / 100")
+- `testConfirmationManagerAsyncApproval`: PASSED (Asynchronous approval with CompletableDeferred)
+- `testConfirmationManagerRejection`: PASSED (User rejection safely cancels pending action)
+- `testConfirmationManagerParameterMismatchRejected`: PASSED (Rejects parameter alteration after proposal)
+- `testActionExecutionGuardBlocksR4Always`: PASSED (Unconditional R4 financial block)
+- `testActionExecutionGuardBlocksUnconfirmedR3`: PASSED (Enforces authentic user approval for R3)
+- `testActionExecutionGuardAllowsValidConfirmedR3`: PASSED (Allows approved R3 with matching parameters)
+- `testActionExecutionGuardBlocksMissingCapability`: PASSED (Blocks actions when capability is disconnected)
+- `testActionExecutionGuardBlocksMissingPermission`: PASSED (Blocks actions when Android permission missing)
+- `testActionVerifierStatuses`: PASSED (Verified, Inconclusive, Failed status checking)
+

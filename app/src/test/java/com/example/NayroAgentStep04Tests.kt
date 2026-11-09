@@ -3,20 +3,33 @@ package com.example
 import com.example.core.accessibility.ActionExecutionGuard
 import com.example.core.accessibility.AppNavigationManager
 import com.example.core.accessibility.GuardEvaluation
+import com.example.core.agent.ActionExecutionResult
 import com.example.core.agent.ActionType
+import com.example.core.agent.AgentAction
 import com.example.core.agent.AgentTask
+import com.example.core.agent.CalculationResult
+import com.example.core.agent.ConfirmationManager
+import com.example.core.agent.ConfirmationStatus
+import com.example.core.agent.LocalMathCalculator
+import com.example.core.agent.PendingConfirmation
 import com.example.core.agent.RiskLevel
 import com.example.core.agent.TaskClassifier
 import com.example.core.agent.TaskPlanner
 import com.example.core.agent.TaskState
 import com.example.core.agent.TaskStateManager
 import com.example.core.agent.UserIntentType
+import com.example.core.agent.VerificationResult
+import com.example.core.agent.VerificationStatus
+import com.example.core.capability.CapabilityId
 import com.example.core.memory.MemoryClassifier
 import com.example.core.memory.MemoryPrivacyGuard
 import com.example.core.screen.ScreenChangeDetector
 import com.example.core.screen.ScreenNodeInfo
 import com.example.core.screen.ScreenSnapshot
 import com.example.core.screen.UIElementParser
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -282,4 +295,292 @@ class NayroAgentStep04Tests {
         assertEquals("mujhe Hindi mein jawab pasand hain", candidate?.value)
         assertEquals(com.example.core.memory.MemoryCategory.USER_PREFERENCE, candidate?.category)
     }
+
+    // ==========================================
+    // STEP 04 Hardening Tests: Calculator, Guard, Confirmation & Verifier
+    // ==========================================
+
+    @Test
+    fun testLocalMathCalculatorBasicArithmetic() {
+        val add = LocalMathCalculator.calculate("12 + 8")
+        assertTrue(add is CalculationResult.Success)
+        assertEquals(20.0, (add as CalculationResult.Success).value, 0.0001)
+        assertEquals("20", add.formattedResult)
+
+        val sub = LocalMathCalculator.calculate("100 - 35")
+        assertTrue(sub is CalculationResult.Success)
+        assertEquals("65", (sub as CalculationResult.Success).formattedResult)
+
+        val mul = LocalMathCalculator.calculate("7 * 6")
+        assertTrue(mul is CalculationResult.Success)
+        assertEquals("42", (mul as CalculationResult.Success).formattedResult)
+
+        val div = LocalMathCalculator.calculate("144 / 12")
+        assertTrue(div is CalculationResult.Success)
+        assertEquals("12", (div as CalculationResult.Success).formattedResult)
+    }
+
+    @Test
+    fun testLocalMathCalculatorOperatorPrecedenceAndParentheses() {
+        // (25 + 15) * 2 = 80
+        val withParens = LocalMathCalculator.calculate("(25 + 15) * 2")
+        assertTrue(withParens is CalculationResult.Success)
+        assertEquals("80", (withParens as CalculationResult.Success).formattedResult)
+
+        // 10 + 2 * 5 = 20 (multiplication before addition)
+        val precedence = LocalMathCalculator.calculate("10 + 2 * 5")
+        assertTrue(precedence is CalculationResult.Success)
+        assertEquals("20", (precedence as CalculationResult.Success).formattedResult)
+    }
+
+    @Test
+    fun testLocalMathCalculatorDecimalsAndUnaryMinus() {
+        val decimal = LocalMathCalculator.calculate("12.5 * 2")
+        assertTrue(decimal is CalculationResult.Success)
+        assertEquals("25", (decimal as CalculationResult.Success).formattedResult)
+
+        val unary = LocalMathCalculator.calculate("-5 + 15")
+        assertTrue(unary is CalculationResult.Success)
+        assertEquals("10", (unary as CalculationResult.Success).formattedResult)
+    }
+
+    @Test
+    fun testLocalMathCalculatorDivisionByZero() {
+        val divZero = LocalMathCalculator.calculate("10 / 0")
+        assertTrue(divZero is CalculationResult.Error)
+        assertTrue((divZero as CalculationResult.Error).message.contains("Division by zero"))
+    }
+
+    @Test
+    fun testIntentClassificationCalculator() {
+        val intent1 = TaskClassifier.classify("Calculate (25 + 15) * 2")
+        assertEquals(UserIntentType.LOCAL_CALCULATOR, intent1.type)
+        assertEquals("(25 + 15) * 2", intent1.searchQueryOrContent)
+
+        val intent2 = TaskClassifier.classify("Babu hisab karo: 500 * 18 / 100")
+        assertEquals(UserIntentType.LOCAL_CALCULATOR, intent2.type)
+        assertTrue(intent2.searchQueryOrContent?.contains("500") == true)
+    }
+
+    @Test
+    fun testConfirmationManagerAsyncApproval() = runBlocking {
+        val confirmationManager = ConfirmationManager()
+        val pending = PendingConfirmation(
+            taskId = "task-1",
+            actionId = "action-1",
+            actionType = ActionType.ASK_USER_CONFIRMATION,
+            title = "Confirm action",
+            description = "Send message",
+            target = "Rahul",
+            parameters = mapOf("message" to "Hello"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+
+        launch {
+            delay(50)
+            val approved = confirmationManager.approve(actionId = "action-1", expectedParams = mapOf("message" to "Hello"))
+            assertTrue(approved)
+        }
+
+        val status = confirmationManager.awaitConfirmation(pending, timeoutMs = 2000L)
+        assertEquals(ConfirmationStatus.CONFIRMED, status)
+    }
+
+    @Test
+    fun testConfirmationManagerRejection() = runBlocking {
+        val confirmationManager = ConfirmationManager()
+        val pending = PendingConfirmation(
+            taskId = "task-2",
+            actionId = "action-2",
+            actionType = ActionType.ASK_USER_CONFIRMATION,
+            title = "Confirm action",
+            description = "Delete data",
+            target = "Data",
+            parameters = emptyMap(),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+
+        launch {
+            delay(50)
+            val rejected = confirmationManager.reject(actionId = "action-2")
+            assertTrue(rejected)
+        }
+
+        val status = confirmationManager.awaitConfirmation(pending, timeoutMs = 2000L)
+        assertEquals(ConfirmationStatus.REJECTED, status)
+    }
+
+    @Test
+    fun testConfirmationManagerParameterMismatchRejected() = runBlocking {
+        val confirmationManager = ConfirmationManager()
+        val pending = PendingConfirmation(
+            taskId = "task-3",
+            actionId = "action-3",
+            actionType = ActionType.ASK_USER_CONFIRMATION,
+            title = "Confirm action",
+            description = "Send money or message",
+            target = "Target",
+            parameters = mapOf("text" to "Original"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+
+        launch {
+            delay(50)
+            // Attempt to approve with altered parameters
+            val approved = confirmationManager.approve(
+                actionId = "action-3",
+                expectedParams = mapOf("text" to "Tampered")
+            )
+            assertFalse("Tampered parameter confirmation must be rejected", approved)
+        }
+
+        val status = confirmationManager.awaitConfirmation(pending, timeoutMs = 2000L)
+        assertEquals(ConfirmationStatus.CANCELLED, status)
+    }
+
+    @Test
+    fun testActionExecutionGuardBlocksR4Always() {
+        val action = AgentAction(
+            taskId = "task-r4",
+            actionType = ActionType.LAUNCH_APP,
+            target = "Bank",
+            riskLevel = RiskLevel.R4_FINANCIAL_PROHIBITED
+        )
+
+        val result = ActionExecutionGuard.validateExecution(
+            action = action,
+            isCapabilityAvailable = true,
+            isPermissionGranted = true,
+            confirmation = null
+        )
+        assertTrue("R4 financial transactions must be blocked unconditionally", result is GuardEvaluation.Blocked)
+    }
+
+    @Test
+    fun testActionExecutionGuardBlocksUnconfirmedR3() {
+        val action = AgentAction(
+            taskId = "task-r3",
+            actionType = ActionType.ASK_USER_CONFIRMATION,
+            target = "Recipient",
+            parameters = mapOf("msg" to "Hi"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+
+        // Without confirmation
+        val resultNoConf = ActionExecutionGuard.validateExecution(
+            action = action,
+            isCapabilityAvailable = true,
+            isPermissionGranted = true,
+            confirmation = null
+        )
+        assertTrue("R3 without confirmation must be blocked/require confirmation", resultNoConf is GuardEvaluation.RequiresConfirmation)
+
+        // With pending but unconfirmed status
+        val pending = PendingConfirmation(
+            taskId = "task-r3",
+            actionId = action.actionId,
+            actionType = action.actionType,
+            title = "Confirm",
+            description = "Send",
+            target = "Recipient",
+            parameters = action.parameters,
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+            status = ConfirmationStatus.PENDING
+        )
+        val resultPending = ActionExecutionGuard.validateExecution(
+            action = action,
+            isCapabilityAvailable = true,
+            isPermissionGranted = true,
+            confirmation = pending
+        )
+        assertTrue(resultPending is GuardEvaluation.RequiresConfirmation)
+    }
+
+    @Test
+    fun testActionExecutionGuardAllowsValidConfirmedR3() {
+        val action = AgentAction(
+            actionId = "act-valid",
+            taskId = "task-valid",
+            actionType = ActionType.ASK_USER_CONFIRMATION,
+            target = "Friend",
+            parameters = mapOf("msg" to "Hello"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+
+        val pending = PendingConfirmation(
+            taskId = "task-valid",
+            actionId = "act-valid",
+            actionType = action.actionType,
+            title = "Confirm",
+            description = "Send",
+            target = "Friend",
+            parameters = mapOf("msg" to "Hello"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+            status = ConfirmationStatus.CONFIRMED
+        )
+
+        val result = ActionExecutionGuard.validateExecution(
+            action = action,
+            isCapabilityAvailable = true,
+            isPermissionGranted = true,
+            confirmation = pending
+        )
+        assertTrue("Authentic confirmed R3 must be allowed", result is GuardEvaluation.Allowed)
+    }
+
+    @Test
+    fun testActionExecutionGuardBlocksMissingCapability() {
+        val action = AgentAction(
+            taskId = "task-cap",
+            actionType = ActionType.CLICK_ELEMENT,
+            target = "Submit",
+            requiredCapability = CapabilityId.ACCESSIBILITY
+        )
+
+        val result = ActionExecutionGuard.validateExecution(
+            action = action,
+            isCapabilityAvailable = false,
+            isPermissionGranted = true
+        )
+        assertTrue("Action must be blocked if capability is unavailable", result is GuardEvaluation.Blocked)
+    }
+
+    @Test
+    fun testActionExecutionGuardBlocksMissingPermission() {
+        val action = AgentAction(
+            taskId = "task-perm",
+            actionType = ActionType.LAUNCH_APP,
+            target = "Chrome",
+            requiredPermission = "android.permission.RECORD_AUDIO"
+        )
+
+        val result = ActionExecutionGuard.validateExecution(
+            action = action,
+            isCapabilityAvailable = true,
+            isPermissionGranted = false
+        )
+        assertTrue("Action must be blocked if permission is missing", result is GuardEvaluation.Blocked)
+    }
+
+    @Test
+    fun testActionVerifierStatuses() {
+        val successResult = VerificationResult(
+            status = VerificationStatus.VERIFIED,
+            details = "Verified successfully"
+        )
+        assertTrue(successResult.isVerified)
+
+        val inconclusiveResult = VerificationResult(
+            status = VerificationStatus.INCONCLUSIVE,
+            details = "Outcome uncertain"
+        )
+        assertFalse(inconclusiveResult.isVerified)
+
+        val failedResult = VerificationResult(
+            status = VerificationStatus.FAILED,
+            details = "Execution failed"
+        )
+        assertFalse(failedResult.isVerified)
+    }
 }
+

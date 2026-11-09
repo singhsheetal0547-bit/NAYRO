@@ -99,8 +99,15 @@ class ActionExecutor(
             }
 
             ActionType.CALCULATE_LOCAL -> {
-                val expr = action.parameters["expression"] ?: ""
-                ActionExecutionResult(true, "Calculation result for $expr")
+                val expr = action.parameters["expression"] ?: action.target ?: ""
+                when (val calc = LocalMathCalculator.calculate(expr)) {
+                    is CalculationResult.Success -> {
+                        ActionExecutionResult(true, "$expr = ${calc.formattedResult}")
+                    }
+                    is CalculationResult.Error -> {
+                        ActionExecutionResult(false, "Error: ${calc.message}")
+                    }
+                }
             }
 
             ActionType.SAVE_NOTE -> {

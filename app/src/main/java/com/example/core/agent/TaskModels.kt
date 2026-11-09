@@ -37,6 +37,35 @@ enum class ActionType {
     QUERY_LLM
 }
 
+enum class ConfirmationStatus {
+    PENDING,
+    CONFIRMED,
+    REJECTED,
+    EXPIRED,
+    CANCELLED
+}
+
+enum class VerificationStatus {
+    VERIFIED,
+    FAILED,
+    INCONCLUSIVE,
+    NOT_SUPPORTED
+}
+
+data class VerificationEvidence(
+    val preState: String? = null,
+    val postState: String? = null,
+    val observedChange: String
+)
+
+data class VerificationResult(
+    val status: VerificationStatus,
+    val details: String,
+    val evidence: VerificationEvidence? = null
+) {
+    val isVerified: Boolean get() = status == VerificationStatus.VERIFIED
+}
+
 data class AgentAction(
     val actionId: String = UUID.randomUUID().toString(),
     val taskId: String,
@@ -71,10 +100,15 @@ data class AgentTask(
 data class PendingConfirmation(
     val taskId: String,
     val actionId: String,
+    val actionType: ActionType,
     val title: String,
     val description: String,
     val target: String?,
     val parameters: Map<String, String>,
     val riskLevel: RiskLevel,
-    val createdAt: Long = System.currentTimeMillis()
-)
+    val createdAt: Long = System.currentTimeMillis(),
+    val expiresAt: Long = System.currentTimeMillis() + 60_000L, // 60-second expiration timeout
+    var status: ConfirmationStatus = ConfirmationStatus.PENDING
+) {
+    fun isExpired(): Boolean = System.currentTimeMillis() > expiresAt || status == ConfirmationStatus.EXPIRED
+}

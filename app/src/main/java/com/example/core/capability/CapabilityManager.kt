@@ -43,6 +43,12 @@ class CapabilityManager(
         _capabilities.value = result
     }
 
+    fun isCapabilityAvailable(id: CapabilityId): Boolean {
+        val eval = _capabilities.value[id] ?: return false
+        return eval.isAvailable
+    }
+
+
     private fun evaluate(def: CapabilityDefinition): CapabilityEvaluation {
         // 1. Android Version check
         if (Build.VERSION.SDK_INT < def.minAndroidSdk) {
