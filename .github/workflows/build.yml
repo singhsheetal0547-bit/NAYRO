@@ -59,6 +59,24 @@ jobs:
           chmod +x ./gradlew
           ./gradlew --version
 
+      - name: Generate CI debug keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v \\
+              -keystore debug.keystore \\
+              -storetype JKS \\
+              -storepass android \\
+              -keypass android \\
+              -alias androiddebugkey \\
+              -keyalg RSA \\
+              -keysize 2048 \\
+              -validity 10000 \\
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          test -s debug.keystore
+
       - name: Build NAYRO debug APK
         run: ./gradlew --no-daemon --stacktrace --warning-mode all :app:assembleDebug
 
