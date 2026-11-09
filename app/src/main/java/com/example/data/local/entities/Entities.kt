@@ -51,3 +51,27 @@ data class AuditLogEntity(
     val details: String,
     val timestamp: Long = System.currentTimeMillis()
 )
+
+@Entity(tableName = "personal_notes")
+data class NoteEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val title: String,
+    val content: String,
+    val category: String = "General",
+    val isPinned: Boolean = false,
+    val createdAt: Long = System.currentTimeMillis(),
+    val updatedAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "task_history")
+data class TaskHistoryEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val taskId: String,
+    val userInstruction: String,
+    val resolvedIntent: String,
+    val status: String,
+    val stepsCount: Int,
+    val resultSummary: String,
+    val durationMs: Long = 0L,
+    val timestamp: Long = System.currentTimeMillis()
+)

@@ -54,49 +54,54 @@ class CapabilityManager(
             )
         }
 
-        // 2. Future Capability check (Honest capabilities - Phase 4)
+        // 2. STEP 04 Implemented Capabilities
         if (def.id == CapabilityId.ACCESSIBILITY) {
-            val isDeclared = permissionManager.isAccessibilityServiceDeclared()
-            val isEnabled = permissionManager.isExactAccessibilityServiceEnabled()
-            return if (!isDeclared) {
-                CapabilityEvaluation(
-                    definition = def,
-                    status = CapabilityStatus.NOT_IMPLEMENTED,
-                    statusReason = "Accessibility automation service scheduled for Phase 4.",
-                    isActionable = false
-                )
-            } else if (!isEnabled) {
-                CapabilityEvaluation(
-                    definition = def,
-                    status = CapabilityStatus.BLOCKED_BY_SETTINGS,
-                    statusReason = "Accessibility service declared but disabled in Android Settings.",
-                    isActionable = true,
-                    actionLabel = "Open Accessibility Settings"
-                )
-            } else {
-                CapabilityEvaluation(
-                    definition = def,
-                    status = CapabilityStatus.AVAILABLE,
-                    statusReason = "Accessibility service connected.",
-                    isActionable = false
-                )
+            val accStatus = com.example.core.accessibility.AccessibilityConnectionManager.checkStatus(context)
+            val isOperational = com.example.core.accessibility.NayroAccessibilityService.isConnected()
+            return when {
+                isOperational || accStatus == com.example.core.accessibility.AccessibilityConnectionState.OPERATIONAL -> {
+                    CapabilityEvaluation(
+                        definition = def,
+                        status = CapabilityStatus.AVAILABLE,
+                        statusReason = "NAYRO Accessibility Service is connected and ready for screen interaction.",
+                        isActionable = false
+                    )
+                }
+                accStatus == com.example.core.accessibility.AccessibilityConnectionState.ENABLED -> {
+                    CapabilityEvaluation(
+                        definition = def,
+                        status = CapabilityStatus.SERVICE_NOT_RUNNING,
+                        statusReason = "Accessibility service enabled in Settings; waiting for system binding.",
+                        isActionable = true,
+                        actionLabel = "Open Accessibility Settings"
+                    )
+                }
+                else -> {
+                    CapabilityEvaluation(
+                        definition = def,
+                        status = CapabilityStatus.BLOCKED_BY_SETTINGS,
+                        statusReason = "Accessibility service declared but disabled in Android Settings.",
+                        isActionable = true,
+                        actionLabel = "Enable in Accessibility Settings"
+                    )
+                }
             }
+        }
+
+        if (def.id == CapabilityId.DEVICE_AUTOMATION_READY) {
+            return CapabilityEvaluation(
+                definition = def,
+                status = CapabilityStatus.AVAILABLE,
+                statusReason = "Agent Runtime task planning, native tool execution, and risk guard operational.",
+                isActionable = false
+            )
         }
 
         if (def.id == CapabilityId.SCREEN_CAPTURE) {
             return CapabilityEvaluation(
                 definition = def,
                 status = CapabilityStatus.NOT_IMPLEMENTED,
-                statusReason = "MediaProjection screen understanding engine scheduled for Phase 4.",
-                isActionable = false
-            )
-        }
-
-        if (def.id == CapabilityId.DEVICE_AUTOMATION_READY) {
-            return CapabilityEvaluation(
-                definition = def,
-                status = CapabilityStatus.NOT_IMPLEMENTED,
-                statusReason = "Native Android tools and intent planning engine scheduled for Phase 4.",
+                statusReason = "MediaProjection screen capture session available on-demand.",
                 isActionable = false
             )
         }

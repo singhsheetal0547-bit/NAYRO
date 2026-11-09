@@ -14,4 +14,7 @@
     <string name="status_overlay_inactive">Overlay Disabled</string>
     <string name="status_provider_ready">AI Ready</string>
     <string name="status_provider_none">Provider Not Configured</string>
+    <string name="accessibility_service_description">NAYRO assistant accessibility service for screen reading context and user-authorized UI navigation assistance.</string>
+    <string name="status_accessibility_connected">Accessibility Connected</string>
+    <string name="status_accessibility_disconnected">Accessibility Disconnected</string>
 </resources>

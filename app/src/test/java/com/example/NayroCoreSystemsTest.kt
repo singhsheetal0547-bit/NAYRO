@@ -56,7 +56,10 @@ class NayroCoreSystemsTest {
 
         val accessibility = CapabilityRegistry.getById(CapabilityId.ACCESSIBILITY)
         assertNotNull(accessibility)
-        assertTrue("Accessibility must remain marked as future capability in Step 02/03", accessibility?.isFutureCapability == true)
+        assertFalse("Accessibility is implemented in Step 04, not future", accessibility?.isFutureCapability == true)
+        val automation = CapabilityRegistry.getById(CapabilityId.DEVICE_AUTOMATION_READY)
+        assertNotNull(automation)
+        assertFalse("Device automation is implemented in Step 04, not future", automation?.isFutureCapability == true)
     }
 
     @Test

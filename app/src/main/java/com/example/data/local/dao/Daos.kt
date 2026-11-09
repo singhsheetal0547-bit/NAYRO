@@ -64,3 +64,33 @@ interface AuditLogDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLog(log: AuditLogEntity)
 }
+
+@Dao
+interface NoteDao {
+    @Query("SELECT * FROM personal_notes ORDER BY isPinned DESC, updatedAt DESC")
+    fun getAllNotes(): Flow<List<com.example.data.local.entities.NoteEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertNote(note: com.example.data.local.entities.NoteEntity): Long
+
+    @Query("DELETE FROM personal_notes WHERE id = :id")
+    suspend fun deleteNote(id: Long)
+
+    @Query("SELECT * FROM personal_notes WHERE title LIKE '%' || :query || '%' OR content LIKE '%' || :query || '%'")
+    fun searchNotes(query: String): Flow<List<com.example.data.local.entities.NoteEntity>>
+
+    @Query("DELETE FROM personal_notes")
+    suspend fun clearAllNotes()
+}
+
+@Dao
+interface TaskHistoryDao {
+    @Query("SELECT * FROM task_history ORDER BY timestamp DESC")
+    fun getAllTasks(): Flow<List<com.example.data.local.entities.TaskHistoryEntity>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertTask(task: com.example.data.local.entities.TaskHistoryEntity): Long
+
+    @Query("DELETE FROM task_history")
+    suspend fun clearTaskHistory()
+}

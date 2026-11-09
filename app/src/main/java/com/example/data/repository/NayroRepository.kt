@@ -5,6 +5,8 @@ import com.example.data.local.entities.AssistantProfileEntity
 import com.example.data.local.entities.AuditLogEntity
 import com.example.data.local.entities.ConversationEntity
 import com.example.data.local.entities.MemoryEntity
+import com.example.data.local.entities.NoteEntity
+import com.example.data.local.entities.TaskHistoryEntity
 import kotlinx.coroutines.flow.Flow
 
 class NayroRepository(private val database: NayroDatabase) {
@@ -13,6 +15,8 @@ class NayroRepository(private val database: NayroDatabase) {
     val conversations: Flow<List<ConversationEntity>> = database.conversationDao().getAllConversations()
     val memories: Flow<List<MemoryEntity>> = database.memoryDao().getAllMemories()
     val auditLogs: Flow<List<AuditLogEntity>> = database.auditLogDao().getAllLogs()
+    val notes: Flow<List<NoteEntity>> = database.noteDao().getAllNotes()
+    val taskHistory: Flow<List<TaskHistoryEntity>> = database.taskHistoryDao().getAllTasks()
 
     suspend fun updateProfile(profile: AssistantProfileEntity) {
         database.assistantProfileDao().insertOrUpdateProfile(profile)
@@ -32,6 +36,30 @@ class NayroRepository(private val database: NayroDatabase) {
 
     suspend fun deleteMemory(id: Long) {
         database.memoryDao().deleteMemory(id)
+    }
+
+    suspend fun clearMemories() {
+        database.memoryDao().clearAll()
+    }
+
+    suspend fun saveNote(note: NoteEntity): Long {
+        return database.noteDao().insertNote(note)
+    }
+
+    suspend fun deleteNote(id: Long) {
+        database.noteDao().deleteNote(id)
+    }
+
+    fun searchNotes(query: String): Flow<List<NoteEntity>> {
+        return database.noteDao().searchNotes(query)
+    }
+
+    suspend fun recordTaskExecution(task: TaskHistoryEntity): Long {
+        return database.taskHistoryDao().insertTask(task)
+    }
+
+    suspend fun clearTaskHistory() {
+        database.taskHistoryDao().clearTaskHistory()
     }
 
     suspend fun logAuditAction(actionType: String, target: String, riskLevel: String, outcome: String, details: String) {

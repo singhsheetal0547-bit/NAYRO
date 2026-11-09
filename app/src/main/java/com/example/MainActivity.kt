@@ -93,7 +93,21 @@ class MainActivity : ComponentActivity() {
         encryptedStorageManager = EncryptedStorageManager(this)
         providerManager = AIProviderManager(encryptedStorageManager)
         capabilityManager = CapabilityManager(this, permissionManager, providerManager)
-        agentRuntime = AgentRuntime()
+
+        val screenIntelligenceManager = com.example.core.screen.ScreenIntelligenceManager(this)
+        val memoryManager = com.example.core.memory.MemoryManager(repository)
+        val notebookManager = com.example.core.memory.NotebookManager(repository)
+
+        agentRuntime = AgentRuntime(
+            context = this,
+            repository = repository,
+            permissionManager = permissionManager,
+            capabilityManager = capabilityManager,
+            screenIntelligenceManager = screenIntelligenceManager,
+            memoryManager = memoryManager,
+            notebookManager = notebookManager,
+            providerManager = providerManager
+        )
         voiceManager = VoiceManager(this)
 
         setContent {
@@ -106,6 +120,7 @@ class MainActivity : ComponentActivity() {
                     agentRuntime = agentRuntime,
                     voiceManager = voiceManager,
                     providerManager = providerManager,
+                    notebookManager = notebookManager,
                     initialPendingPrompt = pendingFloatingPrompt,
                     onClearPendingPrompt = { pendingFloatingPrompt = null },
                     onRequestRuntimePermission = { type ->
@@ -172,6 +187,7 @@ fun NayroAppContent(
     agentRuntime: AgentRuntime,
     voiceManager: VoiceManager,
     providerManager: AIProviderManager,
+    notebookManager: com.example.core.memory.NotebookManager,
     initialPendingPrompt: String?,
     onClearPendingPrompt: () -> Unit,
     onRequestRuntimePermission: (PermissionType) -> Unit,
@@ -185,15 +201,20 @@ fun NayroAppContent(
     var assistantName by remember { mutableStateOf("Babu") }
     var showOnboarding by remember { mutableStateOf(false) }
 
+    val context = androidx.compose.ui.platform.LocalContext.current
     val coroutineScope = rememberCoroutineScope()
     val conversations by repository.conversations.collectAsState(initial = emptyList())
     val memories by repository.memories.collectAsState(initial = emptyList())
+    val notes by repository.notes.collectAsState(initial = emptyList())
     val auditLogs by repository.auditLogs.collectAsState(initial = emptyList())
 
     val evaluations by permissionManager.evaluations.collectAsState()
     val capabilities by capabilityManager.capabilities.collectAsState()
 
     val agentState by agentRuntime.currentState.collectAsState()
+    val currentTask by agentRuntime.currentTask.collectAsState()
+    val pendingConfirmation by agentRuntime.confirmationManager.pendingConfirmation.collectAsState()
+
     val configuredProviders by providerManager.configuredProviders.collectAsState()
     val activeProvider by providerManager.activeProvider.collectAsState()
     val voiceConfig by voiceManager.configuration.collectAsState()
@@ -202,7 +223,7 @@ fun NayroAppContent(
     val foregroundStatus by ServiceStateRepository.foregroundServiceStatus.collectAsState()
     val floatingStatus by ServiceStateRepository.floatingServiceStatus.collectAsState()
 
-    // Unified dispatch function: executes user request across AI engine, TTS, and DB
+    // Unified dispatch function: executes user request through AgentRuntime orchestration
     fun processUserPrompt(promptText: String) {
         val text = promptText.trim()
         if (text.isEmpty()) return
@@ -212,57 +233,19 @@ fun NayroAppContent(
             repository.addConversationMessage(
                 ConversationEntity(sender = "user", content = text)
             )
-            agentRuntime.setState(AgentState.Thinking)
 
-            // Convert DB history to AIChatMessage list
-            val history = conversations.takeLast(10).map { msg ->
-                AIChatMessage(
-                    role = if (msg.sender == "user") "user" else "assistant",
-                    content = msg.content
-                )
-            }
+            // Execute full Agentic Workflow: Planning, Permissions, Execution, Verification
+            val reply = agentRuntime.executeUserInstruction(text)
 
-            // Call Multi-Provider AI Engine
-            val result = providerManager.sendRequest(userPrompt = text, history = history)
+            // Save Babu verified response
+            repository.addConversationMessage(
+                ConversationEntity(sender = "babu", content = reply)
+            )
+            agentRuntime.setState(AgentState.Speaking(reply))
 
-            when (result) {
-                is AIResult.Success -> {
-                    val reply = result.response.content
-                    repository.addConversationMessage(
-                        ConversationEntity(sender = "babu", content = reply)
-                    )
-                    agentRuntime.setState(AgentState.Speaking(reply))
-
-                    // Speak response via TTS if configured
-                    if (voiceConfig.isWakeWordEnabled || voiceState == VoiceState.SPEAKING) {
-                        voiceManager.speak(reply)
-                    }
-
-                    repository.logAuditAction(
-                        actionType = "AI_QUERY_SUCCESS",
-                        target = result.response.providerId,
-                        riskLevel = "R0",
-                        outcome = "SUCCESS",
-                        details = "Model: ${result.response.modelId}, Tokens: ${result.response.completionTokens ?: 0}"
-                    )
-                    agentRuntime.setState(AgentState.Idle)
-                }
-
-                is AIResult.Error -> {
-                    val errReply = "Babu couldn't complete your request: ${result.message}"
-                    repository.addConversationMessage(
-                        ConversationEntity(sender = "babu", content = errReply)
-                    )
-                    agentRuntime.setState(AgentState.Error(result.message))
-
-                    repository.logAuditAction(
-                        actionType = "AI_QUERY_ERROR",
-                        target = activeProvider?.id ?: "none",
-                        riskLevel = "R0",
-                        outcome = "FAILED",
-                        details = "Code: ${result.code}, Msg: ${result.message}"
-                    )
-                }
+            // Speak response via TTS if configured
+            if (voiceConfig.isWakeWordEnabled || voiceState == VoiceState.SPEAKING) {
+                voiceManager.speak(reply)
             }
         }
     }
@@ -319,6 +302,7 @@ fun NayroAppContent(
                 Screen.Home -> HomeScreen(
                     assistantName = assistantName,
                     agentState = agentState,
+                    currentTask = currentTask,
                     isForegroundActive = foregroundStatus.state == ServiceLifecycleState.RUNNING,
                     isFloatingActive = floatingStatus.state == ServiceLifecycleState.RUNNING,
                     isAiReady = activeProvider != null,
@@ -335,6 +319,9 @@ fun NayroAppContent(
                     },
                     onSendText = { text ->
                         processUserPrompt(text)
+                    },
+                    onCancelTask = {
+                        agentRuntime.cancelCurrentTask()
                     },
                     onQuickActionClick = { tag ->
                         when (tag) {
@@ -393,7 +380,7 @@ fun NayroAppContent(
                                 onRequestRuntimePermission(PermissionType.NOTIFICATIONS)
                             }
                             CapabilityId.ACCESSIBILITY -> {
-                                onOpenPermissionSettings(PermissionType.ACCESSIBILITY)
+                                context.startActivity(com.example.core.accessibility.AccessibilityConnectionManager.createSettingsIntent())
                             }
                             else -> {}
                         }
@@ -418,9 +405,25 @@ fun NayroAppContent(
 
                 Screen.Memory -> MemoryScreen(
                     memories = memories,
+                    notes = notes,
                     onDeleteMemory = { id ->
                         coroutineScope.launch {
                             repository.deleteMemory(id)
+                        }
+                    },
+                    onCreateNote = { title, content, cat ->
+                        coroutineScope.launch {
+                            notebookManager.createNote(title, content, cat)
+                        }
+                    },
+                    onDeleteNote = { id ->
+                        coroutineScope.launch {
+                            notebookManager.deleteNote(id)
+                        }
+                    },
+                    onTogglePinNote = { note ->
+                        coroutineScope.launch {
+                            notebookManager.togglePin(note)
                         }
                     }
                 )
@@ -483,6 +486,14 @@ fun NayroAppContent(
                         assistantName = name
                         currentScreen = Screen.Home
                     }
+                )
+            }
+
+            pendingConfirmation?.let { conf ->
+                com.example.ui.components.ConfirmationDialog(
+                    confirmation = conf,
+                    onConfirm = { agentRuntime.confirmationManager.approve() },
+                    onReject = { agentRuntime.confirmationManager.reject() }
                 )
             }
         }

@@ -51,10 +51,10 @@ object CapabilityRegistry {
             displayName = "Accessibility Service",
             description = "Screen reading context and user-authorized Android UI navigation assistance.",
             requiredPermissions = emptyList(),
-            requiredServices = listOf("AccessibilityService"),
+            requiredServices = listOf("NayroAccessibilityService"),
             minAndroidSdk = 24,
             activationPrerequisites = "Enable NAYRO in Android Accessibility Settings manually.",
-            isFutureCapability = true
+            isFutureCapability = false
         ),
         CapabilityDefinition(
             id = CapabilityId.SCREEN_CAPTURE,
@@ -94,7 +94,7 @@ object CapabilityRegistry {
             requiredServices = emptyList(),
             minAndroidSdk = 24,
             activationPrerequisites = "Requires Agent Runtime tool execution engine and risk verification.",
-            isFutureCapability = true
+            isFutureCapability = false
         )
     )
 

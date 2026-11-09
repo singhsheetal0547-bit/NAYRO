@@ -9,11 +9,15 @@ import com.example.data.local.dao.AssistantProfileDao
 import com.example.data.local.dao.AuditLogDao
 import com.example.data.local.dao.ConversationDao
 import com.example.data.local.dao.MemoryDao
+import com.example.data.local.dao.NoteDao
+import com.example.data.local.dao.TaskHistoryDao
 import com.example.data.local.entities.AppSettingsEntity
 import com.example.data.local.entities.AssistantProfileEntity
 import com.example.data.local.entities.AuditLogEntity
 import com.example.data.local.entities.ConversationEntity
 import com.example.data.local.entities.MemoryEntity
+import com.example.data.local.entities.NoteEntity
+import com.example.data.local.entities.TaskHistoryEntity
 
 @Database(
     entities = [
@@ -21,9 +25,11 @@ import com.example.data.local.entities.MemoryEntity
         AssistantProfileEntity::class,
         ConversationEntity::class,
         MemoryEntity::class,
-        AuditLogEntity::class
+        AuditLogEntity::class,
+        NoteEntity::class,
+        TaskHistoryEntity::class
     ],
-    version = 1,
+    version = 2,
     exportSchema = false
 )
 abstract class NayroDatabase : RoomDatabase() {
@@ -33,6 +39,8 @@ abstract class NayroDatabase : RoomDatabase() {
     abstract fun conversationDao(): ConversationDao
     abstract fun memoryDao(): MemoryDao
     abstract fun auditLogDao(): AuditLogDao
+    abstract fun noteDao(): NoteDao
+    abstract fun taskHistoryDao(): TaskHistoryDao
 
     companion object {
         @Volatile

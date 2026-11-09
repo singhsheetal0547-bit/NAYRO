@@ -2,7 +2,6 @@ package com.example.ui.home
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -19,11 +18,16 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.FindInPage
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.SmartDisplay
 import androidx.compose.material.icons.filled.VpnKey
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -44,8 +48,10 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.example.core.agent.AgentState
+import com.example.core.agent.AgentTask
 import com.example.ui.components.AssistantOrb
 import com.example.ui.components.StatusBadge
+import com.example.ui.components.TaskExecutionCard
 import com.example.ui.theme.Coral
 import com.example.ui.theme.ForestGreen
 import com.example.ui.theme.SoftSage
@@ -56,11 +62,13 @@ data class QuickAction(val title: String, val subtitle: String, val icon: ImageV
 fun HomeScreen(
     assistantName: String = "Babu",
     agentState: AgentState = AgentState.Idle,
+    currentTask: AgentTask? = null,
     isForegroundActive: Boolean = false,
     isFloatingActive: Boolean = false,
     isAiReady: Boolean = false,
     onVoiceTap: () -> Unit = {},
     onSendText: (String) -> Unit = {},
+    onCancelTask: () -> Unit = {},
     onQuickActionClick: (String) -> Unit = {}
 ) {
     var textInput by remember { mutableStateOf("") }
@@ -71,7 +79,16 @@ fun HomeScreen(
         QuickAction("Permissions", "Review system permissions & special access", Icons.Default.Security, "action_perm"),
         QuickAction("Capability Registry", "Examine live device & feature availability", Icons.Default.Build, "action_caps"),
         QuickAction("Set Provider API Key", "Configure Gemini or Custom AI Provider", Icons.Default.VpnKey, "action_api"),
-        QuickAction("Memory Vault", "View user-approved local facts", Icons.Default.Psychology, "action_memory")
+        QuickAction("Memory & Notebook", "View saved preferences and personal notes", Icons.Default.Psychology, "action_memory")
+    )
+
+    val suggestedCommands = listOf(
+        "Screen par kya likha hai?",
+        "YouTube kholo aur Android AI search karo",
+        "Settings kholo aur Wi-Fi section tak jao",
+        "Time kya hua hai?",
+        "Note banao: NAYRO architecture meeting",
+        "Yaad rakho ki mujhe Hindi mein jawab pasand hain"
     )
 
     Column(
@@ -104,7 +121,16 @@ fun HomeScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(28.dp))
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // Active Agent Task Card (if present)
+        currentTask?.let { task ->
+            TaskExecutionCard(
+                task = task,
+                onCancelTask = onCancelTask
+            )
+            Spacer(modifier = Modifier.height(20.dp))
+        }
 
         // Assistant Greeting Header
         Text(
@@ -118,29 +144,32 @@ fun HomeScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
         // Central Assistant Visual Orb
         AssistantOrb(
             agentState = agentState,
-            size = 140.dp,
+            size = 130.dp,
             onClick = onVoiceTap
         )
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         Text(
             text = when (agentState) {
                 is AgentState.UserListening -> "Listening to you..."
-                is AgentState.Thinking -> "Babu is thinking..."
+                is AgentState.Thinking -> "Babu is planning & thinking..."
                 is AgentState.Speaking -> "Babu is speaking..."
-                else -> "Tap Orb or tap mic to speak"
+                is AgentState.ExecutingTask -> "Executing step ${agentState.step} of ${agentState.totalSteps}..."
+                is AgentState.WaitingForConfirmation -> "Awaiting your confirmation to proceed..."
+                is AgentState.WaitingForPermission -> "Waiting for required Android permission..."
+                else -> "Tap Orb or mic to speak to Babu"
             },
             style = MaterialTheme.typography.bodyMedium,
             color = Coral
         )
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(24.dp))
 
         // Text & Voice Input Bar
         Row(
@@ -196,7 +225,34 @@ fun HomeScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(18.dp))
+
+        // Quick Suggestion Chips
+        Text(
+            text = "Try an Agent Command",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.align(Alignment.Start)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+
+        LazyRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            items(suggestedCommands) { cmd ->
+                AssistChip(
+                    onClick = { onSendText(cmd) },
+                    label = { Text(cmd, style = MaterialTheme.typography.labelSmall) },
+                    colors = AssistChipDefaults.assistChipColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                        labelColor = ForestGreen
+                    )
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(24.dp))
 
         // Quick Actions Section
         Text(

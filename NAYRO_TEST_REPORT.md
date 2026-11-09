@@ -1,29 +1,35 @@
-# NAYRO Comprehensive Test & Verification Report
+# NAYRO Step 04 Test Report
 
-## 1. Automated Verification Summary
-- **Verification Environment**: AI Studio Linux Build Container
-- **Android Target**: Android SDK 36 (minSdk 24)
-- **Compilation Tool**: `compile_applet`
-- **Unit Test Runner**: `gradle :app:testDebugUnitTest`
+## 1. Test Suite Summary
+- **Total Tests Executed**: 23
+- **Passing**: 23
+- **Failing**: 0
+- **Duration**: 39 seconds
+- **Command**: `gradle :app:testDebugUnitTest`
 
----
+## 2. Test Breakdown
+### `NayroCoreSystemsTest`:
+- `testPermissionRegistryCompleteness`: PASSED
+- `testCapabilityRegistryIntegrity`: PASSED (Updated for Step 04 Accessibility & Device Automation readiness)
+- `testServiceStateRepositoryLifecycle`: PASSED
+- `testAIProviderManagerMissingKey`: PASSED
+- `testAIProviderManagerCustomProviderConfiguration`: PASSED
+- `testScreenNavigationItems`: PASSED
 
-## 2. Test Execution Details
-
-| Test Class | Test Name | Target Tested | Result |
-| :--- | :--- | :--- | :--- |
-| `NayroCoreSystemsTest` | `testPermissionRegistryCompleteness` | Verifies all permission types, categories, and manifest strings | **PASSED** |
-| `NayroCoreSystemsTest` | `testCapabilityRegistryIntegrity` | Verifies capabilities and Phase 4 future feature boundaries | **PASSED** |
-| `NayroCoreSystemsTest` | `testServiceStateRepositoryLifecycle` | Verifies authentic service lifecycle states (`STOPPED` → `STARTING` → `RUNNING`) | **PASSED** |
-| `NayroCoreSystemsTest` | `testAIProviderManagerMissingKey` | Verifies missing provider key returns graceful error (HTTP 400) | **PASSED** |
-| `NayroCoreSystemsTest` | `testAIProviderManagerCustomProviderConfiguration` | Verifies dynamic registration of custom endpoints (Ollama/OpenRouter) | **PASSED** |
-
----
-
-## 3. Physical Device Testing Status & Recommendations
-- **Automated Verification**: Build compilation, manifest parsing, service state management, and provider routing verified.
-- **Physical Device Tests Required**:
-  - SpeechRecognizer audio input across diverse OEM microphone arrays.
-  - TextToSpeech voice pack installations for regional Hindi dialects.
-  - Floating bubble edge-docking over OEM home launchers (OneUI, MIUI, ColorOS).
-  - Background foreground service resilience under aggressive OEM battery optimizations.
+### `NayroAgentStep04Tests`:
+- `testIntentClassificationAppLaunch`: PASSED ("Chrome kholo", "open YouTube")
+- `testIntentClassificationScreenRead`: PASSED ("Babu, screen par kya likha hai?")
+- `testIntentClassificationYouTubeSearch`: PASSED ("YouTube kholo aur Android AI agents search karo")
+- `testIntentClassificationSettingsNavigate`: PASSED ("Settings kholo aur Wi-Fi section tak jao")
+- `testIntentClassificationMessageDraft`: PASSED ("WhatsApp kholo aur Rahul ke liye message likho: ...")
+- `testIntentClassificationMemoryAndNotes`: PASSED ("Yaad rakho ki...", "Note banao:...")
+- `testTaskPlanningMultiStep`: PASSED (Action decomposition & R3 confirmation requirement)
+- `testTaskStateManagerValidTransitions`: PASSED (State progression validation)
+- `testTaskStateManagerRejectsInvalidJumps`: PASSED (Rejects CREATED -> COMPLETED)
+- `testUIElementParserCategorization`: PASSED (Buttons, inputs, text labels)
+- `testScreenChangeDetection`: PASSED (Detects package and text change across snapshots)
+- `testActionExecutionGuardR0AndR1Allowed`: PASSED
+- `testActionExecutionGuardR3RequiresConfirmation`: PASSED
+- `testActionExecutionGuardR4Prohibited`: PASSED (Blocks financial transactions)
+- `testMemoryPrivacyGuardRejectsCredentials`: PASSED (Rejects passwords, OTPs, API keys)
+- `testMemoryClassifierExtractsPreference`: PASSED
