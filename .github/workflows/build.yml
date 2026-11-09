@@ -29,15 +29,18 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK tools without interactive license prompt
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
+          packages: ''
 
       - name: Install exact Android SDK required by this repository
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager --install "platforms;android-36.1" "build-tools;36.0.0" "platform-tools"
           yes | sdkmanager --licenses >/dev/null
+          sdkmanager --install "platforms;android-36.1" "build-tools;36.0.0" "platform-tools"
 
       - name: Verify Android SDK packages
         shell: bash
