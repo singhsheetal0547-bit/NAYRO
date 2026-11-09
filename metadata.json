@@ -1,0 +1,6 @@
+{
+  "name": "NAYRO",
+  "description": "NAYRO - Private Personal Voice-First AI Agent for Android (Assistant: Babu)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
