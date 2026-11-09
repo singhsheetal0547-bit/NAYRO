@@ -65,10 +65,22 @@ class BackgroundAgentHealthManager(
     private val voiceManager: VoiceManager
 ) {
 
-    private val _healthReport = MutableStateFlow(evaluateHealth())
-    val healthReport: StateFlow<BackgroundAgentHealthReport> = _healthReport.asStateFlow()
+    private val _healthReport: MutableStateFlow<BackgroundAgentHealthReport>
+    val healthReport: StateFlow<BackgroundAgentHealthReport>
+
+    init {
+        val initialReport = evaluateHealthInternal()
+        _healthReport = MutableStateFlow(initialReport)
+        healthReport = _healthReport.asStateFlow()
+    }
 
     fun evaluateHealth(): BackgroundAgentHealthReport {
+        val report = evaluateHealthInternal()
+        _healthReport.value = report
+        return report
+    }
+
+    private fun evaluateHealthInternal(): BackgroundAgentHealthReport {
         val foregroundStatus = ServiceStateRepository.foregroundServiceStatus.value
         val floatingStatus = ServiceStateRepository.floatingServiceStatus.value
 
@@ -154,7 +166,7 @@ class BackgroundAgentHealthManager(
             isBgRestricted = isBgRestricted
         )
 
-        val report = BackgroundAgentHealthReport(
+        return BackgroundAgentHealthReport(
             serviceLifecycleState = foregroundStatus.state,
             isForegroundRunning = isForegroundRunning,
             isFloatingOverlayActive = isFloatingActive,
@@ -168,9 +180,6 @@ class BackgroundAgentHealthManager(
             activeStates = statesList,
             healthSummaryMessage = summary
         )
-
-        _healthReport.value = report
-        return report
     }
 
     private fun buildSummaryMessage(

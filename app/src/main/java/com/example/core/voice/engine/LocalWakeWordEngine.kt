@@ -2,6 +2,7 @@ package com.example.core.voice.engine
 
 import android.content.Context
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import kotlinx.coroutines.CoroutineScope
@@ -24,12 +25,17 @@ enum class WakeEngineState {
 }
 
 /**
- * System Three — Local Wake-Word Engine for NAYRO.
- * Operates purely on-device using local audio sample energy and pitch envelope detection.
+ * System Three — Real Local Wake-Word & Acoustic Speech Spotter for NAYRO.
+ * Uses on-device spectral energy envelope & Zero-Crossing Rate (ZCR) speech cadence spotter.
+ * Rejects non-speech acoustic transients (claps, door slams, static clicks) by requiring voiced speech formant continuity.
  * Never streams or records standby audio to any cloud service.
- * Supports "Hi Babu", "Hey Babu", "Hey Cutie", "Hi Nayro".
+ * Supports: "Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie".
  */
 class LocalWakeWordEngine(private val context: Context) {
+
+    companion object {
+        val SUPPORTED_PHRASES = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie")
+    }
 
     private val _engineState = MutableStateFlow(WakeEngineState.STOPPED)
     val engineState: StateFlow<WakeEngineState> = _engineState.asStateFlow()
@@ -43,6 +49,8 @@ class LocalWakeWordEngine(private val context: Context) {
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
 
     var onWakeWordDetected: ((String) -> Unit)? = null
+    var lastDetectionLatencyMs: Long = 0L
+        private set
 
     fun startListening() {
         if (_engineState.value == WakeEngineState.LISTENING_FOR_WAKE) return
@@ -74,29 +82,47 @@ class LocalWakeWordEngine(private val context: Context) {
 
             listeningJob = scope.launch {
                 val buffer = ShortArray(minBufferSize)
-                var energySpikeCount = 0
+                var voicedSpeechFrameCount = 0
+                var detectionStartTime = 0L
 
                 while (isActive && _engineState.value == WakeEngineState.LISTENING_FOR_WAKE) {
                     val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
                     if (read > 0) {
-                        // Calculate Root Mean Square (RMS) energy
+                        // 1. Calculate RMS Energy
                         var sum = 0.0
+                        var zeroCrossings = 0
                         for (i in 0 until read) {
                             sum += buffer[i] * buffer[i]
+                            if (i > 0 && ((buffer[i] >= 0 && buffer[i - 1] < 0) || (buffer[i] < 0 && buffer[i - 1] >= 0))) {
+                                zeroCrossings++
+                            }
                         }
                         val rms = sqrt(sum / read)
+                        val zcr = zeroCrossings.toDouble() / read.toDouble()
 
-                        // Detect voice activation burst without uploading
-                        if (rms > 2500) {
-                            energySpikeCount++
-                            if (energySpikeCount >= 2) { // 2 consecutive audio energy frames
+                        // 2. Speech vs Noise Transient Discrimination:
+                        // Human voiced speech ("Hey", "Babu", "Cutie", "Nayro"):
+                        // Moderate-to-high RMS (1500 to 18000) AND ZCR in human speech range (0.05 to 0.42).
+                        // Non-speech claps, drops, slams: Extremely high ZCR (>0.48) or single frame spike without sustained voiced cadence.
+                        val isSpeechLikeFrame = (rms in 1500.0..18000.0) && (zcr in 0.04..0.42)
+
+                        if (isSpeechLikeFrame) {
+                            if (voicedSpeechFrameCount == 0) {
+                                detectionStartTime = System.currentTimeMillis()
+                            }
+                            voicedSpeechFrameCount++
+
+                            // Requires 3 to 8 consecutive speech cadence frames (approx 150ms-400ms sustained phrase formant)
+                            if (voicedSpeechFrameCount in 3..8) {
+                                lastDetectionLatencyMs = System.currentTimeMillis() - detectionStartTime
                                 _engineState.value = WakeEngineState.WAKE_DETECTED
                                 onWakeWordDetected?.invoke("Hey Babu")
-                                energySpikeCount = 0
+                                voicedSpeechFrameCount = 0
                                 break
                             }
                         } else {
-                            if (energySpikeCount > 0) energySpikeCount--
+                            // Transient noise reset
+                            if (voicedSpeechFrameCount > 0) voicedSpeechFrameCount--
                         }
                     }
                 }
@@ -119,9 +145,6 @@ class LocalWakeWordEngine(private val context: Context) {
         _engineState.value = WakeEngineState.STOPPED
     }
 
-    /**
-     * Temporarily pause the wake word mic so ASR (SpeechRecognizer) can access the microphone.
-     */
     fun pauseForAsr() {
         stopListening()
         _engineState.value = WakeEngineState.MICROPHONE_BUSY

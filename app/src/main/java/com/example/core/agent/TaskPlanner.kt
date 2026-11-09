@@ -1,6 +1,7 @@
 package com.example.core.agent
 
 import com.example.core.capability.CapabilityId
+import org.json.JSONArray
 import java.util.UUID
 
 object TaskPlanner {
@@ -17,7 +18,8 @@ object TaskPlanner {
                         actionType = ActionType.LAUNCH_APP,
                         target = intent.targetAppOrEntity,
                         riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
-                        verificationStrategy = "VERIFY_FOREGROUND_PACKAGE"
+                        verificationStrategy = "VERIFY_FOREGROUND_PACKAGE",
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
             }
@@ -29,7 +31,8 @@ object TaskPlanner {
                         actionType = ActionType.READ_SCREEN,
                         requiredCapability = CapabilityId.ACCESSIBILITY,
                         riskLevel = RiskLevel.R0_LOCAL_READONLY,
-                        verificationStrategy = "VERIFY_SCREEN_READ"
+                        verificationStrategy = "VERIFY_SCREEN_READ",
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
             }
@@ -40,7 +43,8 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.LAUNCH_APP,
                         target = "com.google.android.youtube",
-                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
                 actions.add(
@@ -49,7 +53,8 @@ object TaskPlanner {
                         actionType = ActionType.CLICK_ELEMENT,
                         target = "Search",
                         requiredCapability = CapabilityId.ACCESSIBILITY,
-                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
                 actions.add(
@@ -58,7 +63,8 @@ object TaskPlanner {
                         actionType = ActionType.SET_TEXT,
                         parameters = mapOf("query" to (intent.searchQueryOrContent ?: "Android")),
                         requiredCapability = CapabilityId.ACCESSIBILITY,
-                        riskLevel = RiskLevel.R2_APPLICATION_STATE
+                        riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                        idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
             }
@@ -70,7 +76,8 @@ object TaskPlanner {
                         actionType = ActionType.OPEN_SETTINGS_SECTION,
                         target = intent.section ?: "general",
                         parameters = mapOf("section" to (intent.section ?: "general")),
-                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
                 actions.add(
@@ -78,7 +85,8 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.READ_SCREEN,
                         requiredCapability = CapabilityId.ACCESSIBILITY,
-                        riskLevel = RiskLevel.R0_LOCAL_READONLY
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
             }
@@ -89,7 +97,8 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.LAUNCH_APP,
                         target = "com.whatsapp",
-                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
                 actions.add(
@@ -98,7 +107,8 @@ object TaskPlanner {
                         actionType = ActionType.CLICK_ELEMENT,
                         target = intent.recipient ?: "Contact",
                         requiredCapability = CapabilityId.ACCESSIBILITY,
-                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
                 actions.add(
@@ -107,7 +117,8 @@ object TaskPlanner {
                         actionType = ActionType.SET_TEXT,
                         parameters = mapOf("text" to (intent.searchQueryOrContent ?: "")),
                         requiredCapability = CapabilityId.ACCESSIBILITY,
-                        riskLevel = RiskLevel.R2_APPLICATION_STATE
+                        riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                        idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
                 // Stop before sending and require explicit user confirmation
@@ -120,7 +131,8 @@ object TaskPlanner {
                             "recipient" to (intent.recipient ?: "Unknown"),
                             "draft" to (intent.searchQueryOrContent ?: "")
                         ),
-                        riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+                        riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                        idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
             }
@@ -131,7 +143,8 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.SAVE_NOTE,
                         parameters = mapOf("content" to (intent.searchQueryOrContent ?: "")),
-                        riskLevel = RiskLevel.R0_LOCAL_READONLY
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
             }
@@ -142,7 +155,8 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.SAVE_MEMORY,
                         parameters = mapOf("prompt" to intent.rawPrompt),
-                        riskLevel = RiskLevel.R0_LOCAL_READONLY
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
             }
@@ -152,7 +166,8 @@ object TaskPlanner {
                     AgentAction(
                         taskId = taskId,
                         actionType = ActionType.GET_DEVICE_TIME,
-                        riskLevel = RiskLevel.R0_LOCAL_READONLY
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
             }
@@ -163,7 +178,8 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.CALCULATE_LOCAL,
                         parameters = mapOf("expression" to (intent.searchQueryOrContent ?: "")),
-                        riskLevel = RiskLevel.R0_LOCAL_READONLY
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
             }
@@ -174,7 +190,8 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.QUERY_LLM,
                         parameters = mapOf("prompt" to intent.rawPrompt),
-                        riskLevel = RiskLevel.R0_LOCAL_READONLY
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
                     )
                 )
             }
@@ -187,5 +204,75 @@ object TaskPlanner {
             actions = actions,
             state = TaskState.CREATED
         )
+    }
+
+    /**
+     * Parses LLM-generated JSON action plan array into a validated AgentTask schema.
+     */
+    fun planTaskFromJson(json: String, userInstruction: String): AgentTask? {
+        return try {
+            val jsonArray = JSONArray(json)
+            if (jsonArray.length() == 0) return null
+
+            val taskId = UUID.randomUUID().toString()
+            val actions = mutableListOf<AgentAction>()
+
+            for (i in 0 until jsonArray.length()) {
+                val obj = jsonArray.getJSONObject(i)
+                val typeStr = obj.optString("actionType", "")
+                val actionType = try { ActionType.valueOf(typeStr) } catch (e: Exception) { continue }
+                val target = obj.optString("target", null)?.takeIf { it.isNotBlank() }
+
+                val paramsMap = mutableMapOf<String, String>()
+                val paramsObj = obj.optJSONObject("parameters")
+                paramsObj?.keys()?.forEach { key ->
+                    paramsObj.optString(key)?.let { value ->
+                        paramsMap[key] = value
+                    }
+                }
+
+                val risk = when (actionType) {
+                    ActionType.ASK_USER_CONFIRMATION -> RiskLevel.R3_EXTERNAL_COMMUNICATION
+                    ActionType.SET_TEXT -> RiskLevel.R2_APPLICATION_STATE
+                    ActionType.CLICK_ELEMENT, ActionType.LAUNCH_APP, ActionType.OPEN_SETTINGS_SECTION -> RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                    else -> RiskLevel.R0_LOCAL_READONLY
+                }
+
+                val reqCap = when (actionType) {
+                    ActionType.READ_SCREEN, ActionType.CLICK_ELEMENT, ActionType.SET_TEXT,
+                    ActionType.SCROLL_FORWARD, ActionType.SCROLL_BACKWARD, ActionType.NAVIGATE_BACK -> CapabilityId.ACCESSIBILITY
+                    else -> null
+                }
+
+                val idempotency = when (actionType) {
+                    ActionType.CLICK_ELEMENT, ActionType.SET_TEXT, ActionType.SAVE_NOTE, ActionType.ASK_USER_CONFIRMATION -> "NON_IDEMPOTENT"
+                    else -> "IDEMPOTENT"
+                }
+
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.valueOf(typeStr),
+                        target = target,
+                        parameters = paramsMap,
+                        requiredCapability = reqCap,
+                        riskLevel = risk,
+                        idempotencyClassification = idempotency
+                    )
+                )
+            }
+
+            if (actions.isEmpty()) return null
+
+            AgentTask(
+                taskId = taskId,
+                userInstruction = userInstruction,
+                resolvedIntent = "LLM_STRUCTURED_PLAN",
+                actions = actions,
+                state = TaskState.CREATED
+            )
+        } catch (e: Exception) {
+            null
+        }
     }
 }

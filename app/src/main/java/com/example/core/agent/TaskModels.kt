@@ -76,7 +76,9 @@ data class AgentAction(
     val requiredPermission: String? = null,
     val riskLevel: RiskLevel = RiskLevel.R0_LOCAL_READONLY,
     val timeoutMs: Long = 5000L,
-    val verificationStrategy: String = "VERIFY_STATE_CHANGE"
+    val verificationStrategy: String = "VERIFY_STATE_CHANGE",
+    val retryPolicy: String = "NO_RETRY",
+    val idempotencyClassification: String = "IDEMPOTENT"
 )
 
 data class AgentTask(
