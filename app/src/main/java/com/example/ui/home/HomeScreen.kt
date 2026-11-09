@@ -18,9 +18,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mic
-import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -54,8 +56,8 @@ data class QuickAction(val title: String, val subtitle: String, val icon: ImageV
 fun HomeScreen(
     assistantName: String = "Babu",
     agentState: AgentState = AgentState.Idle,
-    isWakeActive: Boolean = false,
-    isOverlayActive: Boolean = false,
+    isForegroundActive: Boolean = false,
+    isFloatingActive: Boolean = false,
     isAiReady: Boolean = false,
     onVoiceTap: () -> Unit = {},
     onSendText: (String) -> Unit = {},
@@ -65,8 +67,10 @@ fun HomeScreen(
     val scrollState = rememberScrollState()
 
     val quickActions = listOf(
+        QuickAction("Background & Floating", "Toggle foreground service & Babu bubble", Icons.Default.Layers, "action_background"),
+        QuickAction("Permissions", "Review system permissions & special access", Icons.Default.Security, "action_perm"),
+        QuickAction("Capability Registry", "Examine live device & feature availability", Icons.Default.Build, "action_caps"),
         QuickAction("Set Provider API Key", "Configure Gemini or Custom AI Provider", Icons.Default.VpnKey, "action_api"),
-        QuickAction("Check Permissions", "Manage microphone & system overlays", Icons.Default.Notifications, "action_perm"),
         QuickAction("Memory Vault", "View user-approved local facts", Icons.Default.Psychology, "action_memory")
     )
 
@@ -84,17 +88,17 @@ fun HomeScreen(
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
             StatusBadge(
-                label = if (isWakeActive) "Wake Active" else "Wake Off",
-                isActive = isWakeActive,
-                testTag = "badge_wake"
+                label = if (isForegroundActive) "Agent Service: ON" else "Agent Service: OFF",
+                isActive = isForegroundActive,
+                testTag = "badge_agent_service"
             )
             StatusBadge(
-                label = if (isOverlayActive) "Overlay On" else "Overlay Off",
-                isActive = isOverlayActive,
-                testTag = "badge_overlay"
+                label = if (isFloatingActive) "Floating Bubble: ON" else "Floating Bubble: OFF",
+                isActive = isFloatingActive,
+                testTag = "badge_floating_bubble"
             )
             StatusBadge(
-                label = if (isAiReady) "AI Provider Ready" else "AI Not Configured",
+                label = if (isAiReady) "AI Ready" else "AI Setup Needed",
                 isActive = isAiReady,
                 testTag = "badge_ai"
             )
@@ -130,7 +134,7 @@ fun HomeScreen(
                 is AgentState.UserListening -> "Listening to you..."
                 is AgentState.Thinking -> "Babu is thinking..."
                 is AgentState.Speaking -> "Babu is speaking..."
-                else -> "Tap Orb or say 'Hey Babu' to speak"
+                else -> "Tap Orb or tap mic to speak"
             },
             style = MaterialTheme.typography.bodyMedium,
             color = Coral
@@ -196,7 +200,7 @@ fun HomeScreen(
 
         // Quick Actions Section
         Text(
-            text = "Quick Actions",
+            text = "Quick Actions & Controls",
             style = MaterialTheme.typography.titleLarge,
             color = MaterialTheme.colorScheme.onBackground,
             modifier = Modifier.align(Alignment.Start)
