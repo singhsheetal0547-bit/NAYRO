@@ -62,7 +62,7 @@ fun NayroBottomBar(
         contentColor = SoftSage,
         modifier = modifier.testTag("nayro_bottom_bar")
     ) {
-        Screen.bottomNavItems.forEach { screen ->
+        Screen.bottomNavItems.filterNotNull().forEach { screen ->
             val isSelected = currentRoute == screen.route
             NavigationBarItem(
                 selected = isSelected,

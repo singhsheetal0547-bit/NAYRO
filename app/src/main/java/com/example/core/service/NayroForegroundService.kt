@@ -13,16 +13,11 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * System C — Android Foreground Service for NAYRO Background Agent Engine.
- * Manages background lifecycle, persistent notifications, notification channel,
- * and service state monitoring.
- *
- * Compliant with Android 12+ background starts and Android 14+ foreground service types.
+ * Implements real Android service lifecycle tracking with STARTING, RUNNING, STOPPING, STOPPED, FAILED.
  */
 class NayroForegroundService : Service() {
 
@@ -33,10 +28,10 @@ class NayroForegroundService : Service() {
         const val ACTION_START = "com.example.nayro.action.START"
         const val ACTION_STOP = "com.example.nayro.action.STOP"
 
-        private val _isRunning = MutableStateFlow(false)
-        val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+        val status: StateFlow<ServiceStatus> = ServiceStateRepository.foregroundServiceStatus
 
         fun startService(context: Context) {
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STARTING)
             val intent = Intent(context, NayroForegroundService::class.java).apply {
                 action = ACTION_START
             }
@@ -46,17 +41,34 @@ class NayroForegroundService : Service() {
                 } else {
                     context.startService(intent)
                 }
+            } catch (e: SecurityException) {
+                ServiceStateRepository.updateForegroundStatus(
+                    ServiceLifecycleState.FAILED,
+                    "SecurityException: ${e.localizedMessage ?: "Permission not granted"}"
+                )
+            } catch (e: IllegalStateException) {
+                ServiceStateRepository.updateForegroundStatus(
+                    ServiceLifecycleState.FAILED,
+                    "IllegalStateException: Foreground service start not allowed in background."
+                )
             } catch (e: Exception) {
-                // Catches ForegroundServiceStartNotAllowedException on Android 12+ if in background
-                e.printStackTrace()
+                ServiceStateRepository.updateForegroundStatus(
+                    ServiceLifecycleState.FAILED,
+                    "Service start error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                )
             }
         }
 
         fun stopService(context: Context) {
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
             val intent = Intent(context, NayroForegroundService::class.java).apply {
                 action = ACTION_STOP
             }
-            context.stopService(intent)
+            try {
+                context.stopService(intent)
+            } catch (e: Exception) {
+                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
+            }
         }
     }
 
@@ -67,32 +79,42 @@ class NayroForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
-            _isRunning.value = false
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
             return START_NOT_STICKY
         }
 
-        val notification = createNotification("NAYRO Agent Active", "Babu is standing by. Tap to open.")
+        try {
+            val notification = createNotification("NAYRO Agent Active", "Babu background engine is ready. Tap to open.")
 
-        // Android 14+ FOREGROUND_SERVICE_SPECIAL_USE requirement handling
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
+        } catch (e: Exception) {
+            ServiceStateRepository.updateForegroundStatus(
+                ServiceLifecycleState.FAILED,
+                "startForeground failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
             )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+            stopSelf()
+            return START_NOT_STICKY
         }
 
-        _isRunning.value = true
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        _isRunning.value = false
+        ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

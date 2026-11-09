@@ -7,12 +7,15 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -24,18 +27,23 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
-import kotlinx.coroutines.flow.MutableStateFlow
+import com.example.core.service.ServiceLifecycleState
+import com.example.core.service.ServiceStateRepository
+import com.example.core.service.ServiceStatus
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlin.math.abs
 
 /**
  * System B — Android Floating Assistant Service for Babu.
- * Uses Android WindowManager with TYPE_APPLICATION_OVERLAY.
- * Implements draggable bubble, edge docking, panel expansion, and lifecycle coordination.
+ * Real WindowManager TYPE_APPLICATION_OVERLAY implementation.
+ * Fixes:
+ * 1. Floating assistant input submission to main conversation pipeline
+ * 2. Proper window creation verification & lifecycle states
+ * 3. Empty input rejection and state reporting
  */
 class NayroFloatingService : Service() {
 
@@ -46,28 +54,47 @@ class NayroFloatingService : Service() {
         const val ACTION_START = "com.example.nayro.floating.START"
         const val ACTION_STOP = "com.example.nayro.floating.STOP"
 
-        private val _isRunning = MutableStateFlow(false)
-        val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
+        const val EXTRA_FLOATING_PROMPT = "com.example.nayro.extra.FLOATING_PROMPT"
+
+        val status: StateFlow<ServiceStatus> = ServiceStateRepository.floatingServiceStatus
 
         fun startService(context: Context) {
             if (!Settings.canDrawOverlays(context)) {
+                ServiceStateRepository.updateFloatingStatus(
+                    ServiceLifecycleState.PERMISSION_DENIED,
+                    "Overlay permission (SYSTEM_ALERT_WINDOW) not granted."
+                )
                 return
             }
+
+            ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.STARTING)
             val intent = Intent(context, NayroFloatingService::class.java).apply {
                 action = ACTION_START
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                ServiceStateRepository.updateFloatingStatus(
+                    ServiceLifecycleState.FAILED,
+                    "Failed to start floating service: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                )
             }
         }
 
         fun stopService(context: Context) {
+            ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.STOPPING)
             val intent = Intent(context, NayroFloatingService::class.java).apply {
                 action = ACTION_STOP
             }
-            context.stopService(intent)
+            try {
+                context.stopService(intent)
+            } catch (e: Exception) {
+                ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.STOPPED)
+            }
         }
     }
 
@@ -93,31 +120,62 @@ class NayroFloatingService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
+            ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.STOPPING)
             removeOverlayViews()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
-            _isRunning.value = false
+            ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.STOPPED)
             return START_NOT_STICKY
         }
 
         if (!Settings.canDrawOverlays(this)) {
+            ServiceStateRepository.updateFloatingStatus(
+                ServiceLifecycleState.PERMISSION_DENIED,
+                "SYSTEM_ALERT_WINDOW revoked by user."
+            )
             stopSelf()
-            _isRunning.value = false
             return START_NOT_STICKY
         }
 
-        val notification = createNotification()
-        startForeground(NOTIFICATION_ID, notification)
+        try {
+            val notification = createNotification()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                )
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
 
-        initBubbleView()
-        _isRunning.value = true
+            val windowAdded = initBubbleView()
+            if (windowAdded) {
+                ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.RUNNING)
+            } else {
+                ServiceStateRepository.updateFloatingStatus(
+                    ServiceLifecycleState.FAILED,
+                    "WindowManager failed to attach floating bubble view."
+                )
+                stopSelf()
+                return START_NOT_STICKY
+            }
+        } catch (e: Exception) {
+            ServiceStateRepository.updateFloatingStatus(
+                ServiceLifecycleState.FAILED,
+                "Floating window initialization error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            )
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
         return START_STICKY
     }
 
     override fun onDestroy() {
         super.onDestroy()
         removeOverlayViews()
-        _isRunning.value = false
+        ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.STOPPED)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -138,7 +196,9 @@ class NayroFloatingService : Service() {
     }
 
     private fun createNotification(): Notification {
-        val launchIntent = Intent(this, MainActivity::class.java)
+        val launchIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -167,8 +227,8 @@ class NayroFloatingService : Service() {
             .build()
     }
 
-    private fun initBubbleView() {
-        if (bubbleRootView != null) return // Avoid duplicate window
+    private fun initBubbleView(): Boolean {
+        if (bubbleRootView != null) return true // Already created
 
         val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -274,10 +334,12 @@ class NayroFloatingService : Service() {
         })
 
         bubbleRootView = bubble
-        try {
+        return try {
             windowManager.addView(bubbleRootView, bubbleParams)
+            true
         } catch (e: Exception) {
             e.printStackTrace()
+            false
         }
     }
 
@@ -331,7 +393,7 @@ class NayroFloatingService : Service() {
         panel.addView(header)
 
         val subHeader = TextView(this).apply {
-            text = "Private Personal Voice Agent (Ready)"
+            text = "Voice & Text Assistant (Connected)"
             setTextColor(Color.parseColor("#DCE7DE"))
             textSize = 13f
             setPadding(0, 0, 0, (12 * resources.displayMetrics.density).toInt())
@@ -363,14 +425,38 @@ class NayroFloatingService : Service() {
         val sendBtn = Button(this).apply {
             text = "Send"
             setTextColor(Color.parseColor("#FFFFFF"))
-            setBackgroundColor(Color.parseColor("#153B35"))
-            setOnClickListener {
-                closePanel()
-                val mainIntent = Intent(this@NayroFloatingService, MainActivity::class.java).apply {
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-                }
-                startActivity(mainIntent)
+            setBackgroundColor(Color.parseColor("#6F7C76")) // Start disabled color
+            isEnabled = false
+        }
+
+        // Enable send only when input is non-empty
+        input.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
+                val hasText = !s.isNullOrBlank()
+                sendBtn.isEnabled = hasText
+                sendBtn.setBackgroundColor(
+                    if (hasText) Color.parseColor("#153B35") else Color.parseColor("#6F7C76")
+                )
             }
+            override fun afterTextChanged(s: Editable?) {}
+        })
+
+        sendBtn.setOnClickListener {
+            val userText = input.text.toString().trim()
+            if (userText.isEmpty()) {
+                Toast.makeText(this, "Please enter a message", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            closePanel()
+
+            // Transmit user text directly to MainActivity via Intent with EXTRA_FLOATING_PROMPT
+            val mainIntent = Intent(this@NayroFloatingService, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(EXTRA_FLOATING_PROMPT, userText)
+            }
+            startActivity(mainIntent)
         }
         btnRow.addView(sendBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
@@ -402,6 +488,8 @@ class NayroFloatingService : Service() {
             isPanelOpen = true
         } catch (e: Exception) {
             e.printStackTrace()
+            panelRootView = null
+            isPanelOpen = false
         }
     }
 

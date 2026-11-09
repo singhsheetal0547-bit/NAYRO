@@ -2,7 +2,9 @@ package com.example
 
 import android.content.Intent
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -10,6 +12,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -26,9 +29,16 @@ import com.example.core.permission.PermissionManager
 import com.example.core.permission.PermissionRegistry
 import com.example.core.permission.PermissionType
 import com.example.core.provider.AIProviderManager
+import com.example.core.provider.ProviderConfig
+import com.example.core.provider.ProviderType
+import com.example.core.provider.model.AIChatMessage
+import com.example.core.provider.model.AIResult
 import com.example.core.security.EncryptedStorageManager
 import com.example.core.service.NayroForegroundService
+import com.example.core.service.ServiceLifecycleState
+import com.example.core.service.ServiceStateRepository
 import com.example.core.voice.VoiceManager
+import com.example.core.voice.VoiceState
 import com.example.data.local.NayroDatabase
 import com.example.data.local.entities.ConversationEntity
 import com.example.data.repository.NayroRepository
@@ -58,6 +68,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var voiceManager: VoiceManager
     private lateinit var providerManager: AIProviderManager
 
+    // Holds pending prompt delivered from floating assistant
+    private var pendingFloatingPrompt: String? = null
+
     // Single permission request launcher
     private val requestSinglePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -70,15 +83,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
+        // Extract floating assistant intent prompt if present
+        handleIncomingIntent(intent)
+
         // Initialize Core Engines
         database = NayroDatabase.getDatabase(this)
         repository = NayroRepository(database)
         permissionManager = PermissionManager(this)
-        capabilityManager = CapabilityManager(this, permissionManager)
         encryptedStorageManager = EncryptedStorageManager(this)
+        providerManager = AIProviderManager(encryptedStorageManager)
+        capabilityManager = CapabilityManager(this, permissionManager, providerManager)
         agentRuntime = AgentRuntime()
         voiceManager = VoiceManager(this)
-        providerManager = AIProviderManager()
 
         setContent {
             NayroTheme {
@@ -90,6 +106,8 @@ class MainActivity : ComponentActivity() {
                     agentRuntime = agentRuntime,
                     voiceManager = voiceManager,
                     providerManager = providerManager,
+                    initialPendingPrompt = pendingFloatingPrompt,
+                    onClearPendingPrompt = { pendingFloatingPrompt = null },
                     onRequestRuntimePermission = { type ->
                         val item = PermissionRegistry.findByType(type)
                         item?.androidPermissionString?.let { permStr ->
@@ -104,44 +122,44 @@ class MainActivity : ComponentActivity() {
                     },
                     onStartForegroundService = {
                         NayroForegroundService.startService(this)
-                        capabilityManager.updateServiceStates(
-                            foregroundRunning = true,
-                            floatingRunning = NayroFloatingService.isRunning.value
-                        )
                     },
                     onStopForegroundService = {
                         NayroForegroundService.stopService(this)
-                        capabilityManager.updateServiceStates(
-                            foregroundRunning = false,
-                            floatingRunning = NayroFloatingService.isRunning.value
-                        )
                     },
                     onStartFloatingService = {
                         NayroFloatingService.startService(this)
-                        capabilityManager.updateServiceStates(
-                            foregroundRunning = NayroForegroundService.isRunning.value,
-                            floatingRunning = true
-                        )
                     },
                     onStopFloatingService = {
                         NayroFloatingService.stopService(this)
-                        capabilityManager.updateServiceStates(
-                            foregroundRunning = NayroForegroundService.isRunning.value,
-                            floatingRunning = false
-                        )
                     }
                 )
             }
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        val floatingPrompt = intent?.getStringExtra(NayroFloatingService.EXTRA_FLOATING_PROMPT)
+        if (!floatingPrompt.isNullOrBlank()) {
+            pendingFloatingPrompt = floatingPrompt
+            intent.removeExtra(NayroFloatingService.EXTRA_FLOATING_PROMPT)
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         permissionManager.refreshAllPermissions(this)
-        capabilityManager.updateServiceStates(
-            foregroundRunning = NayroForegroundService.isRunning.value,
-            floatingRunning = NayroFloatingService.isRunning.value
-        )
+        capabilityManager.evaluateAll()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        voiceManager.destroy()
     }
 }
 
@@ -154,6 +172,8 @@ fun NayroAppContent(
     agentRuntime: AgentRuntime,
     voiceManager: VoiceManager,
     providerManager: AIProviderManager,
+    initialPendingPrompt: String?,
+    onClearPendingPrompt: () -> Unit,
     onRequestRuntimePermission: (PermissionType) -> Unit,
     onOpenPermissionSettings: (PermissionType) -> Unit,
     onStartForegroundService: () -> Unit,
@@ -174,11 +194,103 @@ fun NayroAppContent(
     val capabilities by capabilityManager.capabilities.collectAsState()
 
     val agentState by agentRuntime.currentState.collectAsState()
+    val configuredProviders by providerManager.configuredProviders.collectAsState()
     val activeProvider by providerManager.activeProvider.collectAsState()
     val voiceConfig by voiceManager.configuration.collectAsState()
+    val voiceState by voiceManager.voiceState.collectAsState()
 
-    val isForegroundRunning by NayroForegroundService.isRunning.collectAsState()
-    val isFloatingRunning by NayroFloatingService.isRunning.collectAsState()
+    val foregroundStatus by ServiceStateRepository.foregroundServiceStatus.collectAsState()
+    val floatingStatus by ServiceStateRepository.floatingServiceStatus.collectAsState()
+
+    // Unified dispatch function: executes user request across AI engine, TTS, and DB
+    fun processUserPrompt(promptText: String) {
+        val text = promptText.trim()
+        if (text.isEmpty()) return
+
+        coroutineScope.launch {
+            // Save User message
+            repository.addConversationMessage(
+                ConversationEntity(sender = "user", content = text)
+            )
+            agentRuntime.setState(AgentState.Thinking)
+
+            // Convert DB history to AIChatMessage list
+            val history = conversations.takeLast(10).map { msg ->
+                AIChatMessage(
+                    role = if (msg.sender == "user") "user" else "assistant",
+                    content = msg.content
+                )
+            }
+
+            // Call Multi-Provider AI Engine
+            val result = providerManager.sendRequest(userPrompt = text, history = history)
+
+            when (result) {
+                is AIResult.Success -> {
+                    val reply = result.response.content
+                    repository.addConversationMessage(
+                        ConversationEntity(sender = "babu", content = reply)
+                    )
+                    agentRuntime.setState(AgentState.Speaking(reply))
+
+                    // Speak response via TTS if configured
+                    if (voiceConfig.isWakeWordEnabled || voiceState == VoiceState.SPEAKING) {
+                        voiceManager.speak(reply)
+                    }
+
+                    repository.logAuditAction(
+                        actionType = "AI_QUERY_SUCCESS",
+                        target = result.response.providerId,
+                        riskLevel = "R0",
+                        outcome = "SUCCESS",
+                        details = "Model: ${result.response.modelId}, Tokens: ${result.response.completionTokens ?: 0}"
+                    )
+                    agentRuntime.setState(AgentState.Idle)
+                }
+
+                is AIResult.Error -> {
+                    val errReply = "Babu couldn't complete your request: ${result.message}"
+                    repository.addConversationMessage(
+                        ConversationEntity(sender = "babu", content = errReply)
+                    )
+                    agentRuntime.setState(AgentState.Error(result.message))
+
+                    repository.logAuditAction(
+                        actionType = "AI_QUERY_ERROR",
+                        target = activeProvider?.id ?: "none",
+                        riskLevel = "R0",
+                        outcome = "FAILED",
+                        details = "Code: ${result.code}, Msg: ${result.message}"
+                    )
+                }
+            }
+        }
+    }
+
+    // Handle Speech Recognition callback
+    LaunchedEffect(Unit) {
+        voiceManager.onSpeechRecognized = { recognizedText ->
+            processUserPrompt(recognizedText)
+        }
+        voiceManager.onSpeechError = { errorMsg ->
+            agentRuntime.setState(AgentState.Error(errorMsg))
+        }
+    }
+
+    // Process Pending prompt from Floating Assistant
+    LaunchedEffect(initialPendingPrompt) {
+        if (!initialPendingPrompt.isNullOrBlank()) {
+            currentScreen = Screen.Chat
+            processUserPrompt(initialPendingPrompt)
+            onClearPendingPrompt()
+        }
+    }
+
+    if (currentScreen != Screen.Home) {
+        BackHandler {
+            currentScreen = Screen.Home
+        }
+    }
 
     if (showOnboarding) {
         OnboardingScreen(
@@ -207,30 +319,22 @@ fun NayroAppContent(
                 Screen.Home -> HomeScreen(
                     assistantName = assistantName,
                     agentState = agentState,
-                    isForegroundActive = isForegroundRunning,
-                    isFloatingActive = isFloatingRunning,
+                    isForegroundActive = foregroundStatus.state == ServiceLifecycleState.RUNNING,
+                    isFloatingActive = floatingStatus.state == ServiceLifecycleState.RUNNING,
                     isAiReady = activeProvider != null,
                     onVoiceTap = {
-                        if (agentState is AgentState.UserListening) {
-                            agentRuntime.setState(AgentState.Idle)
+                        if (voiceState == VoiceState.LISTENING) {
+                            voiceManager.stopListening()
                         } else {
-                            agentRuntime.setState(AgentState.UserListening)
+                            if (!permissionManager.isMicrophoneGranted()) {
+                                onRequestRuntimePermission(PermissionType.MICROPHONE)
+                            } else {
+                                voiceManager.startListening()
+                            }
                         }
                     },
                     onSendText = { text ->
-                        coroutineScope.launch {
-                            repository.addConversationMessage(
-                                ConversationEntity(sender = "user", content = text)
-                            )
-                            agentRuntime.submitUserRequest(text)
-                            repository.addConversationMessage(
-                                ConversationEntity(
-                                    sender = "babu",
-                                    content = "Namaste! I am Babu. I received your message: \"$text\". AI provider setup can be configured in Settings."
-                                )
-                            )
-                            agentRuntime.setState(AgentState.Idle)
-                        }
+                        processUserPrompt(text)
                     },
                     onQuickActionClick = { tag ->
                         when (tag) {
@@ -244,8 +348,8 @@ fun NayroAppContent(
                 )
 
                 Screen.BackgroundControl -> BackgroundControlScreen(
-                    isForegroundRunning = isForegroundRunning,
-                    isFloatingRunning = isFloatingRunning,
+                    isForegroundRunning = foregroundStatus.state == ServiceLifecycleState.RUNNING,
+                    isFloatingRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
                     hasOverlayPermission = permissionManager.canDrawOverlays(),
                     onStartForegroundService = onStartForegroundService,
                     onStopForegroundService = onStopForegroundService,
@@ -269,20 +373,20 @@ fun NayroAppContent(
                             CapabilityId.FLOATING_ASSISTANT -> {
                                 if (!permissionManager.canDrawOverlays()) {
                                     onOpenPermissionSettings(PermissionType.OVERLAY)
-                                } else if (isFloatingRunning) {
+                                } else if (floatingStatus.state == ServiceLifecycleState.RUNNING) {
                                     onStopFloatingService()
                                 } else {
                                     onStartFloatingService()
                                 }
                             }
                             CapabilityId.BACKGROUND_AGENT -> {
-                                if (isForegroundRunning) {
+                                if (foregroundStatus.state == ServiceLifecycleState.RUNNING) {
                                     onStopForegroundService()
                                 } else {
                                     onStartForegroundService()
                                 }
                             }
-                            CapabilityId.MICROPHONE_ACCESS -> {
+                            CapabilityId.MICROPHONE_ACCESS, CapabilityId.WAKE_WORD_READY, CapabilityId.VOICE_INTERACTION_READY -> {
                                 onRequestRuntimePermission(PermissionType.MICROPHONE)
                             }
                             CapabilityId.NOTIFICATION_ACCESS -> {
@@ -299,17 +403,7 @@ fun NayroAppContent(
                 Screen.Chat -> ConversationScreen(
                     conversations = conversations,
                     onSendMessage = { text ->
-                        coroutineScope.launch {
-                            repository.addConversationMessage(
-                                ConversationEntity(sender = "user", content = text)
-                            )
-                            repository.addConversationMessage(
-                                ConversationEntity(
-                                    sender = "babu",
-                                    content = "Babu received: \"$text\"."
-                                )
-                            )
-                        }
+                        processUserPrompt(text)
                     },
                     onClearHistory = {
                         coroutineScope.launch {
@@ -334,8 +428,12 @@ fun NayroAppContent(
                 Screen.Settings -> SettingsScreen(
                     assistantName = assistantName,
                     isWakeEnabled = voiceConfig.isWakeWordEnabled,
+                    providers = configuredProviders,
+                    activeProviderId = activeProvider?.id,
                     onSaveApiKey = { providerId, apiKey ->
                         encryptedStorageManager.saveApiKey(providerId, apiKey)
+                        providerManager.refreshActiveProvider()
+                        capabilityManager.evaluateAll()
                         coroutineScope.launch {
                             repository.logAuditAction(
                                 actionType = "SECURITY_KEY_UPDATE",
@@ -346,8 +444,37 @@ fun NayroAppContent(
                             )
                         }
                     },
+                    onSaveCustomProvider = { id, name, url, model ->
+                        val customConfig = ProviderConfig(
+                            id = id,
+                            type = ProviderType.CUSTOM_OPENAI,
+                            name = name,
+                            baseUrl = url,
+                            modelId = model,
+                            priority = 5,
+                            isEnabled = true
+                        )
+                        providerManager.updateProvider(customConfig)
+                        capabilityManager.evaluateAll()
+                    },
                     onToggleWake = { enabled ->
                         voiceManager.updateConfiguration(voiceConfig.copy(isWakeWordEnabled = enabled))
+                        capabilityManager.evaluateAll()
+                    },
+                    onTestProvider = { providerId ->
+                        coroutineScope.launch {
+                            val key = encryptedStorageManager.getApiKey(providerId)
+                            val provider = configuredProviders.firstOrNull { it.id == providerId }
+                            if (provider != null) {
+                                agentRuntime.setState(AgentState.Thinking)
+                                val result = providerManager.sendRequest("Test connection from NAYRO")
+                                if (result is AIResult.Success) {
+                                    agentRuntime.setState(AgentState.Completed("Connected successfully to ${provider.name}!"))
+                                } else if (result is AIResult.Error) {
+                                    agentRuntime.setState(AgentState.Error(result.message))
+                                }
+                            }
+                        }
                     }
                 )
 

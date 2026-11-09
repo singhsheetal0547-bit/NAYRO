@@ -1,6 +1,7 @@
 package com.example.core.permission
 
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,6 +9,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
+import android.text.TextUtils
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -17,7 +19,7 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * System A — Centralized Permission Management for NAYRO.
  * Accurately tracks Runtime Permissions, Special App Ops (SYSTEM_ALERT_WINDOW),
- * Accessibility Services, and Battery Optimization Exemptions.
+ * exact AccessibilityService component binding verification, and Battery Optimization Exemptions.
  */
 class PermissionManager(private val context: Context) {
 
@@ -98,18 +100,26 @@ class PermissionManager(private val context: Context) {
                 }
             }
             PermissionType.ACCESSIBILITY -> {
-                val isEnabled = isAccessibilityServiceEnabled()
-                if (isEnabled) {
+                val isDeclared = isAccessibilityServiceDeclared()
+                val isEnabledInSettings = isExactAccessibilityServiceEnabled()
+
+                if (!isDeclared) {
                     PermissionEvaluation(
                         item = item,
-                        status = PermissionStatus.GRANTED,
-                        statusExplanation = "Accessibility service authorized and connected."
+                        status = PermissionStatus.UNAVAILABLE,
+                        statusExplanation = "Accessibility service is not declared in AndroidManifest.xml (Phase 4 feature)."
+                    )
+                } else if (!isEnabledInSettings) {
+                    PermissionEvaluation(
+                        item = item,
+                        status = PermissionStatus.SPECIAL_ACCESS_REQUIRED,
+                        statusExplanation = "Service declared but not enabled in Android Accessibility Settings."
                     )
                 } else {
                     PermissionEvaluation(
                         item = item,
-                        status = PermissionStatus.SPECIAL_ACCESS_REQUIRED,
-                        statusExplanation = "Must be enabled manually by the user in Android Accessibility Settings."
+                        status = PermissionStatus.GRANTED,
+                        statusExplanation = "Exact Accessibility Service component enabled and connected."
                     )
                 }
             }
@@ -131,22 +141,23 @@ class PermissionManager(private val context: Context) {
                 }
             }
             PermissionType.FOREGROUND_SERVICE -> {
-                // Foreground service permissions are declared in manifest and granted install-time
-                val check = ContextCompat.checkSelfPermission(
-                    context,
-                    android.Manifest.permission.FOREGROUND_SERVICE
-                )
-                if (check == PackageManager.PERMISSION_GRANTED) {
+                // Verify actual manifest declaration of FOREGROUND_SERVICE and FOREGROUND_SERVICE_SPECIAL_USE
+                val declared = isManifestPermissionDeclared(android.Manifest.permission.FOREGROUND_SERVICE)
+                val specialUseDeclared = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    isManifestPermissionDeclared(android.Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE)
+                } else true
+
+                if (declared && specialUseDeclared) {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.GRANTED,
-                        statusExplanation = "Foreground service permission declared in manifest and active."
+                        statusExplanation = "FOREGROUND_SERVICE & specialUse type verified in manifest."
                     )
                 } else {
                     PermissionEvaluation(
                         item = item,
-                        status = PermissionStatus.GRANTED,
-                        statusExplanation = "Manifest declared install-time foreground service."
+                        status = PermissionStatus.UNAVAILABLE,
+                        statusExplanation = "Foreground service permission missing or incomplete in AndroidManifest."
                     )
                 }
             }
@@ -202,13 +213,69 @@ class PermissionManager(private val context: Context) {
             .apply()
     }
 
-    fun isAccessibilityServiceEnabled(): Boolean {
+    /**
+     * Verifies if a specific permission is declared in this application's package manifest.
+     */
+    fun isManifestPermissionDeclared(permission: String): Boolean {
+        return try {
+            val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(
+                    context.packageName,
+                    PackageManager.PackageInfoFlags.of(PackageManager.GET_PERMISSIONS.toLong())
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_PERMISSIONS)
+            }
+            packageInfo.requestedPermissions?.contains(permission) == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Verifies if any AccessibilityService is declared in this application's manifest.
+     */
+    fun isAccessibilityServiceDeclared(): Boolean {
+        return try {
+            val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.packageManager.getPackageInfo(
+                    context.packageName,
+                    PackageManager.PackageInfoFlags.of(PackageManager.GET_SERVICES.toLong())
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_SERVICES)
+            }
+            packageInfo.services?.any { service ->
+                service.permission == android.Manifest.permission.BIND_ACCESSIBILITY_SERVICE
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Checks if the exact component name of an AccessibilityService of this app is active in system settings.
+     */
+    fun isExactAccessibilityServiceEnabled(): Boolean {
         return try {
             val enabledServices = Settings.Secure.getString(
                 context.contentResolver,
                 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-            ) ?: ""
-            enabledServices.contains(context.packageName)
+            ) ?: return false
+
+            val colonSplitter = TextUtils.SimpleStringSplitter(':')
+            colonSplitter.setString(enabledServices)
+
+            while (colonSplitter.hasNext()) {
+                val componentNameString = colonSplitter.next()
+                val enabledComponent = ComponentName.unflattenFromString(componentNameString)
+                if (enabledComponent != null && enabledComponent.packageName == context.packageName) {
+                    return true
+                }
+            }
+            false
         } catch (e: Exception) {
             false
         }
