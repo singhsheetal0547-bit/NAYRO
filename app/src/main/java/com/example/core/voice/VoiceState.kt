@@ -15,6 +15,7 @@ data class VoiceConfiguration(
     val assistantName: String = "Babu",
     val wakePhrases: List<String> = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie"),
     val isWakeWordEnabled: Boolean = false,
+    val isTtsEnabled: Boolean = true,
     val sensitivity: Float = 0.7f,
     val isScreenOffWakeEnabled: Boolean = false,
     val language: String = "en-IN", // Hindi/English/Hinglish

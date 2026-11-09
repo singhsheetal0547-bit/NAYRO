@@ -114,3 +114,21 @@ Step 04 delivers the complete multi-system agentic architecture for NAYRO, trans
    - Added `isCapabilityAvailable` to `CapabilityManager`.
    - Bound UI `ConfirmationDialog` buttons in `MainActivity` to `confirmationManager.approve(actionId, parameters)` and `reject(actionId)`.
 
+---
+
+### 5. Background Agent Critical Fix Summary
+1. **Application Container Architecture (`NayroApplication.kt`)**:
+   - Created Application-level container maintaining singletons (`database`, `repository`, `agentRuntime`, `voiceManager`, `healthManager`, `capabilityManager`) independent of `MainActivity` lifecycle.
+2. **Foreground Service Compliance (`NayroForegroundService.kt`)**:
+   - Updated FGS type to `android:foregroundServiceType="microphone"` for local wake-word listening on Android 14+ (API 34+) and Android 15.
+   - Connected `NayroForegroundService` to `VoiceManager` and `AgentRuntime` so background voice triggers dispatch directly to the agent.
+3. **Persistent Floating Assistant (`NayroFloatingService.kt`)**:
+   - Fixed prompt submission in the floating panel: user input is processed directly in `AgentRuntime` & `NayroRepository` in a background scope so user messages are never lost even if `MainActivity` is backgrounded or closed.
+4. **Real Runtime Health Evaluator (`BackgroundAgentHealthManager.kt`)**:
+   - Engineered health manager evaluating real platform APIs (`PowerManager`, `ActivityManager`, `PermissionManager`, `NayroAccessibilityService`, `ServiceStateRepository`, `WakeEngineState`).
+   - Renders live un-hardcoded diagnostic states on `BackgroundControlScreen`.
+5. **Task Continuity & Process Recovery**:
+   - Persisted `IN_PROGRESS` task states in Room database (`task_history`).
+   - Added `recoverInterruptedTasksOnBoot()` in `AgentRuntime`: recovers incomplete tasks on boot, marks them as `INTERRUPTED`, and halts non-idempotent actions to prevent duplicate execution.
+
+

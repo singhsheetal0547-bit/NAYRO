@@ -92,6 +92,7 @@ class AgentRuntime(
             }
             is ValidationResult.Valid -> {
                 taskStateManager.transition(task, TaskState.READY)
+                recordTaskHistory(task, "IN_PROGRESS", "Task execution started", startTime)
             }
         }
 
@@ -263,5 +264,31 @@ class AgentRuntime(
         }
         confirmationManager.clear()
         _currentState.value = AgentState.Idle
+    }
+
+    /**
+     * Recovers active task state after process recreation.
+     * Prevents duplicate execution of non-idempotent actions and updates DB status to INTERRUPTED.
+     */
+    suspend fun recoverInterruptedTasksOnBoot() {
+        val interrupted = repository.getIncompleteTasks()
+        for (taskEntity in interrupted) {
+            val failureMsg = "Task was interrupted by process restart. Non-idempotent actions were halted to prevent duplicate execution."
+            repository.recordTaskExecution(
+                taskEntity.copy(
+                    status = "INTERRUPTED",
+                    resultSummary = failureMsg,
+                    durationMs = System.currentTimeMillis() - taskEntity.timestamp
+                )
+            )
+            repository.logAuditAction(
+                actionType = "TASK_RECOVERY_${taskEntity.resolvedIntent}",
+                target = taskEntity.userInstruction.take(50),
+                riskLevel = "R1",
+                outcome = "INTERRUPTED",
+                details = "Interrupted task recovered on process boot. Non-idempotent actions were halted."
+            )
+            AgentEventBus.emit(AgentEvent.TaskFinished(taskEntity.taskId, isSuccess = false, failureMsg))
+        }
     }
 }

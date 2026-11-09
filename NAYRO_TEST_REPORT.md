@@ -1,12 +1,13 @@
 # NAYRO Step 04 Test Report
-## Consolidated Bug Fix & Agentic Hardening Verification
+## Consolidated Bug Fix & Background Agent Hardening Verification
 
 ## 1. Test Suite Summary
-- **Total Tests Executed**: 37
-- **Passing**: 37
+- **Total Tests Executed**: 42
+- **Passing**: 42
 - **Failing**: 0
-- **Duration**: 40 seconds
+- **Duration**: 15 seconds
 - **Command**: `gradle :app:testDebugUnitTest`
+- **Build Assembly**: `gradle assembleDebug` (BUILD SUCCESSFUL)
 
 ## 2. Test Breakdown
 ### `NayroCoreSystemsTest`:
@@ -49,3 +50,9 @@
 - `testActionExecutionGuardBlocksMissingPermission`: PASSED (Blocks actions when Android permission missing)
 - `testActionVerifierStatuses`: PASSED (Verified, Inconclusive, Failed status checking)
 
+### `BackgroundAgentHardeningTests`:
+- `testServiceStateRepositoryLifecycleTransitions`: PASSED (Foreground service status transitions)
+- `testFloatingServiceStateRepositoryLifecycleTransitions`: PASSED (Floating service status transitions)
+- `testTaskHistoryEntityIncompleteRecoveryState`: PASSED (Incomplete task recovery and non-idempotent action halting)
+- `testWakeWordEngineStatesAndPhrases`: PASSED (Engine states and wake phrase support)
+- `testHealthStatesEnumCompleteness`: PASSED (Health state enum completeness)

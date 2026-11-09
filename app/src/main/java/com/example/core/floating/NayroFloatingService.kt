@@ -34,7 +34,10 @@ import com.example.R
 import com.example.core.service.ServiceLifecycleState
 import com.example.core.service.ServiceStateRepository
 import com.example.core.service.ServiceStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlin.math.abs
 
 /**
@@ -442,6 +445,8 @@ class NayroFloatingService : Service() {
             override fun afterTextChanged(s: Editable?) {}
         })
 
+        val serviceScope = CoroutineScope(Dispatchers.Default)
+
         sendBtn.setOnClickListener {
             val userText = input.text.toString().trim()
             if (userText.isEmpty()) {
@@ -451,12 +456,33 @@ class NayroFloatingService : Service() {
 
             closePanel()
 
-            // Transmit user text directly to MainActivity via Intent with EXTRA_FLOATING_PROMPT
+            // Transmit user text directly to AgentRuntime and ConversationManager
+            serviceScope.launch {
+                try {
+                    val app = com.example.NayroApplication.instance
+                    app.repository.addConversationMessage(
+                        com.example.data.local.entities.ConversationEntity(sender = "user", content = userText)
+                    )
+                    val responseText = app.agentRuntime.executeUserInstruction(userText)
+                    app.repository.addConversationMessage(
+                        com.example.data.local.entities.ConversationEntity(sender = "babu", content = responseText)
+                    )
+                    if (app.voiceManager.configuration.value.isTtsEnabled) {
+                        app.voiceManager.speak(responseText)
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+
+            // Also deliver intent to MainActivity if launcher activity is active
             val mainIntent = Intent(this@NayroFloatingService, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
                 putExtra(EXTRA_FLOATING_PROMPT, userText)
             }
-            startActivity(mainIntent)
+            try {
+                startActivity(mainIntent)
+            } catch (e: Exception) {}
         }
         btnRow.addView(sendBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 

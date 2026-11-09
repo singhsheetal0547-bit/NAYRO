@@ -58,6 +58,10 @@ class NayroRepository(private val database: NayroDatabase) {
         return database.taskHistoryDao().insertTask(task)
     }
 
+    suspend fun getIncompleteTasks(): List<TaskHistoryEntity> {
+        return database.taskHistoryDao().getIncompleteTasks()
+    }
+
     suspend fun clearTaskHistory() {
         database.taskHistoryDao().clearTaskHistory()
     }

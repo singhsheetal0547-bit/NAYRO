@@ -91,6 +91,9 @@ interface TaskHistoryDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertTask(task: com.example.data.local.entities.TaskHistoryEntity): Long
 
+    @Query("SELECT * FROM task_history WHERE status IN ('IN_PROGRESS', 'EXECUTING', 'UNDERSTANDING') ORDER BY timestamp DESC")
+    suspend fun getIncompleteTasks(): List<com.example.data.local.entities.TaskHistoryEntity>
+
     @Query("DELETE FROM task_history")
     suspend fun clearTaskHistory()
 }

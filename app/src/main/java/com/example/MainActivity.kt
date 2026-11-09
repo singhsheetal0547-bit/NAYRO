@@ -86,29 +86,17 @@ class MainActivity : ComponentActivity() {
         // Extract floating assistant intent prompt if present
         handleIncomingIntent(intent)
 
-        // Initialize Core Engines
-        database = NayroDatabase.getDatabase(this)
-        repository = NayroRepository(database)
-        permissionManager = PermissionManager(this)
-        encryptedStorageManager = EncryptedStorageManager(this)
-        providerManager = AIProviderManager(encryptedStorageManager)
-        capabilityManager = CapabilityManager(this, permissionManager, providerManager)
-
-        val screenIntelligenceManager = com.example.core.screen.ScreenIntelligenceManager(this)
-        val memoryManager = com.example.core.memory.MemoryManager(repository)
-        val notebookManager = com.example.core.memory.NotebookManager(repository)
-
-        agentRuntime = AgentRuntime(
-            context = this,
-            repository = repository,
-            permissionManager = permissionManager,
-            capabilityManager = capabilityManager,
-            screenIntelligenceManager = screenIntelligenceManager,
-            memoryManager = memoryManager,
-            notebookManager = notebookManager,
-            providerManager = providerManager
-        )
-        voiceManager = VoiceManager(this)
+        // Initialize Core Engines from NayroApplication Container
+        val app = (application as? NayroApplication) ?: NayroApplication.instance
+        database = app.database
+        repository = app.repository
+        permissionManager = app.permissionManager
+        capabilityManager = app.capabilityManager
+        encryptedStorageManager = app.encryptedStorageManager
+        providerManager = app.providerManager
+        agentRuntime = app.agentRuntime
+        voiceManager = app.voiceManager
+        val notebookManager = app.notebookManager
 
         setContent {
             NayroTheme {

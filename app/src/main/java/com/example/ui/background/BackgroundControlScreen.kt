@@ -258,7 +258,60 @@ fun BackgroundControlScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Card 3: Privacy & OEM Guidelines Info
+        // Card 3: Real Runtime Health Diagnostics
+        val healthReport = try {
+            com.example.NayroApplication.instance.healthManager.evaluateHealth()
+        } catch (e: Exception) {
+            null
+        }
+
+        healthReport?.let { report ->
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth().testTag("card_health_diagnostics")
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Real Runtime Health & Diagnostics",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Evaluates actual Android OS APIs, permissions, and engine states.",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Text(
+                        text = report.healthSummaryMessage,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = SoftSage
+                    )
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    report.activeStates.forEach { state ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(vertical = 2.dp)
+                        ) {
+                            StatusBadge(
+                                label = state.name,
+                                isActive = state.name.contains("RUNNING") || state.name.contains("GRANTED") || state.name.contains("ACTIVE") || state.name.contains("CONNECTED") || state.name.contains("OPTIMIZED"),
+                                testTag = "badge_health_${state.name.lowercase()}"
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        // Card 4: Privacy & OEM Guidelines Info
         Card(
             colors = CardDefaults.cardColors(containerColor = DarkSurfaceVariant),
             shape = RoundedCornerShape(16.dp),
@@ -273,7 +326,7 @@ fun BackgroundControlScreen(
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = "• Privacy Rule: Microphone is never continuously active or streaming in the background.\n" +
-                            "• Foreground Service Type: Declared as specialUse for lifecycle coordination.\n" +
+                            "• Foreground Service Type: Legitimate foregroundServiceType='microphone' for local wake phrase listening.\n" +
                             "• OEM Battery Restrictions: Unrestricted battery execution is optional and requested transparently.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = SoftSage
