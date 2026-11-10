@@ -5,6 +5,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
@@ -21,6 +22,8 @@ import com.example.core.agent.tools.ToolRegistryManager
 import com.example.core.memory.MemoryCategory
 import com.example.core.memory.MemoryManager
 import com.example.core.memory.NotebookManager
+import com.example.core.notification.NotificationCategory
+import com.example.core.notification.NotificationIntelligenceRepository
 import com.example.core.provider.AIProviderManager
 import com.example.core.provider.model.AIResult
 import com.example.core.screen.ScreenIntelligenceManager
@@ -31,10 +34,12 @@ import com.example.core.subagent.SubAgentStatus
 import com.example.core.subagent.SubAgentType
 import com.example.core.telephony.CallIntelligenceManager
 import com.example.core.telephony.ContactResolutionResult
+import com.example.core.workflow.CrossAppWorkflowEngine
 import com.example.core.workspace.WorkspaceManager
 import com.example.core.workspace.WorkspaceResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -55,7 +60,7 @@ data class ActionExecutionResult(
 /**
  * Authoritative Native Action Executor for NAYRO.
  * Executes validated AgentActions across Android System APIs, Accessibility, Workspace,
- * Web Research (with SSRF protection), Coding Workspace, Skills, and Bounded Sub-Agents.
+ * Web Research (with SSRF protection), Coding Workspace, Skills, Workflows, and Bounded Sub-Agents.
  * Never fabricates success results for unperformed, unsupported, or failed operations.
  */
 class ActionExecutor(
@@ -67,7 +72,8 @@ class ActionExecutor(
     private val workspaceManager: WorkspaceManager = WorkspaceManager(context),
     private val skillManager: SkillManager = SkillManager(),
     private val subAgentManager: SubAgentManager = SubAgentManager(),
-    private val callIntelligenceManager: CallIntelligenceManager = CallIntelligenceManager(context)
+    private val callIntelligenceManager: CallIntelligenceManager = CallIntelligenceManager(context),
+    private val workflowEngine: CrossAppWorkflowEngine = CrossAppWorkflowEngine()
 ) {
 
     companion object {
@@ -238,6 +244,36 @@ class ActionExecutor(
                     ActionExecutionResult(true, "Resolved package for '$query': $pkg", VerificationStatus.VERIFIED)
                 } else {
                     ActionExecutionResult(false, "No installed package matched '$query'.", VerificationStatus.FAILED)
+                }
+            }
+
+            ActionType.TOGGLE_FLASHLIGHT -> {
+                val enabledStr = action.parameters["enabled"] ?: action.target ?: "true"
+                val turnOn = !enabledStr.equals("false", ignoreCase = true) &&
+                    !enabledStr.equals("off", ignoreCase = true) &&
+                    !enabledStr.equals("0", ignoreCase = true)
+                return try {
+                    val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as? android.hardware.camera2.CameraManager
+                        ?: return ActionExecutionResult(false, "CameraManager service is unavailable on this device.", VerificationStatus.NOT_SUPPORTED)
+
+                    val torchCameraId = cameraManager.cameraIdList.firstOrNull { id ->
+                        val chars = cameraManager.getCameraCharacteristics(id)
+                        chars.get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+                    } ?: return ActionExecutionResult(false, "No camera with flashlight hardware found on this device.", VerificationStatus.NOT_SUPPORTED)
+
+                    cameraManager.setTorchMode(torchCameraId, turnOn)
+                    val stateWord = if (turnOn) "ON" else "OFF"
+                    ActionExecutionResult(
+                        true,
+                        "Flashlight turned $stateWord (cameraId=$torchCameraId).",
+                        VerificationStatus.VERIFIED
+                    )
+                } catch (e: Exception) {
+                    ActionExecutionResult(
+                        false,
+                        "Failed to toggle flashlight: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                        VerificationStatus.FAILED
+                    )
                 }
             }
 
@@ -476,23 +512,30 @@ class ActionExecutor(
             }
 
             ActionType.READ_NOTIFICATIONS -> {
-                val enabledListeners = try {
-                    Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners").orEmpty()
-                } catch (_: Exception) {
-                    ""
-                }
-                if (!enabledListeners.contains(context.packageName)) {
+                if (!isNotificationListenerAvailable()) {
                     ActionExecutionResult(
                         false,
                         "Notification Listener access is not enabled for NAYRO. Please grant Notification Access in Settings.",
                         VerificationStatus.REQUIRES_PERMISSION
                     )
                 } else {
-                    ActionExecutionResult(
-                        true,
-                        "Notification Listener is enabled; no unread priority notifications in active buffer.",
-                        VerificationStatus.VERIFIED
-                    )
+                    val recent = NotificationIntelligenceRepository.getFilteredNotifications().take(15)
+                    if (recent.isEmpty()) {
+                        ActionExecutionResult(
+                            true,
+                            "Notification Listener is enabled; no unread notifications in active buffer.",
+                            VerificationStatus.VERIFIED
+                        )
+                    } else {
+                        val listText = recent.joinToString("\n") {
+                            "[${it.category.name}] ${it.packageName}: ${it.title} — ${it.text}"
+                        }
+                        ActionExecutionResult(
+                            true,
+                            "Active Notifications (${recent.size}):\n$listText",
+                            VerificationStatus.VERIFIED
+                        )
+                    }
                 }
             }
 
@@ -982,7 +1025,410 @@ class ActionExecutor(
                     )
                 }
             }
+
+            ActionType.GET_CURRENT_LOCATION -> {
+                val hasCoarse = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                ) == PackageManager.PERMISSION_GRANTED
+                if (!hasCoarse) {
+                    return ActionExecutionResult(
+                        false,
+                        "Permission required: ACCESS_COARSE_LOCATION is not granted.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+                return try {
+                    val lm = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager
+                        ?: return ActionExecutionResult(false, "LocationManager service unavailable.", VerificationStatus.FAILED)
+                    val providers = lm.getProviders(true)
+                    val lastLoc = providers.mapNotNull { prov ->
+                        try { lm.getLastKnownLocation(prov) } catch (_: SecurityException) { null }
+                    }.maxByOrNull { it.time }
+
+                    if (lastLoc != null) {
+                        ActionExecutionResult(
+                            true,
+                            "Approximate location: lat=${"%.4f".format(lastLoc.latitude)}, lon=${"%.4f".format(lastLoc.longitude)} (provider=${lastLoc.provider}).",
+                            VerificationStatus.VERIFIED
+                        )
+                    } else {
+                        ActionExecutionResult(
+                            false,
+                            "Location permission granted, but no cached location fix is currently available on device.",
+                            VerificationStatus.INCONCLUSIVE
+                        )
+                    }
+                } catch (e: Exception) {
+                    ActionExecutionResult(false, "Location lookup failed: ${e.localizedMessage}", VerificationStatus.FAILED)
+                }
+            }
+
+            ActionType.SWIPE_SCREEN -> {
+                val service = NayroAccessibilityService.instance
+                    ?: return ActionExecutionResult(
+                        false,
+                        "Cannot swipe screen: NAYRO Accessibility Service is not connected.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                val direction = (action.target ?: action.parameters["direction"] ?: "up").trim().lowercase()
+                val durationMs = action.parameters["durationMs"]?.toLongOrNull() ?: 300L
+                val (sx, sy, ex, ey) = when (direction) {
+                    "up" -> listOf(540f, 1600f, 540f, 500f)
+                    "down" -> listOf(540f, 500f, 540f, 1600f)
+                    "left" -> listOf(900f, 1000f, 180f, 1000f)
+                    "right" -> listOf(180f, 1000f, 900f, 1000f)
+                    else -> {
+                        val x1 = action.parameters["startX"]?.toFloatOrNull()
+                        val y1 = action.parameters["startY"]?.toFloatOrNull()
+                        val x2 = action.parameters["endX"]?.toFloatOrNull()
+                        val y2 = action.parameters["endY"]?.toFloatOrNull()
+                        if (x1 == null || y1 == null || x2 == null || y2 == null) {
+                            return ActionExecutionResult(
+                                false,
+                                "Invalid swipe direction '$direction'. Specify up, down, left, right, or numeric startX/startY/endX/endY.",
+                                VerificationStatus.FAILED
+                            )
+                        }
+                        listOf(x1, y1, x2, y2)
+                    }
+                }
+                val (ok, msg) = service.dispatchSwipeGesture(sx, sy, ex, ey, durationMs)
+                ActionExecutionResult(ok, msg, if (ok) VerificationStatus.VERIFIED else VerificationStatus.FAILED)
+            }
+
+            ActionType.ANALYZE_IMAGE_VISION -> {
+                val prompt = (action.parameters["prompt"] ?: action.target ?: "Describe what is visible on the screen.").trim()
+                val filename = action.parameters["filename"]?.trim()
+                val contextText = if (!filename.isNullOrBlank()) {
+                    when (val res = workspaceManager.readFileResult(filename)) {
+                        is WorkspaceResult.Success -> "Workspace file '$filename':\n${res.content.take(3000)}"
+                        else -> {
+                            return mapWorkspaceResult(res)
+                        }
+                    }
+                } else if (NayroAccessibilityService.isConnected()) {
+                    screenIntelligenceManager.describeScreenContent()
+                } else {
+                    return ActionExecutionResult(
+                        false,
+                        "Cannot analyze screen/image: neither a workspace filename was provided nor is Accessibility Service connected.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+
+                val activeProvider = providerManager.activeProvider.value
+                if (activeProvider != null && activeProvider.hasKeySaved) {
+                    val aiRes = providerManager.sendRequest(
+                        userPrompt = "$prompt\n\nObserved Visual/Screen Context:\n$contextText",
+                        systemPrompt = "Analyze the observed screen or document context accurately and concisely."
+                    )
+                    if (aiRes is AIResult.Success) {
+                        return ActionExecutionResult(true, aiRes.response.content, VerificationStatus.VERIFIED)
+                    }
+                }
+                ActionExecutionResult(
+                    true,
+                    "Visual/Screen Context Analysis:\n$contextText",
+                    VerificationStatus.VERIFIED
+                )
+            }
+
+            ActionType.SEND_SMS -> {
+                val rawRecipient = (action.target ?: action.parameters["recipient"])?.trim().orEmpty()
+                val message = (action.parameters["message"] ?: action.parameters["draft"])?.trim().orEmpty()
+                if (rawRecipient.isEmpty() || message.isEmpty()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Cannot send SMS: recipient and message text are both required.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                if (!isConfirmed) {
+                    return ActionExecutionResult(
+                        false,
+                        "Confirmation required before composing SMS to '$rawRecipient': \"$message\"",
+                        VerificationStatus.REQUIRES_CONFIRMATION
+                    )
+                }
+
+                val isDirectDigits = rawRecipient.any { it.isDigit() } && rawRecipient.none { it.isLetter() }
+                val phoneToSms = if (isDirectDigits) {
+                    rawRecipient
+                } else {
+                    when (val res = callIntelligenceManager.resolveContactsByName(rawRecipient)) {
+                        is ContactResolutionResult.SingleMatch -> res.contact.phoneNumber
+                        is ContactResolutionResult.Ambiguous -> {
+                            return ActionExecutionResult(
+                                false,
+                                "Ambiguous SMS recipient '$rawRecipient': multiple contacts matched.",
+                                VerificationStatus.FAILED
+                            )
+                        }
+                        is ContactResolutionResult.PermissionRequired -> {
+                            return ActionExecutionResult(
+                                false,
+                                "Permission required: READ_CONTACTS is needed to resolve '$rawRecipient'.",
+                                VerificationStatus.REQUIRES_PERMISSION
+                            )
+                        }
+                        is ContactResolutionResult.NotFound -> {
+                            return ActionExecutionResult(
+                                false,
+                                "Contact '$rawRecipient' was not found in device contacts.",
+                                VerificationStatus.FAILED
+                            )
+                        }
+                    }
+                }
+
+                return try {
+                    val smsIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(phoneToSms)}")).apply {
+                        putExtra("sms_body", message)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(smsIntent)
+                    ActionExecutionResult(
+                        true,
+                        "Opened SMS composer for $rawRecipient ($phoneToSms) with message '$message'. Please tap Send in your SMS app to complete network transmission.",
+                        VerificationStatus.VERIFIED
+                    )
+                } catch (e: Exception) {
+                    ActionExecutionResult(
+                        false,
+                        "Failed to open SMS composer for '$rawRecipient': ${e.localizedMessage}",
+                        VerificationStatus.FAILED
+                    )
+                }
+            }
+
+            ActionType.SUMMARIZE_NOTIFICATIONS -> {
+                if (!isNotificationListenerAvailable()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Notification Listener access is not enabled for NAYRO. Please grant Notification Access in Settings.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+                val summary = NotificationIntelligenceRepository.summarizeNotifications()
+                ActionExecutionResult(true, summary, VerificationStatus.VERIFIED)
+            }
+
+            ActionType.CLASSIFY_NOTIFICATIONS -> {
+                if (!isNotificationListenerAvailable()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Notification Listener access is not enabled for NAYRO.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+                val categoryFilter = action.parameters["category"]?.trim()?.uppercase()
+                val all = NotificationIntelligenceRepository.getFilteredNotifications().take(25)
+                val filtered = if (!categoryFilter.isNullOrBlank()) {
+                    val cat = runCatching { NotificationCategory.valueOf(categoryFilter) }.getOrNull()
+                    if (cat != null) all.filter { item -> item.category == cat } else all
+                } else {
+                    all
+                }
+                if (filtered.isEmpty()) {
+                    ActionExecutionResult(true, "No active notifications matched filter.", VerificationStatus.VERIFIED)
+                } else {
+                    val text = filtered.joinToString("\n") { item ->
+                        "- [${item.category.name}] ${item.packageName}: ${item.title} (${item.text})"
+                    }
+                    ActionExecutionResult(true, "Classified Notifications (${filtered.size}):\n$text", VerificationStatus.VERIFIED)
+                }
+            }
+
+            ActionType.CREATE_TASK_FROM_NOTIFICATION -> {
+                if (!isNotificationListenerAvailable()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Notification Listener access is not enabled for NAYRO.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+                val recent = NotificationIntelligenceRepository.getFilteredNotifications().take(10)
+                val targetNotif = recent.firstOrNull()
+                    ?: return ActionExecutionResult(
+                        false,
+                        "No active notification found to convert into a reminder/task.",
+                        VerificationStatus.FAILED
+                    )
+                val reminderTitle = "Follow up (${targetNotif.packageName}): ${targetNotif.title}"
+                val noteId = notebookManager.createNote(
+                    title = reminderTitle.take(48),
+                    content = "${targetNotif.title} — ${targetNotif.text}",
+                    category = "Reminders"
+                )
+                ActionExecutionResult(
+                    true,
+                    "Created reminder #$noteId from notification: '$reminderTitle'.",
+                    VerificationStatus.VERIFIED
+                )
+            }
+
+            ActionType.COMPARE_DOCUMENTS -> {
+                val firstFile = (action.parameters["firstFile"] ?: "").trim()
+                val secondFile = (action.parameters["secondFile"] ?: "").trim()
+                if (firstFile.isEmpty() || secondFile.isEmpty()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Both 'firstFile' and 'secondFile' parameters are required to compare documents.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                val res1 = workspaceManager.readFileResult(firstFile)
+                if (res1 !is WorkspaceResult.Success) return mapWorkspaceResult(res1)
+                val res2 = workspaceManager.readFileResult(secondFile)
+                if (res2 !is WorkspaceResult.Success) return mapWorkspaceResult(res2)
+
+                val lines1 = res1.content.lines()
+                val lines2 = res2.content.lines()
+                val added = (lines2.toSet() - lines1.toSet()).size
+                val removed = (lines1.toSet() - lines2.toSet()).size
+                val identical = res1.content == res2.content
+                val msg = if (identical) {
+                    "Documents '$firstFile' and '$secondFile' are identical (${lines1.size} lines)."
+                } else {
+                    "Comparison of '$firstFile' (${lines1.size} lines) vs '$secondFile' (${lines2.size} lines): $added unique line(s) in '$secondFile', $removed unique line(s) in '$firstFile'."
+                }
+                ActionExecutionResult(true, msg, VerificationStatus.VERIFIED)
+            }
+
+            ActionType.EXECUTE_CROSS_APP_WORKFLOW -> {
+                val workflowId = (action.target ?: action.parameters["workflowId"] ?: "wf_doc_summary_to_note").trim()
+                val wfResult = workflowEngine.executeTemplateById(
+                    templateId = workflowId,
+                    parameters = action.parameters
+                ) { stepAction ->
+                    execute(stepAction, isConfirmed)
+                }
+                val status = when (wfResult.state) {
+                    TaskState.COMPLETED -> VerificationStatus.VERIFIED
+                    TaskState.PARTIALLY_COMPLETED -> VerificationStatus.PARTIALLY_COMPLETED
+                    TaskState.WAITING_FOR_PERMISSION -> VerificationStatus.REQUIRES_PERMISSION
+                    TaskState.WAITING_FOR_CONFIRMATION -> VerificationStatus.REQUIRES_CONFIRMATION
+                    else -> VerificationStatus.FAILED
+                }
+                ActionExecutionResult(
+                    isSuccess = wfResult.state == TaskState.COMPLETED,
+                    outputMessage = wfResult.finalSummary ?: "Workflow '${wfResult.title}' finished with state ${wfResult.state.name}.",
+                    status = status
+                )
+            }
+
+            ActionType.SEARCH_NOTES -> {
+                val query = (action.target ?: action.parameters["query"] ?: "").trim()
+                val notesList = if (query.isBlank()) {
+                    notebookManager.notes.firstOrNull().orEmpty()
+                } else {
+                    notebookManager.searchNotes(query).firstOrNull().orEmpty()
+                }
+                if (notesList.isEmpty()) {
+                    ActionExecutionResult(
+                        true,
+                        if (query.isBlank()) "No saved notes in notebook." else "No saved notes matched '$query'.",
+                        VerificationStatus.VERIFIED
+                    )
+                } else {
+                    val summary = notesList.take(10).joinToString("\n") {
+                        "#${it.id} [${it.category}] ${it.title}: ${it.content.take(80)}"
+                    }
+                    ActionExecutionResult(
+                        true,
+                        "Found ${notesList.size} note(s):\n$summary",
+                        VerificationStatus.VERIFIED
+                    )
+                }
+            }
+
+            ActionType.DELETE_NOTE -> {
+                if (!isConfirmed) {
+                    return ActionExecutionResult(
+                        false,
+                        "Confirmation required before deleting personal note.",
+                        VerificationStatus.REQUIRES_CONFIRMATION
+                    )
+                }
+                val noteId = action.parameters["noteId"]?.toLongOrNull()
+                val titleQuery = (action.target ?: action.parameters["title"])?.trim()
+                if (noteId != null) {
+                    notebookManager.deleteNote(noteId)
+                    return ActionExecutionResult(
+                        true,
+                        "Deleted note #$noteId.",
+                        VerificationStatus.VERIFIED
+                    )
+                }
+                if (!titleQuery.isNullOrBlank()) {
+                    val matches = notebookManager.searchNotes(titleQuery).firstOrNull().orEmpty()
+                    val first = matches.firstOrNull()
+                        ?: return ActionExecutionResult(false, "No note found matching '$titleQuery'.", VerificationStatus.FAILED)
+                    notebookManager.deleteNote(first.id)
+                    return ActionExecutionResult(
+                        true,
+                        "Deleted note #${first.id} ('${first.title}').",
+                        VerificationStatus.VERIFIED
+                    )
+                }
+                ActionExecutionResult(false, "Cannot delete note: provide 'noteId' or 'title'.", VerificationStatus.FAILED)
+            }
+
+            ActionType.READ_CALENDAR_EVENTS -> {
+                val hasReadCal = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.READ_CALENDAR
+                ) == PackageManager.PERMISSION_GRANTED
+                if (!hasReadCal) {
+                    return ActionExecutionResult(
+                        false,
+                        "Permission required: READ_CALENDAR is not granted.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+                val limit = (action.parameters["limit"]?.toIntOrNull() ?: 5).coerceIn(1, 20)
+                return try {
+                    val now = System.currentTimeMillis()
+                    val projection = arrayOf(
+                        CalendarContract.Events._ID,
+                        CalendarContract.Events.TITLE,
+                        CalendarContract.Events.DTSTART
+                    )
+                    val selection = "${CalendarContract.Events.DTSTART} >= ?"
+                    val selectionArgs = arrayOf(now.toString())
+                    val events = mutableListOf<String>()
+                    context.contentResolver.query(
+                        CalendarContract.Events.CONTENT_URI,
+                        projection,
+                        selection,
+                        selectionArgs,
+                        "${CalendarContract.Events.DTSTART} ASC"
+                    )?.use { cursor ->
+                        val titleIdx = cursor.getColumnIndex(CalendarContract.Events.TITLE)
+                        val startIdx = cursor.getColumnIndex(CalendarContract.Events.DTSTART)
+                        val sdf = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault())
+                        while (cursor.moveToNext() && events.size < limit) {
+                            val t = if (titleIdx >= 0) cursor.getString(titleIdx) ?: "Untitled" else "Untitled"
+                            val s = if (startIdx >= 0) cursor.getLong(startIdx) else now
+                            events.add("$t (${sdf.format(Date(s))})")
+                        }
+                    }
+                    val msg = if (events.isEmpty()) {
+                        "No upcoming calendar events found."
+                    } else {
+                        "Upcoming Calendar Events (${events.size}): " + events.joinToString("; ")
+                    }
+                    ActionExecutionResult(true, msg, VerificationStatus.VERIFIED)
+                } catch (e: Exception) {
+                    ActionExecutionResult(false, "Failed to read calendar events: ${e.localizedMessage}", VerificationStatus.FAILED)
+                }
+            }
         }
+    }
+
+    private fun isNotificationListenerAvailable(): Boolean {
+        return NotificationIntelligenceRepository.isNotificationAccessEnabled(context)
     }
 
     /**

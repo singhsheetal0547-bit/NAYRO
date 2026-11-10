@@ -1,7 +1,9 @@
 package com.example.ui.home
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -9,22 +11,24 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Build
-import androidx.compose.material.icons.filled.FindInPage
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Psychology
-import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Security
-import androidx.compose.material.icons.filled.SmartDisplay
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VpnKey
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
@@ -33,9 +37,11 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -46,9 +52,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.core.agent.AgentState
 import com.example.core.agent.AgentTask
+import com.example.data.local.entities.ConversationEntity
 import com.example.ui.components.AssistantOrb
 import com.example.ui.components.StatusBadge
 import com.example.ui.components.TaskExecutionCard
@@ -63,6 +71,7 @@ fun HomeScreen(
     assistantName: String = "Babu",
     agentState: AgentState = AgentState.Idle,
     currentTask: AgentTask? = null,
+    recentConversations: List<ConversationEntity> = emptyList(),
     isForegroundActive: Boolean = false,
     isFloatingActive: Boolean = false,
     isAiReady: Boolean = false,
@@ -75,20 +84,22 @@ fun HomeScreen(
     val scrollState = rememberScrollState()
 
     val quickActions = listOf(
-        QuickAction("Background & Floating", "Toggle foreground service & Babu bubble", Icons.Default.Layers, "action_background"),
-        QuickAction("Permissions", "Review system permissions & special access", Icons.Default.Security, "action_perm"),
-        QuickAction("Capability Registry", "Examine live device & feature availability", Icons.Default.Build, "action_caps"),
-        QuickAction("Set Provider API Key", "Configure Gemini or Custom AI Provider", Icons.Default.VpnKey, "action_api"),
-        QuickAction("Memory & Notebook", "View saved preferences and personal notes", Icons.Default.Psychology, "action_memory")
+        QuickAction("Agent Control Center", "Autonomy levels, workflows, automations & Emergency Stop", Icons.Default.Tune, "action_dashboard"),
+        QuickAction("Permissions & Wizard", "Verify runtime permissions, Accessibility & Overlay access", Icons.Default.Security, "action_perm"),
+        QuickAction("Background & Floating", "Toggle foreground service & Andee-style Babu bubble", Icons.Default.Layers, "action_background"),
+        QuickAction("Capability Registry", "Inspect live Android device & feature readiness", Icons.Default.Build, "action_caps"),
+        QuickAction("Memory & Notebook", "View saved preferences, notes, and context", Icons.Default.Psychology, "action_memory"),
+        QuickAction("Set Provider API Key", "Configure Gemini, OpenAI, Grok, or Local Ollama", Icons.Default.VpnKey, "action_api")
     )
 
     val suggestedCommands = listOf(
         "Screen par kya likha hai?",
         "YouTube kholo aur Android AI search karo",
         "Settings kholo aur Wi-Fi section tak jao",
+        "Summarize my recent notifications",
+        "Run workflow: Read Screen & Save Summary Note",
         "Time kya hua hai?",
-        "Note banao: NAYRO architecture meeting",
-        "Yaad rakho ki mujhe Hindi mein jawab pasand hain"
+        "Note banao: NAYRO release checklist"
     )
 
     Column(
@@ -102,135 +113,250 @@ fun HomeScreen(
         // Status Row Badges
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceEvenly
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             StatusBadge(
-                label = if (isForegroundActive) "Agent Service: ON" else "Agent Service: OFF",
+                label = if (isForegroundActive) "Bg Agent: ON" else "Bg Agent: OFF",
                 isActive = isForegroundActive,
+                modifier = Modifier.weight(1f),
                 testTag = "badge_agent_service"
             )
             StatusBadge(
-                label = if (isFloatingActive) "Floating Bubble: ON" else "Floating Bubble: OFF",
+                label = if (isFloatingActive) "Floating: ON" else "Floating: OFF",
                 isActive = isFloatingActive,
+                modifier = Modifier.weight(1f),
                 testTag = "badge_floating_bubble"
             )
             StatusBadge(
-                label = if (isAiReady) "AI Ready" else "AI Setup Needed",
+                label = if (isAiReady) "AI: Ready" else "AI: Local Mode",
                 isActive = isAiReady,
+                modifier = Modifier.weight(1f),
                 testTag = "badge_ai"
             )
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
-        // Active Agent Task Card (if present)
+        // Hero Assistant Workspace Card (Crisp White Surface)
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            shape = RoundedCornerShape(22.dp),
+            elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Namaste! I'm $assistantName",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = "Autonomous Android Agent • Voice, Screen & 48 Native Tools",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { onQuickActionClick("action_wizard") },
+                        modifier = Modifier.testTag("btn_home_setup_wizard")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AutoFixHigh,
+                            contentDescription = null,
+                            tint = ForestGreen,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Setup", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(18.dp))
+
+                AssistantOrb(
+                    agentState = agentState,
+                    size = 96.dp,
+                    onClick = onVoiceTap
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Text(
+                    text = when (agentState) {
+                        is AgentState.UserListening -> "Listening to you..."
+                        is AgentState.Transcribing -> "Transcribing your voice..."
+                        is AgentState.Thinking -> "$assistantName is planning & reasoning..."
+                        is AgentState.Speaking -> "$assistantName is speaking..."
+                        is AgentState.ExecutingTask -> "Executing step ${agentState.step} of ${agentState.totalSteps}: ${agentState.currentAction.actionType}"
+                        is AgentState.ExecutingAction -> "Executing ${agentState.toolName}..."
+                        is AgentState.WaitingForConfirmation -> "Awaiting your confirmation to proceed..."
+                        is AgentState.WaitingForPermission -> "Waiting for required Android permission (${agentState.permission})..."
+                        is AgentState.Completed -> agentState.responseText.take(120)
+                        is AgentState.Error -> "Alert: ${agentState.message.take(100)}"
+                        else -> "Tap Orb or Mic to speak, or type a command below"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    color = Coral
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                // Text & Voice Composer Bar inside Hero Card
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = textInput,
+                        onValueChange = { textInput = it },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("text_input_field"),
+                        placeholder = { Text("Ask $assistantName anything (Hindi, English, Hinglish)...") },
+                        shape = RoundedCornerShape(24.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = ForestGreen,
+                            unfocusedBorderColor = MaterialTheme.colorScheme.outline
+                        ),
+                        singleLine = true
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    if (textInput.isNotBlank()) {
+                        IconButton(
+                            onClick = {
+                                onSendText(textInput)
+                                textInput = ""
+                            },
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(ForestGreen)
+                                .testTag("send_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Send,
+                                contentDescription = "Send prompt",
+                                tint = MaterialTheme.colorScheme.onPrimary
+                            )
+                        }
+                    } else {
+                        IconButton(
+                            onClick = onVoiceTap,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .clip(CircleShape)
+                                .background(Coral)
+                                .testTag("mic_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Mic,
+                                contentDescription = "Activate microphone",
+                                tint = MaterialTheme.colorScheme.onSecondary
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Active Agent Task Execution Card (if present)
         currentTask?.let { task ->
             TaskExecutionCard(
                 task = task,
                 onCancelTask = onCancelTask
             )
-            Spacer(modifier = Modifier.height(20.dp))
+            Spacer(modifier = Modifier.height(16.dp))
         }
 
-        // Assistant Greeting Header
-        Text(
-            text = "Namaste! I'm $assistantName",
-            style = MaterialTheme.typography.displayLarge,
-            color = MaterialTheme.colorScheme.onBackground
-        )
-        Text(
-            text = "Your private, voice-first personal Android AI agent",
-            style = MaterialTheme.typography.bodyLarge,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Central Assistant Visual Orb
-        AssistantOrb(
-            agentState = agentState,
-            size = 130.dp,
-            onClick = onVoiceTap
-        )
-
-        Spacer(modifier = Modifier.height(14.dp))
-
-        Text(
-            text = when (agentState) {
-                is AgentState.UserListening -> "Listening to you..."
-                is AgentState.Thinking -> "Babu is planning & thinking..."
-                is AgentState.Speaking -> "Babu is speaking..."
-                is AgentState.ExecutingTask -> "Executing step ${agentState.step} of ${agentState.totalSteps}..."
-                is AgentState.WaitingForConfirmation -> "Awaiting your confirmation to proceed..."
-                is AgentState.WaitingForPermission -> "Waiting for required Android permission..."
-                else -> "Tap Orb or mic to speak to Babu"
-            },
-            style = MaterialTheme.typography.bodyMedium,
-            color = Coral
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Text & Voice Input Bar
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            OutlinedTextField(
-                value = textInput,
-                onValueChange = { textInput = it },
+        // Inline Conversation Stream Card (shows recent turns right on Home)
+        if (recentConversations.isNotEmpty()) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                shape = RoundedCornerShape(18.dp),
                 modifier = Modifier
-                    .weight(1f)
-                    .testTag("text_input_field"),
-                placeholder = { Text("Ask Babu anything (Hindi, English, Hinglish)...") },
-                shape = RoundedCornerShape(24.dp),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = ForestGreen,
-                    unfocusedBorderColor = SoftSage
-                ),
-                singleLine = true
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            if (textInput.isNotEmpty()) {
-                IconButton(
-                    onClick = {
-                        onSendText(textInput)
-                        textInput = ""
-                    },
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(ForestGreen)
-                        .testTag("send_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Send,
-                        contentDescription = "Send prompt",
-                        tint = MaterialTheme.colorScheme.onPrimary
-                    )
-                }
-            } else {
-                IconButton(
-                    onClick = onVoiceTap,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(24.dp))
-                        .background(Coral)
-                        .testTag("mic_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Mic,
-                        contentDescription = "Activate microphone",
-                        tint = MaterialTheme.colorScheme.onSecondary
-                    )
+                    .fillMaxWidth()
+                    .testTag("home_inline_conversation_card")
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.Chat,
+                                contentDescription = null,
+                                tint = ForestGreen,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Recent Conversation",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                        TextButton(onClick = { onQuickActionClick("action_chat") }) {
+                            Text("Full History", color = ForestGreen)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    recentConversations.takeLast(4).forEach { msg ->
+                        val isUser = msg.sender.equals("user", ignoreCase = true)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(
+                                        if (isUser) ForestGreen else SoftSage
+                                    )
+                                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                Text(
+                                    text = "${if (isUser) "You" else assistantName}: ${msg.content}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = if (isUser) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
+                                )
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        Spacer(modifier = Modifier.height(18.dp))
+            Spacer(modifier = Modifier.height(16.dp))
+        }
 
         // Quick Suggestion Chips
         Text(
-            text = "Try an Agent Command",
+            text = "Try an Autonomous Command",
             style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.align(Alignment.Start)
         )
@@ -252,16 +378,17 @@ fun HomeScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(20.dp))
 
-        // Quick Actions Section
+        // Quick Actions & Agent Modules Section
         Text(
-            text = "Quick Actions & Controls",
-            style = MaterialTheme.typography.titleLarge,
+            text = "Agent Modules & System Controls",
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onBackground,
             modifier = Modifier.align(Alignment.Start)
         )
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
         LazyRow(
             modifier = Modifier.fillMaxWidth(),
@@ -271,12 +398,13 @@ fun HomeScreen(
                 Card(
                     onClick = { onQuickActionClick(action.tag) },
                     modifier = Modifier
-                        .width(220.dp)
+                        .width(225.dp)
                         .testTag("quick_action_${action.tag}"),
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.surface
                     ),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
                 ) {
                     Column(modifier = Modifier.padding(16.dp)) {
                         Icon(
@@ -287,13 +415,14 @@ fun HomeScreen(
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
                             text = action.title,
-                            style = MaterialTheme.typography.titleLarge,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Spacer(modifier = Modifier.height(4.dp))
                         Text(
                             text = action.subtitle,
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }

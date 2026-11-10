@@ -46,6 +46,64 @@ class LocalWakeWordEngine(private val context: Context?) {
     var lastDetectionLatencyMs: Long = 0L
         private set
 
+    private var sensitivity: Float = 0.55f // 0.0 (strict) .. 1.0 (high sensitivity)
+
+    fun setSensitivity(value: Float) {
+        sensitivity = value.coerceIn(0.1f, 0.95f)
+    }
+
+    fun getSensitivity(): Float = sensitivity
+
+    fun isValidSampleRate(sampleRateHz: Int): Boolean {
+        return sampleRateHz in setOf(8000, 16000, 22050, 44100, 48000)
+    }
+
+    /**
+     * Extracts a deterministic 4-element acoustic feature vector `[rms, zcr, peakAmplitude,voicedRatio]`
+     * from a 16-bit PCM frame without allocating large objects on the audio thread.
+     */
+    fun extractAcousticFeatures(pcmBuffer: ShortArray, readCount: Int = pcmBuffer.size): FloatArray {
+        if (readCount <= 0 || pcmBuffer.isEmpty()) return floatArrayOf(0f, 0f, 0f, 0f)
+        val n = readCount.coerceAtMost(pcmBuffer.size)
+        var sumSq = 0.0
+        var zeroCrossings = 0
+        var peak = 0
+        var voicedSamples = 0
+        for (i in 0 until n) {
+            val s = pcmBuffer[i].toInt()
+            val absS = kotlin.math.abs(s)
+            if (absS > peak) peak = absS
+            if (absS > 600) voicedSamples++
+            sumSq += s.toDouble() * s.toDouble()
+            if (i > 0 && ((pcmBuffer[i] >= 0 && pcmBuffer[i - 1] < 0) || (pcmBuffer[i] < 0 && pcmBuffer[i - 1] >= 0))) {
+                zeroCrossings++
+            }
+        }
+        val rms = sqrt(sumSq / n).toFloat()
+        val zcr = zeroCrossings.toFloat() / n.toFloat()
+        val voicedRatio = voicedSamples.toFloat() / n.toFloat()
+        return floatArrayOf(rms, zcr, peak.toFloat(), voicedRatio)
+    }
+
+    /**
+     * Splits an utterance starting with a wake phrase (e.g., "Hi Babu, open WhatsApp")
+     * into `Pair(matchedWakePhrase, trailingCommand)`. Returns null if no configured wake phrase matches.
+     */
+    fun extractCommandAfterWakePhrase(utterance: String): Pair<String, String>? {
+        val trimmed = utterance.trim()
+        if (trimmed.isEmpty()) return null
+        val phrases = getConfiguredWakePhrases().sortedByDescending { it.length }
+        for (phrase in phrases) {
+            val regex = Regex("^${Regex.escape(phrase)}(?:[\\s,.:;!-]+(.*))?$", RegexOption.IGNORE_CASE)
+            val match = regex.find(trimmed)
+            if (match != null) {
+                val remainder = match.groupValues.getOrNull(1)?.trim().orEmpty()
+                return phrase to remainder
+            }
+        }
+        return null
+    }
+
     /**
      * Checks whether a real offline KWS acoustic model file exists in Android assets.
      */
@@ -84,36 +142,28 @@ class LocalWakeWordEngine(private val context: Context?) {
      */
     fun processAudioFrame(pcmBuffer: ShortArray, readCount: Int = pcmBuffer.size, kwsHypothesis: String? = null): String? {
         if (readCount <= 0 || pcmBuffer.isEmpty()) return null
-        val n = readCount.coerceAtMost(pcmBuffer.size)
-
-        var sum = 0.0
-        var zeroCrossings = 0
-        for (i in 0 until n) {
-            val sample = pcmBuffer[i].toDouble()
-            sum += sample * sample
-            if (i > 0 && ((pcmBuffer[i] >= 0 && pcmBuffer[i - 1] < 0) || (pcmBuffer[i] < 0 && pcmBuffer[i - 1] >= 0))) {
-                zeroCrossings++
-            }
-        }
-        val rms = sqrt(sum / n)
-        val zcr = zeroCrossings.toDouble() / n.toDouble()
+        val features = extractAcousticFeatures(pcmBuffer, readCount)
+        val rms = features[0].toDouble()
+        val zcr = features[1].toDouble()
 
         return evaluateWakeCandidate(kwsHypothesis, rms, zcr)
     }
 
     /**
      * Evaluates whether a candidate utterance and acoustic metrics match a configured wake phrase.
-     * - Rejects silence (`rms < 800.0`).
+     * - Rejects silence (`rms < minRmsThreshold`).
      * - Rejects non-speech transients/claps/white noise (`zcr !in 0.03..0.44` or `rms > 28000.0`).
      * - Rejects any speech where [kwsHypothesis] is null, blank, or does not match a configured wake phrase.
      */
     fun evaluateWakeCandidate(kwsHypothesis: String?, rms: Double, zcr: Double): String? {
-        val isValidSpeechEnvelope = (rms in 800.0..28000.0) && (zcr in 0.03..0.44)
+        val minRmsThreshold = (1100.0 - (sensitivity * 550.0)).coerceIn(450.0, 1200.0)
+        val isValidSpeechEnvelope = (rms in minRmsThreshold..28000.0) && (zcr in 0.03..0.44)
         if (!isValidSpeechEnvelope) return null
 
         val candidate = kwsHypothesis?.trim() ?: return null
         if (candidate.isEmpty()) return null
 
+        val startNs = System.nanoTime()
         val normalizedCandidate = candidate.lowercase().replace(Regex("[^a-z0-9\\s]"), "").replace(Regex("\\s+"), " ").trim()
         val matched = synchronized(activeWakePhrases) {
             activeWakePhrases.firstOrNull { phrase ->
@@ -123,6 +173,7 @@ class LocalWakeWordEngine(private val context: Context?) {
         }
 
         if (matched != null) {
+            lastDetectionLatencyMs = ((System.nanoTime() - startNs) / 1_000_000L).coerceAtLeast(1L)
             _engineState.value = WakeEngineState.WAKE_DETECTED
             _statusMessage.value = "Wake phrase detected: $matched"
             onWakeWordDetected?.invoke(matched)

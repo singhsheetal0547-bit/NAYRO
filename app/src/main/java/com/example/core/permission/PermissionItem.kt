@@ -11,7 +11,11 @@ data class PermissionItem(
     val minAndroidSdk: Int = 24,
     val androidPermissionString: String? = null,
     val settingsAction: String? = null,
-    val associatedCapabilities: List<String> = emptyList()
+    val associatedCapabilities: List<String> = emptyList(),
+    val requirementLevel: PermissionRequirementLevel = PermissionRequirementLevel.CORE_AGENT,
+    val featureDependency: String = "",
+    val verificationMethod: String = "",
+    val fallbackBehavior: String = ""
 )
 
 /**

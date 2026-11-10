@@ -7,8 +7,12 @@ import com.example.core.agent.ActionVerifier
 import com.example.core.agent.AgentAction
 import com.example.core.agent.AgentBrain
 import com.example.core.agent.AgentTask
+import com.example.core.agent.RiskLevel
+import com.example.core.agent.TaskClassifier
+import com.example.core.agent.TaskPlanner
 import com.example.core.agent.TaskState
 import com.example.core.agent.TaskStateManager
+import com.example.core.agent.UserIntentType
 import com.example.core.agent.VerificationResult
 import com.example.core.agent.VerificationStatus
 import com.example.core.agent.tools.ToolRegistryManager
@@ -475,6 +479,518 @@ class SecurityAndVerificationTests {
             parameters = mapOf("x" to "150", "y" to "300")
         )
         assertTrue(ToolRegistryManager.validateParameters(validCoords).first)
+    }
+
+    // =========================================================================
+    // M. Autonomy Policy Manager Tests (Part 11)
+    // =========================================================================
+
+    @Test
+    fun testAutonomyPolicyLevelsEmergencyStopAndExpiringGrants() {
+        val policyManager = com.example.core.security.AutonomyPolicyManager()
+        val r0Action = AgentAction(taskId = "t1", actionType = ActionType.GET_DEVICE_TIME, riskLevel = RiskLevel.R0_LOCAL_READONLY)
+        val r1Action = AgentAction(taskId = "t1", actionType = ActionType.LAUNCH_APP, target = "com.android.chrome", riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE)
+        val r2Action = AgentAction(taskId = "t1", actionType = ActionType.SET_TEXT, parameters = mapOf("text" to "hi"), riskLevel = RiskLevel.R2_APPLICATION_STATE)
+        val r3Action = AgentAction(taskId = "t1", actionType = ActionType.MESSAGE_DRAFT_SEND, target = "Rahul", riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION)
+
+        // Level 1: Always Ask (even R0/R1 require confirmation)
+        policyManager.setAutonomyLevel(com.example.core.security.AutonomyLevel.LEVEL_1_ALWAYS_ASK)
+        assertTrue(policyManager.evaluateAction(r0Action) is com.example.core.security.AutonomyDecision.RequireUserConfirmation)
+        assertTrue(policyManager.evaluateAction(r1Action) is com.example.core.security.AutonomyDecision.RequireUserConfirmation)
+
+        // Level 2: Ask for Sensitive Actions (R0 & R1 allowed, R2 & R3 require confirmation)
+        policyManager.setAutonomyLevel(com.example.core.security.AutonomyLevel.LEVEL_2_ASK_FOR_SENSITIVE)
+        assertTrue(policyManager.evaluateAction(r0Action) is com.example.core.security.AutonomyDecision.AllowImmediately)
+        assertTrue(policyManager.evaluateAction(r1Action) is com.example.core.security.AutonomyDecision.AllowImmediately)
+        assertTrue(policyManager.evaluateAction(r2Action) is com.example.core.security.AutonomyDecision.RequireUserConfirmation)
+        assertTrue(policyManager.evaluateAction(r3Action) is com.example.core.security.AutonomyDecision.RequireUserConfirmation)
+
+        // Expiring Temporary Grant allows R2 until expiry, then reverts
+        val baseNow = System.currentTimeMillis()
+        policyManager.grantTemporaryPermission(ActionType.SET_TEXT.name, durationMs = 10_000L)
+        assertTrue(policyManager.evaluateAction(r2Action, nowMs = baseNow + 2_000L) is com.example.core.security.AutonomyDecision.AllowImmediately)
+        assertTrue(policyManager.evaluateAction(r2Action, nowMs = baseNow + 15_000L) is com.example.core.security.AutonomyDecision.RequireUserConfirmation)
+
+        // Per-App Block blocks target app
+        policyManager.setAppPolicy("com.android.chrome", com.example.core.security.ToolAccessPolicy.NEVER_ALLOW)
+        assertTrue(policyManager.evaluateAction(r1Action) is com.example.core.security.AutonomyDecision.DenyExecution)
+
+        // Emergency Stop blocks everything
+        policyManager.triggerEmergencyStop()
+        assertTrue(policyManager.evaluateAction(r0Action) is com.example.core.security.AutonomyDecision.DenyExecution)
+    }
+
+    // =========================================================================
+    // N. Multi-Turn Conversation Continuity & Slot Filling Tests (Part 9)
+    // =========================================================================
+
+    @Test
+    fun testMultiTurnSlotFillingAndReferenceResolution() {
+        val continuity = com.example.core.memory.ConversationContinuityManager()
+
+        // Turn 1: "Rahul ko WhatsApp message bhejna" -> missing message body
+        val turn1Intent = TaskClassifier.classify("Rahul ko WhatsApp message bhejna")
+        assertEquals(UserIntentType.MESSAGE_DRAFT, turn1Intent.type)
+        assertEquals("Rahul", turn1Intent.recipient)
+        assertTrue("Message body should be empty on Turn 1", turn1Intent.searchQueryOrContent.isNullOrBlank())
+
+        val initialTask = TaskPlanner.planTask(turn1Intent)
+        continuity.recordEntityContext(contact = "Rahul")
+        continuity.registerPendingSlot(
+            com.example.core.memory.PendingSlotContinuation(
+                taskId = initialTask.taskId,
+                intentType = UserIntentType.MESSAGE_DRAFT,
+                missingSlotName = "message",
+                promptToUser = "Kya message bhejna hai Rahul ko?",
+                collectedEntities = mapOf("recipient" to "Rahul"),
+                createdAtMs = 1000L,
+                expiresAtMs = 301_000L
+            )
+        )
+
+        // Turn 2: User replies "Main busy hoon" -> resumes the SAME taskId with filled message
+        val turn2Eval = continuity.evaluateIncomingTurn(
+            userTurn = "Main busy hoon",
+            hasActivePendingConfirmation = false,
+            nowMs = 5000L
+        )
+        assertTrue(turn2Eval is com.example.core.memory.ContinuationResolution.SlotFilledResumeIntent)
+        val resumed = turn2Eval as com.example.core.memory.ContinuationResolution.SlotFilledResumeIntent
+        assertEquals(initialTask.taskId, resumed.taskId)
+        assertEquals("Rahul", resumed.resolvedIntent.recipient)
+        assertEquals("Main busy hoon", resumed.resolvedIntent.searchQueryOrContent)
+
+        // Turn 3: User replies "Yes" to confirmation
+        val turn3Eval = continuity.evaluateIncomingTurn(
+            userTurn = "Yes",
+            hasActivePendingConfirmation = true,
+            nowMs = 6000L
+        )
+        assertTrue(turn3Eval is com.example.core.memory.ContinuationResolution.ConfirmationReply)
+        assertTrue((turn3Eval as com.example.core.memory.ContinuationResolution.ConfirmationReply).approved)
+
+        // Reference resolution ("usko" -> "Rahul")
+        val resolvedPronoun = continuity.resolveReferencesInPrompt("Usko call karo")
+        assertTrue(resolvedPronoun.contains("Rahul"))
+    }
+
+    // =========================================================================
+    // O. Cross-App Multi-Step Workflow Engine Tests (Part 6)
+    // =========================================================================
+
+    @Test
+    fun testCrossAppWorkflowContextTransferAndPartialCompletion() = runBlocking {
+        val wfEngine = com.example.core.workflow.CrossAppWorkflowEngine()
+
+        // 1. Successful execution transfers step_1_output into subsequent steps
+        val receivedParams = mutableListOf<Map<String, String>>()
+        val resultOk = wfEngine.executeTemplateById("wf_doc_to_meeting_note") { action ->
+            receivedParams.add(action.parameters)
+            ActionExecutionResult(true, "Output of ${action.actionType.name}", VerificationStatus.VERIFIED)
+        }
+        assertEquals(TaskState.COMPLETED, resultOk.state)
+        assertEquals(2, resultOk.currentStepIndex)
+        assertTrue(receivedParams[1]["content"]?.contains("Output of PDF_EXTRACT_TEXT") == true)
+
+        // 2. Partial failure when step 2 fails marks workflow PARTIALLY_COMPLETED
+        val resultPartial = wfEngine.executeTemplateById("wf_doc_to_meeting_note") { action ->
+            if (action.actionType == ActionType.PDF_EXTRACT_TEXT) {
+                ActionExecutionResult(true, "Extracted text", VerificationStatus.VERIFIED)
+            } else {
+                ActionExecutionResult(false, "Storage write failed", VerificationStatus.FAILED)
+            }
+        }
+        assertEquals(TaskState.PARTIALLY_COMPLETED, resultPartial.state)
+        assertEquals(1, resultPartial.currentStepIndex)
+    }
+
+    // =========================================================================
+    // P. Proactive Intelligence & Event Automation Engine Tests (Parts 7 & 8)
+    // =========================================================================
+
+    @Test
+    fun testProactiveIntelligenceQuietHoursAndDeduplication() {
+        val proactive = com.example.core.proactive.ProactiveIntelligenceEngine()
+        val list1 = proactive.evaluateContext(
+            incompleteTasks = emptyList(),
+            notesAndReminders = emptyList(),
+            unreadNotifications = listOf(
+                com.example.core.notification.CapturedNotificationItem("k1", "com.whatsapp", "A", "1", com.example.core.notification.NotificationCategory.MESSAGE, 100L),
+                com.example.core.notification.CapturedNotificationItem("k2", "com.whatsapp", "B", "2", com.example.core.notification.NotificationCategory.MESSAGE, 200L)
+            ),
+            batteryPercent = 14,
+            currentHourOfDay = 12
+        )
+        assertEquals(2, list1.size) // Unread batch + low battery
+
+        // Dismiss low battery suggestion -> no longer returned
+        proactive.dismissSuggestion("low_battery_14")
+        val list2 = proactive.evaluateContext(
+            incompleteTasks = emptyList(),
+            notesAndReminders = emptyList(),
+            unreadNotifications = listOf(
+                com.example.core.notification.CapturedNotificationItem("k1", "com.whatsapp", "A", "1", com.example.core.notification.NotificationCategory.MESSAGE, 100L),
+                com.example.core.notification.CapturedNotificationItem("k2", "com.whatsapp", "B", "2", com.example.core.notification.NotificationCategory.MESSAGE, 200L)
+            ),
+            batteryPercent = 14,
+            currentHourOfDay = 12
+        )
+        assertEquals(1, list2.size)
+
+        // Quiet hours (23:00) suppresses suggestions
+        val quietList = proactive.evaluateContext(
+            incompleteTasks = emptyList(),
+            notesAndReminders = emptyList(),
+            unreadNotifications = emptyList(),
+            batteryPercent = 14,
+            currentHourOfDay = 23
+        )
+        assertTrue(quietList.isEmpty())
+    }
+
+    @Test
+    fun testAutomationEngineTriggersAndCooldownDeduplication() = runBlocking {
+        val autoEngine = com.example.core.automation.AutomationEngine()
+        val firstRun = autoEngine.onEventTriggered(
+            triggerType = com.example.core.automation.AutomationTriggerType.BATTERY_BELOW_THRESHOLD,
+            eventValue = "14",
+            nowMs = 100_000L
+        ) {
+            true to "Saved battery note"
+        }
+        assertEquals(1, firstRun.size)
+        assertTrue(firstRun[0].isSuccess)
+
+        // Immediate second trigger within cooldown window is deduplicated
+        val secondRun = autoEngine.onEventTriggered(
+            triggerType = com.example.core.automation.AutomationTriggerType.BATTERY_BELOW_THRESHOLD,
+            eventValue = "14",
+            nowMs = 105_000L
+        ) {
+            true to "Should not fire"
+        }
+        assertTrue(secondRun.isEmpty())
+    }
+
+    // =========================================================================
+    // Q. Notification Intelligence Classification & Filtering Tests (Part 4D)
+    // =========================================================================
+
+    @Test
+    fun testNotificationClassificationAndAppFiltering() {
+        val repo = com.example.core.notification.NotificationIntelligenceRepository
+        repo.clearForTesting()
+
+        val catMsg = repo.classifyNotification("com.whatsapp", "Rahul", "New message received")
+        assertEquals(com.example.core.notification.NotificationCategory.MESSAGE, catMsg)
+
+        val catRem = repo.classifyNotification("com.google.android.calendar", "Meeting Reminder", "Starts in 10m")
+        assertEquals(com.example.core.notification.NotificationCategory.REMINDER_OR_CALENDAR, catRem)
+
+        repo.setAllowedPackagesFilter(setOf("com.whatsapp"))
+        repo.onNotificationPosted(
+            com.example.core.notification.CapturedNotificationItem(
+                key = "k_spam",
+                packageName = "com.spam.app",
+                title = "Sale",
+                text = "50% off",
+                category = com.example.core.notification.NotificationCategory.SOCIAL_OR_PROMOTION,
+                postTime = 1000L
+            )
+        )
+        assertTrue("Non-allowlisted app notification must be filtered out", repo.getFilteredNotifications().isEmpty())
+        repo.clearForTesting()
+    }
+
+    // =========================================================================
+    // R. Permission Setup Wizard, Registry Audit & Verification Report Tests (Parts 2 & 3)
+    // =========================================================================
+
+    @Test
+    fun testPermissionRegistryAuditAndSetupWizardReport() {
+        val allItems = com.example.core.permission.PermissionRegistry.items
+        assertEquals("All 13 NAYRO permission items must be registered", 13, allItems.size)
+
+        for (item in allItems) {
+            assertTrue("Permission name must not be blank for ${item.type}", item.permissionName.isNotBlank())
+            assertTrue("Purpose must not be blank for ${item.type}", item.purpose.isNotBlank())
+            assertTrue("Feature dependency must not be blank for ${item.type}", item.featureDependency.isNotBlank())
+            assertTrue("Verification method must not be blank for ${item.type}", item.verificationMethod.isNotBlank())
+            assertTrue("Fallback behavior must not be blank for ${item.type}", item.fallbackBehavior.isNotBlank())
+        }
+
+        val coreItems = com.example.core.permission.PermissionRegistry.getCorePermissions()
+        val optionalItems = com.example.core.permission.PermissionRegistry.getOptionalPermissions()
+        assertTrue(coreItems.isNotEmpty())
+        assertTrue(optionalItems.isNotEmpty())
+        assertEquals(allItems.size, coreItems.size + optionalItems.size)
+
+        // Test PermissionSetupManager headless wizard lifecycle & report building
+        val setupManager = com.example.core.permission.PermissionSetupManager(context = null, permissionManager = null)
+        assertFalse("Setup must be incomplete on first launch", setupManager.isSetupCompleted())
+        assertEquals("Babu", setupManager.getSavedAssistantName())
+        assertEquals(com.example.core.permission.SetupWizardStep.WELCOME, setupManager.currentStep.value)
+
+        // Initial report when nothing is granted
+        val initialReport = setupManager.buildVerificationReport()
+        assertFalse("Core agent must not be marked ready when core permissions are missing", initialReport.isCoreAgentReady)
+        assertEquals(0, initialReport.coreGrantedCount)
+        assertTrue(initialReport.missingCorePermissions.contains(com.example.core.permission.PermissionType.MICROPHONE))
+        assertTrue(initialReport.missingCorePermissions.contains(com.example.core.permission.PermissionType.OVERLAY))
+
+        // Simulate granting all core permissions and verify report updates accurately
+        val coreGrantOverrides = coreItems.associate {
+            it.type to com.example.core.permission.PermissionStatus.GRANTED
+        }
+        val readyReport = setupManager.buildVerificationReport(overrideStatuses = coreGrantOverrides)
+        assertTrue("Core agent must be ready once all core permissions are verified granted", readyReport.isCoreAgentReady)
+        assertEquals(coreItems.size, readyReport.coreGrantedCount)
+        assertTrue(readyReport.missingCorePermissions.isEmpty())
+
+        // Complete onboarding wizard and verify persistence
+        setupManager.setWizardStep(com.example.core.permission.SetupWizardStep.VERIFICATION_REPORT)
+        assertEquals(com.example.core.permission.SetupWizardStep.VERIFICATION_REPORT, setupManager.currentStep.value)
+        setupManager.markSetupCompleted("Babu")
+        assertTrue(setupManager.isSetupCompleted())
+
+        // Reset wizard and verify it returns to incomplete state
+        setupManager.resetSetupWizard()
+        assertFalse(setupManager.isSetupCompleted())
+        assertEquals(com.example.core.permission.SetupWizardStep.WELCOME, setupManager.currentStep.value)
+
+        // Verify com.example.permission.PermissionSetupManager integration with PermissionRegistry,
+        // individual status checks, and special access settings Intents
+        val pkgSetupManager = com.example.permission.PermissionSetupManager(context = null, permissionManager = null)
+        val audited = pkgSetupManager.auditPermissions()
+        assertEquals(13, audited.size)
+        assertEquals(
+            com.example.core.permission.PermissionStatus.DENIED,
+            pkgSetupManager.checkPermissionStatus(com.example.core.permission.PermissionType.MICROPHONE)
+        )
+        assertEquals(
+            com.example.core.permission.PermissionStatus.SPECIAL_ACCESS_REQUIRED,
+            pkgSetupManager.checkPermissionStatus(com.example.core.permission.PermissionType.OVERLAY)
+        )
+        assertFalse(pkgSetupManager.isPermissionGranted(com.example.core.permission.PermissionType.OVERLAY))
+
+        val overlayEval = pkgSetupManager.getPermissionEvaluation(com.example.core.permission.PermissionType.OVERLAY)
+        assertNotNull(overlayEval)
+        assertTrue(overlayEval!!.canLaunchSettings)
+
+        assertEquals(
+            android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            pkgSetupManager.resolveSpecialAccessAction(com.example.core.permission.PermissionType.OVERLAY)
+        )
+        assertEquals(
+            "package:com.example.nayro",
+            pkgSetupManager.resolveSpecialAccessDataUri(
+                com.example.core.permission.PermissionType.OVERLAY,
+                packageNameOverride = "com.example.nayro"
+            )
+        )
+        val overlayIntent = pkgSetupManager.createSpecialAccessIntent(
+            com.example.core.permission.PermissionType.OVERLAY,
+            packageNameOverride = "com.example.nayro"
+        )
+        assertNotNull("Overlay special access intent must be created", overlayIntent)
+        assertFalse(
+            "Headless triggerSpecialAccessSettings without Context/Activity returns false safely",
+            pkgSetupManager.triggerOverlayPermissionSettings(activity = null)
+        )
+    }
+
+    // =========================================================================
+    // S. Section 2, 3, 5, 6, 8, 9, 11 & 12 Beyond-Andee Verification Tests
+    // =========================================================================
+
+    @Test
+    fun testSection2FloatingBabuVoiceCommandsClassificationAndPlanning() {
+        // 1. "Hi Babu, open WhatsApp."
+        val cmd1 = TaskPlanner.planTask(TaskClassifier.classify("Hi Babu, open WhatsApp."))
+        assertEquals(1, cmd1.actions.size)
+        assertEquals(ActionType.LAUNCH_APP, cmd1.actions[0].actionType)
+        assertTrue(cmd1.actions[0].target!!.contains("whatsapp", ignoreCase = true))
+
+        // 2. "Hey Babu, call Rahul."
+        val cmd2 = TaskPlanner.planTask(TaskClassifier.classify("Hey Babu, call Rahul."))
+        assertTrue(cmd2.actions.any { it.actionType == ActionType.MAKE_PHONE_CALL })
+        assertEquals("Rahul", cmd2.actions.first().target)
+
+        // 3. "Hi Babu, turn on the flashlight."
+        val cmd3 = TaskPlanner.planTask(TaskClassifier.classify("Hi Babu, turn on the flashlight."))
+        assertEquals(1, cmd3.actions.size)
+        assertEquals(ActionType.TOGGLE_FLASHLIGHT, cmd3.actions[0].actionType)
+        assertEquals("ON", cmd3.actions[0].target)
+        assertEquals("true", cmd3.actions[0].parameters["enabled"])
+
+        // 4. "Hey Babu, read my notifications."
+        val cmd4 = TaskPlanner.planTask(TaskClassifier.classify("Hey Babu, read my notifications."))
+        assertEquals(1, cmd4.actions.size)
+        assertEquals(ActionType.READ_NOTIFICATIONS, cmd4.actions[0].actionType)
+
+        // 5. "Hi Babu, find my downloaded PDF."
+        val cmd5 = TaskPlanner.planTask(TaskClassifier.classify("Hi Babu, find my downloaded PDF."))
+        assertEquals(1, cmd5.actions.size)
+        assertEquals(ActionType.FILE_SEARCH, cmd5.actions[0].actionType)
+        assertEquals(".pdf", cmd5.actions[0].parameters["query"])
+
+        // 6. "Hey Babu, create a reminder for tomorrow."
+        val cmd6 = TaskPlanner.planTask(TaskClassifier.classify("Hey Babu, create a reminder for tomorrow."))
+        assertEquals(1, cmd6.actions.size)
+        assertEquals(ActionType.CREATE_REMINDER, cmd6.actions[0].actionType)
+    }
+
+    @Test
+    fun testSection5CompoundWhatsAppMessageInstruction() {
+        val brain = createTestBrain()
+        val task = brain.planTaskForInstruction("Open WhatsApp, find Rahul, send him a message that I will reach in 20 minutes")
+        assertEquals(4, task.actions.size)
+        assertEquals(ActionType.LAUNCH_APP, task.actions[0].actionType)
+        assertEquals(ActionType.CLICK_ELEMENT, task.actions[1].actionType)
+        assertEquals("Rahul", task.actions[1].target)
+        assertEquals(ActionType.SET_TEXT, task.actions[2].actionType)
+        assertEquals("I will reach in 20 minutes", task.actions[2].parameters["text"])
+        assertEquals(ActionType.ASK_USER_CONFIRMATION, task.actions[3].actionType)
+        assertEquals("Rahul", task.actions[3].target)
+        assertEquals("I will reach in 20 minutes", task.actions[3].parameters["draft"])
+        assertEquals(RiskLevel.R3_EXTERNAL_COMMUNICATION, task.actions[3].riskLevel)
+        assertTrue(task.actions[3].riskLevel.requiresConfirmation)
+    }
+
+    @Test
+    fun testSection9ThreeTurnSequentialWhatsAppContext() {
+        val continuity = com.example.core.memory.ConversationContinuityManager()
+
+        // Turn 1: "Open WhatsApp."
+        val turn1Classified = TaskClassifier.classify("Open WhatsApp.")
+        assertEquals(UserIntentType.APP_LAUNCH, turn1Classified.type)
+        continuity.recordEntityContext(app = turn1Classified.targetAppOrEntity)
+
+        // Turn 2: "Message Rahul." -> missing message body, registers pending slot for recipient Rahul
+        val turn2Classified = TaskClassifier.classify("Message Rahul.")
+        assertEquals(UserIntentType.MESSAGE_DRAFT, turn2Classified.type)
+        assertEquals("Rahul", turn2Classified.recipient)
+        assertTrue(turn2Classified.searchQueryOrContent.isNullOrBlank())
+
+        val turn2Task = TaskPlanner.planTask(turn2Classified)
+        continuity.recordEntityContext(contact = "Rahul")
+        continuity.registerPendingSlot(
+            com.example.core.memory.PendingSlotContinuation(
+                taskId = turn2Task.taskId,
+                intentType = UserIntentType.MESSAGE_DRAFT,
+                missingSlotName = "message",
+                promptToUser = "Kya message bhejna hai Rahul ko?",
+                collectedEntities = mapOf("recipient" to "Rahul"),
+                createdAtMs = 1000L,
+                expiresAtMs = 301_000L
+            )
+        )
+
+        // Turn 3: "Tell him I will be late." -> strips "Tell him " and fills message body = "I will be late"
+        val turn3Eval = continuity.evaluateIncomingTurn(
+            userTurn = "Tell him I will be late.",
+            hasActivePendingConfirmation = false,
+            nowMs = 3000L
+        )
+        assertTrue(turn3Eval is com.example.core.memory.ContinuationResolution.SlotFilledResumeIntent)
+        val resumed = turn3Eval as com.example.core.memory.ContinuationResolution.SlotFilledResumeIntent
+        assertEquals("Rahul", resumed.resolvedIntent.recipient)
+        assertEquals("I will be late", resumed.resolvedIntent.searchQueryOrContent)
+    }
+
+    @Test
+    fun testSection3DeviceOperatingStateAndLockScreenPolicy() {
+        val stateMgr = com.example.core.service.DeviceOperatingStateManager(context = null)
+
+        // Operating states A..F
+        stateMgr.onAppForegroundChanged(true)
+        stateMgr.setTestingOverrides(isLocked = false, isScreenInteractive = true)
+        assertEquals(
+            com.example.core.service.DeviceOperatingState.APPLICATION_OPEN,
+            stateMgr.refreshOperatingState()
+        )
+
+        stateMgr.onAppForegroundChanged(false)
+        assertEquals(
+            com.example.core.service.DeviceOperatingState.APPLICATION_IN_BACKGROUND,
+            stateMgr.refreshOperatingState()
+        )
+
+        stateMgr.setTestingOverrides(isLocked = false, isScreenInteractive = false)
+        assertEquals(
+            com.example.core.service.DeviceOperatingState.SCREEN_OFF,
+            stateMgr.refreshOperatingState()
+        )
+
+        stateMgr.setTestingOverrides(isLocked = true, isScreenInteractive = true)
+        assertEquals(
+            com.example.core.service.DeviceOperatingState.DEVICE_LOCKED,
+            stateMgr.refreshOperatingState()
+        )
+
+        stateMgr.onBootCompleted()
+        assertEquals(
+            com.example.core.service.DeviceOperatingState.DEVICE_RESTARTED,
+            stateMgr.currentOperatingState.value
+        )
+
+        // Lock screen policy checks
+        val timeAction = AgentAction(taskId = "t1", actionType = ActionType.GET_DEVICE_TIME, riskLevel = RiskLevel.R0_LOCAL_READONLY)
+        val torchAction = AgentAction(taskId = "t1", actionType = ActionType.TOGGLE_FLASHLIGHT, parameters = mapOf("enabled" to "true"), riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE)
+        val sendMsgAction = AgentAction(taskId = "t1", actionType = ActionType.MESSAGE_DRAFT_SEND, target = "Rahul", riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION)
+        val launchAppAction = AgentAction(taskId = "t1", actionType = ActionType.LAUNCH_APP, target = "WhatsApp", riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE)
+
+        assertTrue(
+            stateMgr.evaluateLockScreenPolicy(timeAction, isLocked = true) is com.example.core.service.LockScreenPolicyDecision.AllowedWhileLocked
+        )
+        assertTrue(
+            stateMgr.evaluateLockScreenPolicy(torchAction, isLocked = true) is com.example.core.service.LockScreenPolicyDecision.AllowedWhileLocked
+        )
+        assertTrue(
+            stateMgr.evaluateLockScreenPolicy(sendMsgAction, isLocked = true) is com.example.core.service.LockScreenPolicyDecision.RequireDeviceUnlock
+        )
+        assertTrue(
+            stateMgr.evaluateLockScreenPolicy(launchAppAction, isLocked = true) is com.example.core.service.LockScreenPolicyDecision.RequireDeviceUnlock
+        )
+    }
+
+    @Test
+    fun testSection11WakeWordSensitivityAndCommandExtraction() {
+        val engine = LocalWakeWordEngine(null)
+        engine.setSensitivity(0.85f)
+        assertEquals(0.85f, engine.getSensitivity(), 0.001f)
+        assertTrue(engine.isValidSampleRate(16000))
+        assertFalse(engine.isValidSampleRate(12345))
+
+        val split = engine.extractCommandAfterWakePhrase("Hi Babu, turn on the flashlight")
+        assertNotNull(split)
+        assertEquals("Hi Babu", split!!.first)
+        assertEquals("turn on the flashlight", split.second)
+    }
+
+    @Test
+    fun testSection12AutomationEngineUpdateAndManualRun() = runBlocking {
+        val autoEngine = com.example.core.automation.AutomationEngine()
+        val created = autoEngine.createRule(
+            name = "Test Rule",
+            triggerType = com.example.core.automation.AutomationTriggerType.MANUAL_TRIGGER,
+            triggerConditionValue = "",
+            actionInstruction = "What time is it"
+        )
+        val updated = autoEngine.updateRule(
+            ruleId = created.ruleId,
+            name = "Updated Rule Name",
+            actionInstruction = "Turn on the flashlight"
+        )
+        assertNotNull(updated)
+        assertEquals("Updated Rule Name", updated!!.name)
+
+        val record = autoEngine.executeRuleNow(created.ruleId) { instr ->
+            true to "Executed: $instr"
+        }
+        assertNotNull(record)
+        assertTrue(record!!.isSuccess)
+        assertEquals("Executed: Turn on the flashlight", record.outputSummary)
     }
 }
 

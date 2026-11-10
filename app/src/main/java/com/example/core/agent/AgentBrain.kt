@@ -60,7 +60,10 @@ class AgentBrain(
      * Decomposes a single or compound natural-language instruction into an ordered [AgentTask]
      * with one or more [AgentAction] steps.
      */
-    fun planTaskForInstruction(userPrompt: String): AgentTask {
+    fun planTaskForInstruction(
+        userPrompt: String,
+        existingTaskId: String = UUID.randomUUID().toString()
+    ): AgentTask {
         val trimmed = userPrompt.trim()
         // Check for compound multi-step instructions joined by " and then " or " then "
         val clauses = trimmed.split(Regex("(?i)\\s+(?:and then|then|aur phir)\\s+"))
@@ -68,11 +71,11 @@ class AgentBrain(
             .filter { it.isNotBlank() }
 
         if (clauses.size > 1) {
-            val taskId = UUID.randomUUID().toString()
+            val taskId = existingTaskId
             val mergedActions = mutableListOf<AgentAction>()
             clauses.forEach { clause ->
                 val subIntent = TaskClassifier.classify(clause)
-                val subPlan = TaskPlanner.planTask(subIntent)
+                val subPlan = TaskPlanner.planTask(subIntent, existingTaskId = taskId)
                 subPlan.actions.forEach { act ->
                     mergedActions.add(act.copy(taskId = taskId))
                 }
@@ -89,7 +92,7 @@ class AgentBrain(
         }
 
         val resolvedIntent = TaskClassifier.classify(userPrompt)
-        return TaskPlanner.planTask(resolvedIntent)
+        return TaskPlanner.planTask(resolvedIntent, existingTaskId = existingTaskId)
     }
 
     /**

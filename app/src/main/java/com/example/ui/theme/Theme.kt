@@ -10,41 +10,44 @@ import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
 private val DarkColorScheme = darkColorScheme(
-    primary = SoftSage,
-    onPrimary = DeepGreen,
-    primaryContainer = ForestGreen,
-    onPrimaryContainer = WarmIvory,
+    primary = Color(0xFF34D399),
+    onPrimary = Color(0xFF062E22),
+    primaryContainer = Color(0xFF1E293B),
+    onPrimaryContainer = Color(0xFFF8FAFC),
     secondary = Coral,
     onSecondary = WhitePure,
     background = DarkSurface,
-    onBackground = WarmIvory,
+    onBackground = Color(0xFFF8FAFC),
     surface = DarkSurfaceVariant,
-    onSurface = WarmIvory,
-    surfaceVariant = ForestGreen,
-    onSurfaceVariant = SoftSage,
+    onSurface = Color(0xFFF8FAFC),
+    surfaceVariant = Color(0xFF334155),
+    onSurfaceVariant = Color(0xFFCBD5E1),
+    outline = Color(0xFF475569),
     error = ErrorRed,
     onError = WhitePure
 )
 
 private val LightColorScheme = lightColorScheme(
     primary = ForestGreen,
-    onPrimary = WarmIvory,
+    onPrimary = WhitePure,
     primaryContainer = SoftSage,
-    onPrimaryContainer = DeepGreen,
+    onPrimaryContainer = InkText,
     secondary = Coral,
     onSecondary = WhitePure,
     background = WarmIvory,
     onBackground = InkText,
     surface = WhitePure,
     onSurface = InkText,
-    surfaceVariant = SoftSage,
-    onSurfaceVariant = InkText,
+    surfaceVariant = SurfaceSubtle,
+    onSurfaceVariant = MutedText,
+    outline = SlateBorder,
     error = ErrorRed,
     onError = WhitePure
 )
@@ -52,7 +55,7 @@ private val LightColorScheme = lightColorScheme(
 @Composable
 fun NayroTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = false, // Set false to ensure NAYRO visual identity branding
+    dynamicColor: Boolean = false,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
@@ -68,7 +71,7 @@ fun NayroTheme(
     if (!view.isInEditMode) {
         SideEffect {
             val window = (view.context as Activity).window
-            window.statusBarColor = colorScheme.background.toArgb()
+            window.statusBarColor = colorScheme.surface.toArgb()
             WindowCompat.getInsetsController(window, view).isAppearanceLightStatusBars = !darkTheme
         }
     }

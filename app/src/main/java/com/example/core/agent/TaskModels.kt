@@ -5,20 +5,26 @@ import java.util.UUID
 
 enum class TaskState {
     CREATED,
+    PENDING,
     UNDERSTANDING,
     PLANNING,
     VALIDATING,
     WAITING_FOR_PERMISSION,
     WAITING_FOR_CONFIRMATION,
+    WAITING_FOR_USER_INPUT,
     READY,
+    RUNNING,
     EXECUTING,
+    OBSERVING,
     VERIFYING,
+    RECOVERING,
     PAUSED,
     RETRYING,
     COMPLETED,
     PARTIALLY_COMPLETED,
     INCONCLUSIVE,
     NOT_SUPPORTED,
+    BLOCKED_BY_ANDROID,
     TIMED_OUT,
     FAILED,
     CANCELLED
@@ -34,6 +40,8 @@ enum class ActionType {
     GET_STORAGE_INFO,
     GET_DEVICE_TIME,
     SEARCH_INSTALLED_APPS,
+    GET_CURRENT_LOCATION,
+    TOGGLE_FLASHLIGHT,
 
     // Screen & Interaction Tools
     READ_SCREEN,
@@ -43,16 +51,22 @@ enum class ActionType {
     SET_TEXT,
     SCROLL_FORWARD,
     SCROLL_BACKWARD,
+    SWIPE_SCREEN,
     NAVIGATE_BACK,
     TAKE_SCREENSHOT,
     INTERACT_COORDINATES,
+    ANALYZE_IMAGE_VISION,
 
     // Communication & Telephony Tools
     MESSAGE_DRAFT_SEND,
+    SEND_SMS,
     CHECK_INCOMING_CALL,
     RESOLVE_CONTACT,
     MAKE_PHONE_CALL,
     READ_NOTIFICATIONS,
+    SUMMARIZE_NOTIFICATIONS,
+    CLASSIFY_NOTIFICATIONS,
+    CREATE_TASK_FROM_NOTIFICATION,
 
     // Workspace & File Tools
     FILE_BROWSE,
@@ -61,6 +75,7 @@ enum class ActionType {
     FILE_SEARCH,
     PDF_EXTRACT_TEXT,
     DOC_SUMMARIZE,
+    COMPARE_DOCUMENTS,
 
     // Web & Research Agent Tools
     WEB_SEARCH,
@@ -73,10 +88,11 @@ enum class ActionType {
     CODE_DIAGNOSE_ERROR,
     CODE_GENERATE_DOCS,
 
-    // Skills & Sub-Agent Orchestration Tools
+    // Skills, Workflows & Sub-Agent Orchestration Tools
     EXECUTE_PROCEDURAL_SKILL,
     REGISTER_CUSTOM_SKILL,
     LIST_SKILLS,
+    EXECUTE_CROSS_APP_WORKFLOW,
     DELEGATE_SUBAGENT_TASK,
     CHECK_SUBAGENT_STATUS,
     AGGREGATE_SUBAGENT_RESULTS,
@@ -84,9 +100,12 @@ enum class ActionType {
     // Local Utilities & Productivity
     CALCULATE_LOCAL,
     SAVE_NOTE,
+    SEARCH_NOTES,
+    DELETE_NOTE,
     SAVE_MEMORY,
     CREATE_REMINDER,
     SCHEDULE_ALARM,
+    READ_CALENDAR_EVENTS,
     CREATE_CALENDAR_EVENT,
     ASK_USER_CONFIRMATION,
     QUERY_LLM

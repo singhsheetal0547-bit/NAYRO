@@ -6,8 +6,8 @@ import java.util.UUID
 
 object TaskPlanner {
 
-    fun planTask(intent: ResolvedIntent): AgentTask {
-        val taskId = UUID.randomUUID().toString()
+    fun planTask(intent: ResolvedIntent, existingTaskId: String = UUID.randomUUID().toString()): AgentTask {
+        val taskId = existingTaskId
         val actions = mutableListOf<AgentAction>()
 
         when (intent.type) {
@@ -121,7 +121,6 @@ object TaskPlanner {
                         idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
-                // Stop before sending and require explicit user confirmation
                 actions.add(
                     AgentAction(
                         taskId = taskId,
@@ -132,6 +131,78 @@ object TaskPlanner {
                             "draft" to (intent.searchQueryOrContent ?: "")
                         ),
                         riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                        idempotencyClassification = "NON_IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.PHONE_CALL -> {
+                val targetRecipient = intent.recipient ?: "Contact"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.MAKE_PHONE_CALL,
+                        target = targetRecipient,
+                        parameters = mapOf("recipient" to targetRecipient),
+                        riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                        idempotencyClassification = "NON_IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.FLASHLIGHT_CONTROL -> {
+                val enabledVal = intent.searchQueryOrContent ?: "true"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.TOGGLE_FLASHLIGHT,
+                        target = if (enabledVal == "false") "OFF" else "ON",
+                        parameters = mapOf("enabled" to enabledVal),
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.NOTIFICATION_READ -> {
+                val actionType = if (intent.searchQueryOrContent == "summarize") {
+                    ActionType.SUMMARIZE_NOTIFICATIONS
+                } else {
+                    ActionType.READ_NOTIFICATIONS
+                }
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = actionType,
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.FILE_FIND -> {
+                val query = intent.searchQueryOrContent ?: ".pdf"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.FILE_SEARCH,
+                        target = query,
+                        parameters = mapOf("query" to query),
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.REMINDER_CREATE -> {
+                val title = intent.searchQueryOrContent ?: "Reminder"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.CREATE_REMINDER,
+                        target = title,
+                        parameters = mapOf("title" to title, "time" to "Tomorrow 09:00 AM"),
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
                         idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
@@ -226,15 +297,21 @@ object TaskPlanner {
                 val paramsMap = mutableMapOf<String, String>()
                 val paramsObj = obj.optJSONObject("parameters")
                 paramsObj?.keys()?.forEach { key ->
-                    paramsObj.optString(key)?.let { value ->
+                    paramsObj.optString(key, "")?.let { value ->
                         paramsMap[key] = value
                     }
                 }
 
                 val risk = when (actionType) {
-                    ActionType.ASK_USER_CONFIRMATION -> RiskLevel.R3_EXTERNAL_COMMUNICATION
+                    ActionType.ASK_USER_CONFIRMATION,
+                    ActionType.MAKE_PHONE_CALL,
+                    ActionType.SEND_SMS,
+                    ActionType.MESSAGE_DRAFT_SEND -> RiskLevel.R3_EXTERNAL_COMMUNICATION
                     ActionType.SET_TEXT -> RiskLevel.R2_APPLICATION_STATE
-                    ActionType.CLICK_ELEMENT, ActionType.LAUNCH_APP, ActionType.OPEN_SETTINGS_SECTION -> RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                    ActionType.CLICK_ELEMENT,
+                    ActionType.LAUNCH_APP,
+                    ActionType.OPEN_SETTINGS_SECTION,
+                    ActionType.TOGGLE_FLASHLIGHT -> RiskLevel.R1_LOW_IMPACT_REVERSIBLE
                     else -> RiskLevel.R0_LOCAL_READONLY
                 }
 

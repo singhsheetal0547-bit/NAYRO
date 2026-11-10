@@ -2,7 +2,6 @@ package com.example
 
 import android.content.Intent
 import android.os.Bundle
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -27,11 +26,11 @@ import com.example.core.capability.CapabilityManager
 import com.example.core.floating.NayroFloatingService
 import com.example.core.permission.PermissionManager
 import com.example.core.permission.PermissionRegistry
+import com.example.core.permission.PermissionSetupManager
 import com.example.core.permission.PermissionType
 import com.example.core.provider.AIProviderManager
 import com.example.core.provider.ProviderConfig
 import com.example.core.provider.ProviderType
-import com.example.core.provider.model.AIChatMessage
 import com.example.core.provider.model.AIResult
 import com.example.core.security.EncryptedStorageManager
 import com.example.core.service.NayroForegroundService
@@ -62,6 +61,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var database: NayroDatabase
     private lateinit var repository: NayroRepository
     private lateinit var permissionManager: PermissionManager
+    private lateinit var permissionSetupManager: PermissionSetupManager
     private lateinit var capabilityManager: CapabilityManager
     private lateinit var encryptedStorageManager: EncryptedStorageManager
     private lateinit var agentRuntime: AgentRuntime
@@ -77,6 +77,7 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestPermission()
     ) { _ ->
         permissionManager.refreshAllPermissions(this)
+        permissionSetupManager.refreshReport()
         capabilityManager.evaluateAll()
     }
 
@@ -92,6 +93,7 @@ class MainActivity : ComponentActivity() {
         database = app.database
         repository = app.repository
         permissionManager = app.permissionManager
+        permissionSetupManager = app.permissionSetupManager
         capabilityManager = app.capabilityManager
         encryptedStorageManager = app.encryptedStorageManager
         providerManager = app.providerManager
@@ -104,6 +106,7 @@ class MainActivity : ComponentActivity() {
                 NayroAppContent(
                     repository = repository,
                     permissionManager = permissionManager,
+                    permissionSetupManager = permissionSetupManager,
                     capabilityManager = capabilityManager,
                     encryptedStorageManager = encryptedStorageManager,
                     agentRuntime = agentRuntime,
@@ -120,9 +123,12 @@ class MainActivity : ComponentActivity() {
                         }
                     },
                     onOpenPermissionSettings = { type ->
-                        permissionManager.createSettingsIntent(type)?.let { intent ->
-                            startActivity(intent)
-                        }
+                        permissionSetupManager.triggerSpecialAccessSettings(type, this)
+                    },
+                    onRefreshPermissions = {
+                        permissionManager.refreshAllPermissions(this)
+                        permissionSetupManager.refreshReport()
+                        capabilityManager.evaluateAll()
                     },
                     onStartForegroundService = {
                         NayroForegroundService.startService(this)
@@ -158,6 +164,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         permissionManager.refreshAllPermissions(this)
+        permissionSetupManager.refreshReport()
         capabilityManager.evaluateAll()
     }
 
@@ -171,6 +178,7 @@ class MainActivity : ComponentActivity() {
 fun NayroAppContent(
     repository: NayroRepository,
     permissionManager: PermissionManager,
+    permissionSetupManager: PermissionSetupManager,
     capabilityManager: CapabilityManager,
     encryptedStorageManager: EncryptedStorageManager,
     agentRuntime: AgentRuntime,
@@ -181,14 +189,15 @@ fun NayroAppContent(
     onClearPendingPrompt: () -> Unit,
     onRequestRuntimePermission: (PermissionType) -> Unit,
     onOpenPermissionSettings: (PermissionType) -> Unit,
+    onRefreshPermissions: () -> Unit,
     onStartForegroundService: () -> Unit,
     onStopForegroundService: () -> Unit,
     onStartFloatingService: () -> Unit,
     onStopFloatingService: () -> Unit
 ) {
     var currentScreen by remember { mutableStateOf<Screen>(Screen.Home) }
-    var assistantName by remember { mutableStateOf("Babu") }
-    var showOnboarding by remember { mutableStateOf(false) }
+    var assistantName by remember { mutableStateOf(permissionSetupManager.getSavedAssistantName()) }
+    var showOnboarding by remember { mutableStateOf(!permissionSetupManager.isSetupCompleted()) }
 
     val context = androidx.compose.ui.platform.LocalContext.current
     val coroutineScope = rememberCoroutineScope()
@@ -218,21 +227,17 @@ fun NayroAppContent(
         if (text.isEmpty()) return
 
         coroutineScope.launch {
-            // Save User message
             repository.addConversationMessage(
                 ConversationEntity(sender = "user", content = text)
             )
 
-            // Execute full Agentic Workflow: Planning, Permissions, Execution, Verification
             val reply = agentRuntime.executeUserInstruction(text)
 
-            // Save Babu verified response
             repository.addConversationMessage(
                 ConversationEntity(sender = "babu", content = reply)
             )
             agentRuntime.setState(AgentState.Speaking(reply))
 
-            // Speak response via TTS if configured
             if (voiceConfig.isWakeWordEnabled || voiceState == VoiceState.SPEAKING) {
                 voiceManager.speak(reply)
             }
@@ -266,8 +271,19 @@ fun NayroAppContent(
 
     if (showOnboarding) {
         OnboardingScreen(
+            evaluations = evaluations,
+            initialAssistantName = assistantName,
+            isForegroundRunning = foregroundStatus.state == ServiceLifecycleState.RUNNING,
+            isFloatingRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
+            onRequestRuntimePermission = onRequestRuntimePermission,
+            onOpenPermissionSettings = onOpenPermissionSettings,
+            onRefreshPermissions = onRefreshPermissions,
+            onStartForegroundService = onStartForegroundService,
+            onStartFloatingService = onStartFloatingService,
             onCompleteOnboarding = { name ->
-                assistantName = name
+                val cleanName = name.trim().ifEmpty { "Babu" }
+                assistantName = cleanName
+                permissionSetupManager.markSetupCompleted(cleanName)
                 showOnboarding = false
                 currentScreen = Screen.Home
             }
@@ -276,7 +292,11 @@ fun NayroAppContent(
         Scaffold(
             modifier = Modifier.fillMaxSize(),
             topBar = {
-                NayroTopBar(currentScreen = currentScreen)
+                NayroTopBar(
+                    currentScreen = currentScreen,
+                    onOpenPermissions = { currentScreen = Screen.PermissionAccess },
+                    onOpenControlCenter = { currentScreen = Screen.AgentDashboard }
+                )
             },
             bottomBar = {
                 NayroBottomBar(
@@ -285,232 +305,259 @@ fun NayroAppContent(
                 )
             }
         ) { innerPadding ->
-            val modifier = Modifier.padding(innerPadding)
-
-            when (currentScreen) {
-                Screen.Home -> HomeScreen(
-                    assistantName = assistantName,
-                    agentState = agentState,
-                    currentTask = currentTask,
-                    isForegroundActive = foregroundStatus.state == ServiceLifecycleState.RUNNING,
-                    isFloatingActive = floatingStatus.state == ServiceLifecycleState.RUNNING,
-                    isAiReady = activeProvider != null,
-                    onVoiceTap = {
-                        if (voiceState == VoiceState.LISTENING) {
-                            voiceManager.stopListening()
-                        } else {
-                            if (!permissionManager.isMicrophoneGranted()) {
-                                onRequestRuntimePermission(PermissionType.MICROPHONE)
+            androidx.compose.foundation.layout.Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+            ) {
+                when (currentScreen) {
+                    Screen.Home -> HomeScreen(
+                        assistantName = assistantName,
+                        agentState = agentState,
+                        currentTask = currentTask,
+                        recentConversations = conversations,
+                        isForegroundActive = foregroundStatus.state == ServiceLifecycleState.RUNNING,
+                        isFloatingActive = floatingStatus.state == ServiceLifecycleState.RUNNING,
+                        isAiReady = activeProvider != null,
+                        onVoiceTap = {
+                            if (voiceState == VoiceState.LISTENING) {
+                                voiceManager.stopListening()
                             } else {
-                                voiceManager.startListening()
-                            }
-                        }
-                    },
-                    onSendText = { text ->
-                        processUserPrompt(text)
-                    },
-                    onCancelTask = {
-                        agentRuntime.cancelCurrentTask()
-                    },
-                    onQuickActionClick = { tag ->
-                        when (tag) {
-                            "action_background" -> currentScreen = Screen.BackgroundControl
-                            "action_perm" -> currentScreen = Screen.PermissionAccess
-                            "action_caps" -> currentScreen = Screen.Capabilities
-                            "action_api" -> currentScreen = Screen.Settings
-                            "action_memory" -> currentScreen = Screen.Memory
-                        }
-                    }
-                )
-
-                Screen.BackgroundControl -> BackgroundControlScreen(
-                    isForegroundRunning = foregroundStatus.state == ServiceLifecycleState.RUNNING,
-                    isFloatingRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
-                    hasOverlayPermission = permissionManager.canDrawOverlays(),
-                    onStartForegroundService = onStartForegroundService,
-                    onStopForegroundService = onStopForegroundService,
-                    onStartFloatingService = onStartFloatingService,
-                    onStopFloatingService = onStopFloatingService,
-                    onRequestOverlayPermission = {
-                        onOpenPermissionSettings(PermissionType.OVERLAY)
-                    }
-                )
-
-                Screen.PermissionAccess -> PermissionAccessScreen(
-                    evaluations = evaluations,
-                    onRequestRuntimePermission = onRequestRuntimePermission,
-                    onOpenSystemSettings = onOpenPermissionSettings
-                )
-
-                Screen.Capabilities -> CapabilitiesScreen(
-                    capabilities = capabilities,
-                    onActionClick = { capId, label ->
-                        when (capId) {
-                            CapabilityId.FLOATING_ASSISTANT -> {
-                                if (!permissionManager.canDrawOverlays()) {
-                                    onOpenPermissionSettings(PermissionType.OVERLAY)
-                                } else if (floatingStatus.state == ServiceLifecycleState.RUNNING) {
-                                    onStopFloatingService()
+                                if (!permissionManager.isMicrophoneGranted()) {
+                                    onRequestRuntimePermission(PermissionType.MICROPHONE)
                                 } else {
-                                    onStartFloatingService()
+                                    voiceManager.startListening()
                                 }
                             }
-                            CapabilityId.BACKGROUND_AGENT -> {
-                                if (foregroundStatus.state == ServiceLifecycleState.RUNNING) {
-                                    onStopForegroundService()
-                                } else {
-                                    onStartForegroundService()
+                        },
+                        onSendText = { text ->
+                            processUserPrompt(text)
+                        },
+                        onCancelTask = {
+                            agentRuntime.cancelCurrentTask()
+                        },
+                        onQuickActionClick = { tag ->
+                            when (tag) {
+                                "action_dashboard" -> currentScreen = Screen.AgentDashboard
+                                "action_background" -> currentScreen = Screen.BackgroundControl
+                                "action_perm" -> currentScreen = Screen.PermissionAccess
+                                "action_caps" -> currentScreen = Screen.Capabilities
+                                "action_api" -> currentScreen = Screen.Settings
+                                "action_memory" -> currentScreen = Screen.Memory
+                                "action_chat" -> currentScreen = Screen.Chat
+                                "action_wizard" -> showOnboarding = true
+                            }
+                        }
+                    )
+
+                    Screen.BackgroundControl -> BackgroundControlScreen(
+                        isForegroundRunning = foregroundStatus.state == ServiceLifecycleState.RUNNING,
+                        isFloatingRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
+                        hasOverlayPermission = permissionManager.canDrawOverlays(),
+                        onStartForegroundService = onStartForegroundService,
+                        onStopForegroundService = onStopForegroundService,
+                        onStartFloatingService = onStartFloatingService,
+                        onStopFloatingService = onStopFloatingService,
+                        onRequestOverlayPermission = {
+                            onOpenPermissionSettings(PermissionType.OVERLAY)
+                        }
+                    )
+
+                    Screen.PermissionAccess -> PermissionAccessScreen(
+                        evaluations = evaluations,
+                        onRequestRuntimePermission = onRequestRuntimePermission,
+                        onOpenSystemSettings = onOpenPermissionSettings,
+                        onRefreshPermissions = onRefreshPermissions,
+                        onLaunchSetupWizard = { showOnboarding = true }
+                    )
+
+                    Screen.Capabilities -> CapabilitiesScreen(
+                        capabilities = capabilities,
+                        onActionClick = { capId, _ ->
+                            when (capId) {
+                                CapabilityId.FLOATING_ASSISTANT -> {
+                                    if (!permissionManager.canDrawOverlays()) {
+                                        onOpenPermissionSettings(PermissionType.OVERLAY)
+                                    } else if (floatingStatus.state == ServiceLifecycleState.RUNNING) {
+                                        onStopFloatingService()
+                                    } else {
+                                        onStartFloatingService()
+                                    }
                                 }
+                                CapabilityId.BACKGROUND_AGENT -> {
+                                    if (foregroundStatus.state == ServiceLifecycleState.RUNNING) {
+                                        onStopForegroundService()
+                                    } else {
+                                        onStartForegroundService()
+                                    }
+                                }
+                                CapabilityId.MICROPHONE_ACCESS, CapabilityId.WAKE_WORD_READY, CapabilityId.VOICE_INTERACTION_READY -> {
+                                    onRequestRuntimePermission(PermissionType.MICROPHONE)
+                                }
+                                CapabilityId.NOTIFICATION_ACCESS -> {
+                                    onRequestRuntimePermission(PermissionType.NOTIFICATIONS)
+                                }
+                                CapabilityId.ACCESSIBILITY -> {
+                                    context.startActivity(com.example.core.accessibility.AccessibilityConnectionManager.createSettingsIntent())
+                                }
+                                else -> {}
                             }
-                            CapabilityId.MICROPHONE_ACCESS, CapabilityId.WAKE_WORD_READY, CapabilityId.VOICE_INTERACTION_READY -> {
-                                onRequestRuntimePermission(PermissionType.MICROPHONE)
+                        }
+                    )
+
+                    Screen.Chat -> ConversationScreen(
+                        conversations = conversations,
+                        onSendMessage = { text ->
+                            processUserPrompt(text)
+                        },
+                        onClearHistory = {
+                            coroutineScope.launch {
+                                repository.clearHistory()
                             }
-                            CapabilityId.NOTIFICATION_ACCESS -> {
-                                onRequestRuntimePermission(PermissionType.NOTIFICATIONS)
+                        }
+                    )
+
+                    Screen.Activity -> ActivityScreen(
+                        auditLogs = auditLogs
+                    )
+
+                    Screen.Memory -> MemoryScreen(
+                        memories = memories,
+                        notes = notes,
+                        onDeleteMemory = { id ->
+                            coroutineScope.launch {
+                                repository.deleteMemory(id)
                             }
-                            CapabilityId.ACCESSIBILITY -> {
-                                context.startActivity(com.example.core.accessibility.AccessibilityConnectionManager.createSettingsIntent())
+                        },
+                        onCreateNote = { title, content, cat ->
+                            coroutineScope.launch {
+                                notebookManager.createNote(title, content, cat)
                             }
-                            else -> {}
+                        },
+                        onDeleteNote = { id ->
+                            coroutineScope.launch {
+                                notebookManager.deleteNote(id)
+                            }
+                        },
+                        onTogglePinNote = { note ->
+                            coroutineScope.launch {
+                                notebookManager.togglePin(note)
+                            }
                         }
-                    }
-                )
+                    )
 
-                Screen.Chat -> ConversationScreen(
-                    conversations = conversations,
-                    onSendMessage = { text ->
-                        processUserPrompt(text)
-                    },
-                    onClearHistory = {
-                        coroutineScope.launch {
-                            repository.clearHistory()
-                        }
-                    }
-                )
-
-                Screen.Activity -> ActivityScreen(
-                    auditLogs = auditLogs
-                )
-
-                Screen.Memory -> MemoryScreen(
-                    memories = memories,
-                    notes = notes,
-                    onDeleteMemory = { id ->
-                        coroutineScope.launch {
-                            repository.deleteMemory(id)
-                        }
-                    },
-                    onCreateNote = { title, content, cat ->
-                        coroutineScope.launch {
-                            notebookManager.createNote(title, content, cat)
-                        }
-                    },
-                    onDeleteNote = { id ->
-                        coroutineScope.launch {
-                            notebookManager.deleteNote(id)
-                        }
-                    },
-                    onTogglePinNote = { note ->
-                        coroutineScope.launch {
-                            notebookManager.togglePin(note)
-                        }
-                    }
-                )
-
-                Screen.Settings -> SettingsScreen(
-                    assistantName = assistantName,
-                    isWakeEnabled = voiceConfig.isWakeWordEnabled,
-                    providers = configuredProviders,
-                    activeProviderId = activeProvider?.id,
-                    onSaveApiKey = { providerId, apiKey ->
-                        encryptedStorageManager.saveApiKey(providerId, apiKey)
-                        providerManager.refreshActiveProvider()
-                        capabilityManager.evaluateAll()
-                        coroutineScope.launch {
-                            repository.logAuditAction(
-                                actionType = "SECURITY_KEY_UPDATE",
-                                target = providerId,
-                                riskLevel = "R0",
-                                outcome = "SUCCESS",
-                                details = "API key securely stored in Android KeyStore."
+                    Screen.Settings -> SettingsScreen(
+                        assistantName = assistantName,
+                        isWakeEnabled = voiceConfig.isWakeWordEnabled,
+                        providers = configuredProviders,
+                        activeProviderId = activeProvider?.id,
+                        onSaveApiKey = { providerId, apiKey ->
+                            encryptedStorageManager.saveApiKey(providerId, apiKey)
+                            providerManager.refreshActiveProvider()
+                            capabilityManager.evaluateAll()
+                            coroutineScope.launch {
+                                repository.logAuditAction(
+                                    actionType = "SECURITY_KEY_UPDATE",
+                                    target = providerId,
+                                    riskLevel = "R0",
+                                    outcome = "SUCCESS",
+                                    details = "API key securely stored in Android KeyStore."
+                                )
+                            }
+                        },
+                        onSaveCustomProvider = { id, name, url, model ->
+                            val customConfig = ProviderConfig(
+                                id = id,
+                                type = ProviderType.CUSTOM_OPENAI,
+                                name = name,
+                                baseUrl = url,
+                                modelId = model,
+                                priority = 5,
+                                isEnabled = true
                             )
-                        }
-                    },
-                    onSaveCustomProvider = { id, name, url, model ->
-                        val customConfig = ProviderConfig(
-                            id = id,
-                            type = ProviderType.CUSTOM_OPENAI,
-                            name = name,
-                            baseUrl = url,
-                            modelId = model,
-                            priority = 5,
-                            isEnabled = true
-                        )
-                        providerManager.updateProvider(customConfig)
-                        capabilityManager.evaluateAll()
-                    },
-                    onToggleWake = { enabled ->
-                        voiceManager.updateConfiguration(voiceConfig.copy(isWakeWordEnabled = enabled))
-                        capabilityManager.evaluateAll()
-                    },
-                    onTestProvider = { providerId ->
-                        coroutineScope.launch {
-                            val key = encryptedStorageManager.getApiKey(providerId)
-                            val provider = configuredProviders.firstOrNull { it.id == providerId }
-                            if (provider != null) {
-                                agentRuntime.setState(AgentState.Thinking)
-                                val result = providerManager.sendRequest("Test connection from NAYRO")
-                                if (result is AIResult.Success) {
-                                    agentRuntime.setState(AgentState.Completed("Connected successfully to ${provider.name}!"))
-                                } else if (result is AIResult.Error) {
-                                    agentRuntime.setState(AgentState.Error(result.message))
+                            providerManager.updateProvider(customConfig)
+                            capabilityManager.evaluateAll()
+                        },
+                        onToggleWake = { enabled ->
+                            voiceManager.updateConfiguration(voiceConfig.copy(isWakeWordEnabled = enabled))
+                            capabilityManager.evaluateAll()
+                        },
+                        onTestProvider = { providerId ->
+                            coroutineScope.launch {
+                                val provider = configuredProviders.firstOrNull { it.id == providerId }
+                                if (provider != null) {
+                                    agentRuntime.setState(AgentState.Thinking)
+                                    val result = providerManager.sendRequest("Test connection from NAYRO")
+                                    if (result is AIResult.Success) {
+                                        agentRuntime.setState(AgentState.Completed("Connected successfully to ${provider.name}!"))
+                                    } else if (result is AIResult.Error) {
+                                        agentRuntime.setState(AgentState.Error(result.message))
+                                    }
                                 }
                             }
                         }
-                    }
-                )
+                    )
 
-                Screen.ToolsCatalog -> com.example.ui.tools.ToolsCatalogScreen()
+                    Screen.ToolsCatalog -> com.example.ui.tools.ToolsCatalogScreen()
 
-                Screen.SkillsHub -> com.example.ui.skills.SkillsHubScreen(
-                    skillManager = (context.applicationContext as NayroApplication).skillManager,
-                    onExecuteSkill = { skillId ->
-                        processUserPrompt("Execute procedural skill: $skillId")
-                    }
-                )
+                    Screen.SkillsHub -> com.example.ui.skills.SkillsHubScreen(
+                        skillManager = (context.applicationContext as NayroApplication).skillManager,
+                        onExecuteSkill = { skillId ->
+                            processUserPrompt("Execute procedural skill: $skillId")
+                        }
+                    )
 
-                Screen.SubAgents -> com.example.ui.subagent.SubAgentManagerScreen(
-                    subAgentManager = (context.applicationContext as NayroApplication).subAgentManager,
-                    onDelegate = { agentType, subGoal ->
-                        val app = (context.applicationContext as NayroApplication)
-                        app.subAgentManager.delegateTask(agentType, subGoal)
-                        processUserPrompt("Delegate sub-task to ${agentType.displayName}: $subGoal")
-                    }
-                )
+                    Screen.SubAgents -> com.example.ui.subagent.SubAgentManagerScreen(
+                        subAgentManager = (context.applicationContext as NayroApplication).subAgentManager,
+                        onDelegate = { agentType, subGoal ->
+                            val app = (context.applicationContext as NayroApplication)
+                            app.subAgentManager.delegateTask(agentType, subGoal)
+                            processUserPrompt("Delegate sub-task to ${agentType.displayName}: $subGoal")
+                        }
+                    )
 
-                Screen.Workspace -> com.example.ui.workspace.WorkspaceScreen(
-                    workspaceManager = (context.applicationContext as NayroApplication).workspaceManager
-                )
+                    Screen.Workspace -> com.example.ui.workspace.WorkspaceScreen(
+                        workspaceManager = (context.applicationContext as NayroApplication).workspaceManager
+                    )
 
-                Screen.ResearchAgent -> com.example.ui.research.ResearchAgentScreen(
-                    providerManager = providerManager,
-                    workspaceManager = (context.applicationContext as NayroApplication).workspaceManager
-                )
+                    Screen.ResearchAgent -> com.example.ui.research.ResearchAgentScreen(
+                        providerManager = providerManager,
+                        workspaceManager = (context.applicationContext as NayroApplication).workspaceManager
+                    )
 
-                Screen.Onboarding -> OnboardingScreen(
-                    onCompleteOnboarding = { name ->
-                        assistantName = name
-                        currentScreen = Screen.Home
-                    }
-                )
-            }
+                    Screen.AgentDashboard -> com.example.ui.dashboard.AgentDashboardScreen(
+                        agentRuntime = agentRuntime,
+                        onExecuteInstruction = { cmd ->
+                            processUserPrompt(cmd)
+                        }
+                    )
 
-            pendingConfirmation?.let { conf ->
-                com.example.ui.components.ConfirmationDialog(
-                    confirmation = conf,
-                    onConfirm = { agentRuntime.confirmationManager.approve(conf.actionId, conf.parameters) },
-                    onReject = { agentRuntime.confirmationManager.reject(conf.actionId) }
-                )
+                    Screen.Onboarding -> OnboardingScreen(
+                        evaluations = evaluations,
+                        initialAssistantName = assistantName,
+                        isForegroundRunning = foregroundStatus.state == ServiceLifecycleState.RUNNING,
+                        isFloatingRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
+                        onRequestRuntimePermission = onRequestRuntimePermission,
+                        onOpenPermissionSettings = onOpenPermissionSettings,
+                        onRefreshPermissions = onRefreshPermissions,
+                        onStartForegroundService = onStartForegroundService,
+                        onStartFloatingService = onStartFloatingService,
+                        onCompleteOnboarding = { name ->
+                            val cleanName = name.trim().ifEmpty { "Babu" }
+                            assistantName = cleanName
+                            permissionSetupManager.markSetupCompleted(cleanName)
+                            currentScreen = Screen.Home
+                        }
+                    )
+                }
+
+                pendingConfirmation?.let { conf ->
+                    com.example.ui.components.ConfirmationDialog(
+                        confirmation = conf,
+                        onConfirm = { agentRuntime.confirmationManager.approve(conf.actionId, conf.parameters) },
+                        onReject = { agentRuntime.confirmationManager.reject(conf.actionId) }
+                    )
+                }
             }
         }
     }

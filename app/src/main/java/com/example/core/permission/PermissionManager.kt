@@ -12,6 +12,7 @@ import android.provider.Settings
 import android.text.TextUtils
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.example.core.notification.NotificationIntelligenceRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -19,14 +20,15 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * System A — Centralized Permission Management for NAYRO.
  * Accurately tracks Runtime Permissions, Special App Ops (SYSTEM_ALERT_WINDOW),
- * exact AccessibilityService component binding verification, and Battery Optimization Exemptions.
+ * exact AccessibilityService component binding verification, NotificationListenerService binding,
+ * and Battery Optimization Exemptions.
  */
 class PermissionManager(private val context: Context) {
 
     private val _evaluations = MutableStateFlow<Map<PermissionType, PermissionEvaluation>>(emptyMap())
     val evaluations: StateFlow<Map<PermissionType, PermissionEvaluation>> = _evaluations.asStateFlow()
 
-    // Backwards compatibility for Step 01 callers
+    // Backwards compatibility for callers
     private val _permissionStates = MutableStateFlow<Map<PermissionType, PermissionState>>(emptyMap())
     val permissionStates: StateFlow<Map<PermissionType, PermissionState>> = _permissionStates.asStateFlow()
 
@@ -83,13 +85,28 @@ class PermissionManager(private val context: Context) {
                     )
                 }
             }
+            PermissionType.READ_CONTACTS -> {
+                evaluateRuntimePermission(android.Manifest.permission.READ_CONTACTS, item, activity)
+            }
+            PermissionType.READ_PHONE_STATE -> {
+                evaluateRuntimePermission(android.Manifest.permission.READ_PHONE_STATE, item, activity)
+            }
+            PermissionType.READ_CALENDAR -> {
+                evaluateRuntimePermission(android.Manifest.permission.READ_CALENDAR, item, activity)
+            }
+            PermissionType.WRITE_CALENDAR -> {
+                evaluateRuntimePermission(android.Manifest.permission.WRITE_CALENDAR, item, activity)
+            }
+            PermissionType.COARSE_LOCATION -> {
+                evaluateRuntimePermission(android.Manifest.permission.ACCESS_COARSE_LOCATION, item, activity)
+            }
             PermissionType.OVERLAY -> {
                 val canDraw = Settings.canDrawOverlays(context)
                 if (canDraw) {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.GRANTED,
-                        statusExplanation = "SYSTEM_ALERT_WINDOW granted. Floating assistant can overlay anywhere."
+                        statusExplanation = "SYSTEM_ALERT_WINDOW verified granted. Floating Babu overlay ready."
                     )
                 } else {
                     PermissionEvaluation(
@@ -107,19 +124,35 @@ class PermissionManager(private val context: Context) {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.UNAVAILABLE,
-                        statusExplanation = "Accessibility service is not declared in AndroidManifest.xml (Phase 4 feature)."
+                        statusExplanation = "Accessibility service is not declared in AndroidManifest.xml."
                     )
                 } else if (!isEnabledInSettings) {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.SPECIAL_ACCESS_REQUIRED,
-                        statusExplanation = "Service declared but not enabled in Android Accessibility Settings."
+                        statusExplanation = "Service declared in Manifest; enable NAYRO in Android Accessibility Settings."
                     )
                 } else {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.GRANTED,
-                        statusExplanation = "Exact Accessibility Service component enabled and connected."
+                        statusExplanation = "Exact Accessibility Service component enabled and verified in system settings."
+                    )
+                }
+            }
+            PermissionType.NOTIFICATION_LISTENER -> {
+                val isEnabled = isNotificationListenerEnabled()
+                if (isEnabled) {
+                    PermissionEvaluation(
+                        item = item,
+                        status = PermissionStatus.GRANTED,
+                        statusExplanation = "NotificationListenerService enabled and verified in system settings."
+                    )
+                } else {
+                    PermissionEvaluation(
+                        item = item,
+                        status = PermissionStatus.SPECIAL_ACCESS_REQUIRED,
+                        statusExplanation = "Enable NAYRO in Android Settings > Notification Access to read & summarize notifications."
                     )
                 }
             }
@@ -130,18 +163,17 @@ class PermissionManager(private val context: Context) {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.GRANTED,
-                        statusExplanation = "Unrestricted background battery execution enabled."
+                        statusExplanation = "Unrestricted background battery execution verified enabled."
                     )
                 } else {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.SPECIAL_ACCESS_REQUIRED,
-                        statusExplanation = "Recommended: Exclude from battery optimization to prevent background kills."
+                        statusExplanation = "Recommended: Exclude NAYRO from battery optimization to prevent background kills."
                     )
                 }
             }
             PermissionType.FOREGROUND_SERVICE -> {
-                // Verify actual manifest declaration of FOREGROUND_SERVICE and FOREGROUND_SERVICE_SPECIAL_USE
                 val declared = isManifestPermissionDeclared(android.Manifest.permission.FOREGROUND_SERVICE)
                 val specialUseDeclared = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     isManifestPermissionDeclared(android.Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE)
@@ -151,7 +183,7 @@ class PermissionManager(private val context: Context) {
                     PermissionEvaluation(
                         item = item,
                         status = PermissionStatus.GRANTED,
-                        statusExplanation = "FOREGROUND_SERVICE & specialUse type verified in manifest."
+                        statusExplanation = "FOREGROUND_SERVICE & specialUse type verified in AndroidManifest."
                     )
                 } else {
                     PermissionEvaluation(
@@ -162,11 +194,19 @@ class PermissionManager(private val context: Context) {
                 }
             }
             PermissionType.SCREEN_CAPTURE -> {
-                PermissionEvaluation(
-                    item = item,
-                    status = PermissionStatus.SPECIAL_ACCESS_REQUIRED,
-                    statusExplanation = "Requires active user consent via MediaProjection dialog on-demand."
-                )
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && isExactAccessibilityServiceEnabled()) {
+                    PermissionEvaluation(
+                        item = item,
+                        status = PermissionStatus.NOT_REQUIRED,
+                        statusExplanation = "Provided automatically by AccessibilityService.takeScreenshot() on Android 11+."
+                    )
+                } else {
+                    PermissionEvaluation(
+                        item = item,
+                        status = PermissionStatus.SPECIAL_ACCESS_REQUIRED,
+                        statusExplanation = "Requires per-session user consent via MediaProjection dialog when requested."
+                    )
+                }
             }
         }
     }
@@ -181,15 +221,15 @@ class PermissionManager(private val context: Context) {
             return PermissionEvaluation(
                 item = item,
                 status = PermissionStatus.GRANTED,
-                statusExplanation = "Runtime permission granted."
+                statusExplanation = "Runtime permission verified granted by Android OS."
             )
         }
 
+        val prefs = context.getSharedPreferences("nayro_perm_prefs", Context.MODE_PRIVATE)
+        val requestedBefore = prefs.getBoolean("requested_$permission", false)
+
         if (activity != null) {
             val shouldShowRationale = ActivityCompat.shouldShowRequestPermissionRationale(activity, permission)
-            val prefs = context.getSharedPreferences("nayro_perm_prefs", Context.MODE_PRIVATE)
-            val requestedBefore = prefs.getBoolean("requested_$permission", false)
-
             if (!shouldShowRationale && requestedBefore) {
                 return PermissionEvaluation(
                     item = item,
@@ -202,7 +242,11 @@ class PermissionManager(private val context: Context) {
         return PermissionEvaluation(
             item = item,
             status = PermissionStatus.DENIED,
-            statusExplanation = "Runtime permission not yet granted."
+            statusExplanation = if (requestedBefore) {
+                "Permission was denied previously. Tap Request or Open Settings to grant."
+            } else {
+                "Runtime permission not yet granted."
+            }
         )
     }
 
@@ -281,6 +325,32 @@ class PermissionManager(private val context: Context) {
         }
     }
 
+    /**
+     * Checks if NAYRO's NotificationListenerService is enabled in Android system settings
+     * or actively bound.
+     */
+    fun isNotificationListenerEnabled(): Boolean {
+        if (NotificationIntelligenceRepository.isListenerConnected.value) return true
+        return try {
+            val flat = Settings.Secure.getString(
+                context.contentResolver,
+                "enabled_notification_listeners"
+            ) ?: return false
+            val colonSplitter = TextUtils.SimpleStringSplitter(':')
+            colonSplitter.setString(flat)
+            while (colonSplitter.hasNext()) {
+                val componentNameString = colonSplitter.next()
+                val cn = ComponentName.unflattenFromString(componentNameString)
+                if (cn != null && cn.packageName == context.packageName) {
+                    return true
+                }
+            }
+            false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     fun isPermissionGranted(permission: String): Boolean {
         return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
     }
@@ -307,6 +377,11 @@ class PermissionManager(private val context: Context) {
         }
     }
 
+    fun isBatteryOptimizationIgnored(): Boolean {
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+        return powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+    }
+
     /**
      * Creates direct Intent to the exact Android System Settings screen for a permission.
      */
@@ -323,13 +398,24 @@ class PermissionManager(private val context: Context) {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
             }
+            PermissionType.NOTIFICATION_LISTENER -> {
+                Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            }
             PermissionType.BATTERY_OPTIMIZATION -> {
                 Intent(
                     Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                     Uri.parse("package:${context.packageName}")
                 ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
             }
-            PermissionType.MICROPHONE, PermissionType.NOTIFICATIONS -> {
+            PermissionType.MICROPHONE,
+            PermissionType.NOTIFICATIONS,
+            PermissionType.READ_CONTACTS,
+            PermissionType.READ_PHONE_STATE,
+            PermissionType.READ_CALENDAR,
+            PermissionType.WRITE_CALENDAR,
+            PermissionType.COARSE_LOCATION -> {
                 Intent(
                     Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                     Uri.parse("package:${context.packageName}")

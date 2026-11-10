@@ -1,7 +1,7 @@
 package com.example.ui.components
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -27,12 +27,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.core.agent.PendingConfirmation
 import com.example.ui.theme.Coral
-import com.example.ui.theme.DeepGreen
 import com.example.ui.theme.ForestGreen
-import com.example.ui.theme.SoftSage
 
 @Composable
 fun ConfirmationDialog(
@@ -53,21 +52,22 @@ fun ConfirmationDialog(
                 Text(
                     text = confirmation.title,
                     style = MaterialTheme.typography.titleMedium,
-                    color = Color.White
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface
                 )
             }
         },
         text = {
             Column {
-                // Risk Badge
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = "RISK LEVEL: ${confirmation.riskLevel.code}",
                         style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
                         color = Coral,
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
-                            .background(DeepGreen)
+                            .background(Coral.copy(alpha = 0.12f))
                             .padding(horizontal = 8.dp, vertical = 4.dp)
                     )
                 }
@@ -77,13 +77,14 @@ fun ConfirmationDialog(
                 Text(
                     text = confirmation.description,
                     style = MaterialTheme.typography.bodyMedium,
-                    color = SoftSage
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 if (confirmation.parameters.isNotEmpty()) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Card(
-                        colors = CardDefaults.cardColors(containerColor = DeepGreen),
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+                        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Column(modifier = Modifier.padding(10.dp)) {
@@ -91,7 +92,7 @@ fun ConfirmationDialog(
                                 Text(
                                     text = "$key: $value",
                                     style = MaterialTheme.typography.bodySmall,
-                                    color = Color.White
+                                    color = MaterialTheme.colorScheme.onSurface
                                 )
                             }
                         }
@@ -102,7 +103,7 @@ fun ConfirmationDialog(
         confirmButton = {
             Button(
                 onClick = onConfirm,
-                colors = ButtonDefaults.buttonColors(containerColor = Coral),
+                colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
                 modifier = Modifier.testTag("btn_confirm_action")
             ) {
                 Text("Confirm & Execute", color = Color.White)
@@ -113,10 +114,10 @@ fun ConfirmationDialog(
                 onClick = onReject,
                 modifier = Modifier.testTag("btn_reject_action")
             ) {
-                Text("Cancel", color = SoftSage)
+                Text("Cancel", color = MaterialTheme.colorScheme.onSurface)
             }
         },
-        containerColor = ForestGreen,
-        textContentColor = SoftSage
+        containerColor = MaterialTheme.colorScheme.surface,
+        textContentColor = MaterialTheme.colorScheme.onSurface
     )
 }

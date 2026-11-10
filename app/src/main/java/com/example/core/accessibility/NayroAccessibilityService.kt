@@ -176,4 +176,65 @@ class NayroAccessibilityService : AccessibilityService() {
 
         return outcome ?: (false to "Tap gesture at ($x, $y) timed out.")
     }
+
+    /**
+     * Dispatches a real directional or coordinate swipe gesture via AccessibilityService.dispatchGesture.
+     */
+    suspend fun dispatchSwipeGesture(
+        startX: Float,
+        startY: Float,
+        endX: Float,
+        endY: Float,
+        durationMs: Long = 300L
+    ): Pair<Boolean, String> {
+        val displayMetrics = resources.displayMetrics
+        val maxW = displayMetrics.widthPixels.toFloat().coerceAtLeast(1080f)
+        val maxH = displayMetrics.heightPixels.toFloat().coerceAtLeast(2400f)
+
+        if (startX < 0f || startY < 0f || endX < 0f || endY < 0f ||
+            startX > maxW || endX > maxW || startY > maxH || endY > maxH
+        ) {
+            return false to "Invalid swipe coordinates ($startX,$startY -> $endX,$endY): outside screen bounds."
+        }
+
+        val safeDuration = durationMs.coerceIn(100L, 2000L)
+        val outcome = withTimeoutOrNull(safeDuration + 2500L) {
+            suspendCancellableCoroutine<Pair<Boolean, String>> { cont ->
+                try {
+                    val path = Path().apply {
+                        moveTo(startX, startY)
+                        lineTo(endX, endY)
+                    }
+                    val stroke = GestureDescription.StrokeDescription(path, 0L, safeDuration)
+                    val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                    val dispatched = dispatchGesture(
+                        gesture,
+                        object : GestureResultCallback() {
+                            override fun onCompleted(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) {
+                                    cont.resume(true to "Dispatched swipe gesture from ($startX, $startY) to ($endX, $endY).")
+                                }
+                            }
+
+                            override fun onCancelled(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) {
+                                    cont.resume(false to "Swipe gesture was cancelled by the system.")
+                                }
+                            }
+                        },
+                        null
+                    )
+                    if (!dispatched && cont.isActive) {
+                        cont.resume(false to "System rejected swipe gesture dispatch.")
+                    }
+                } catch (e: Exception) {
+                    if (cont.isActive) {
+                        cont.resume(false to "Failed to dispatch swipe gesture: ${e.localizedMessage}")
+                    }
+                }
+            }
+        }
+
+        return outcome ?: (false to "Swipe gesture timed out.")
+    }
 }

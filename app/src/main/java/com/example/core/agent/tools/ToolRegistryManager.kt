@@ -133,6 +133,17 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.TOGGLE_FLASHLIGHT,
+                toolId = "android.toggle_flashlight",
+                displayName = "Toggle Flashlight / Torch",
+                description = "Turns the device camera flashlight (torch) ON or OFF using Android CameraManager.",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = mapOf("enabled" to "Boolean ('true' or 'false') - Whether to turn torch on or off"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
 
         // 2. Screen & Interaction Tools
         register(
@@ -626,6 +637,148 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.GET_CURRENT_LOCATION,
+                toolId = "android.get_current_location",
+                displayName = "Get Approximate Device Location",
+                description = "Retrieves the last known approximate device location when location permission is granted.",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredPermission = Manifest.permission.ACCESS_COARSE_LOCATION
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SWIPE_SCREEN,
+                toolId = "screen.swipe_screen",
+                displayName = "Swipe Screen Gesture",
+                description = "Dispatches a directional (up, down, left, right) or coordinate swipe gesture via AccessibilityService.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = mapOf(
+                    "direction" to "String - up, down, left, right (or startX/startY/endX/endY)",
+                    "durationMs" to "Long - Swipe duration in ms"
+                ),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.ANALYZE_IMAGE_VISION,
+                toolId = "screen.analyze_image_vision",
+                displayName = "Multimodal Screen & Image Analysis",
+                description = "Analyzes screen content or workspace image/document using the active multimodal AI provider or OCR context.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = mapOf("prompt" to "String - Question about the screen or image", "filename" to "String - Optional workspace file"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SEND_SMS,
+                toolId = "comm.send_sms",
+                displayName = "Compose & Send SMS",
+                description = "Resolves recipient contact, enforces confirmation, and opens the Android SMS composer with pre-filled text via ACTION_SENDTO.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("recipient" to "String - Contact name or phone number", "message" to "String - SMS body text"),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SUMMARIZE_NOTIFICATIONS,
+                toolId = "comm.summarize_notifications",
+                displayName = "Summarize Active Notifications",
+                description = "Summarizes recent status bar notifications grouped by priority and category.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredCapability = CapabilityId.NOTIFICATION_ACCESS
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CLASSIFY_NOTIFICATIONS,
+                toolId = "comm.classify_notifications",
+                displayName = "Classify Notifications by Priority",
+                description = "Classifies active notifications into Message, Reminder, System Alert, Social/Promotion, or General.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("category" to "String - Optional category filter"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredCapability = CapabilityId.NOTIFICATION_ACCESS
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CREATE_TASK_FROM_NOTIFICATION,
+                toolId = "comm.create_task_from_notification",
+                displayName = "Create Reminder/Note from Notification",
+                description = "Extracts an actionable reminder or note from a recent notification.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("notificationKey" to "String - Optional notification key or sender filter"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredCapability = CapabilityId.NOTIFICATION_ACCESS
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.COMPARE_DOCUMENTS,
+                toolId = "workspace.compare_documents",
+                displayName = "Compare Two Workspace Documents",
+                description = "Compares two files inside the NAYRO workspace and highlights line/content differences.",
+                category = ToolCategory.WORKSPACE_FILES,
+                parametersSchema = mapOf("firstFile" to "String - First workspace filename", "secondFile" to "String - Second workspace filename"),
+                requiredParams = setOf("firstFile", "secondFile"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.EXECUTE_CROSS_APP_WORKFLOW,
+                toolId = "skills.execute_cross_app_workflow",
+                displayName = "Execute Cross-App Multi-Step Workflow",
+                description = "Executes a structured multi-step workflow across tools and apps with shared context transfer.",
+                category = ToolCategory.SKILLS_SUBAGENTS,
+                parametersSchema = mapOf("workflowId" to "String - Workflow template ID", "recipient" to "String - Optional recipient"),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SEARCH_NOTES,
+                toolId = "util.search_notes",
+                displayName = "Search Personal Notes",
+                description = "Searches saved notes and reminders in the local Room database matching a query.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("query" to "String - Search keyword"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.DELETE_NOTE,
+                toolId = "util.delete_note",
+                displayName = "Delete Personal Note",
+                description = "Deletes a saved note by ID or matching title after user confirmation.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("noteId" to "Long - Note ID", "title" to "String - Optional note title to match"),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.READ_CALENDAR_EVENTS,
+                toolId = "util.read_calendar_events",
+                displayName = "Read Upcoming Calendar Events",
+                description = "Queries upcoming events from the Android Calendar provider when READ_CALENDAR permission is granted.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("limit" to "Int - Max events to return"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredPermission = Manifest.permission.READ_CALENDAR
+            )
+        )
     }
 
     /**
@@ -655,6 +808,13 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 val y = action.parameters["y"]?.toFloatOrNull()
                 if (x == null || y == null) {
                     return false to "Numeric coordinates 'x' and 'y' are required for INTERACT_COORDINATES."
+                }
+            }
+            ActionType.SEND_SMS -> {
+                val recipient = action.target ?: action.parameters["recipient"]
+                val message = action.parameters["message"] ?: action.parameters["draft"]
+                if (recipient.isNullOrBlank() || message.isNullOrBlank()) {
+                    return false to "Both 'recipient' and 'message' are required for SEND_SMS."
                 }
             }
             ActionType.FETCH_WEB_PAGE -> {

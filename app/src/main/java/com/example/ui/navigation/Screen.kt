@@ -30,6 +30,7 @@ sealed class Screen(val route: String, val title: String, val icon: ImageVector?
     object Activity : Screen("activity", "Activity", Icons.Default.History)
     object Memory : Screen("memory", "Memory", Icons.Default.Psychology)
     object Settings : Screen("settings", "Settings", Icons.Default.Settings)
+    object AgentDashboard : Screen("agent_dashboard", "Control Center", Icons.Default.Layers)
     object Onboarding : Screen("onboarding", "Onboarding")
 
     companion object {
