@@ -82,23 +82,32 @@ object TaskClassifier {
             }
         }
 
-        // 5. Message Draft Intent (e.g. WhatsApp kholo aur Rahul ke liye message likho: ...)
-        if ((lower.contains("message") || lower.contains("sandesh")) && (lower.contains("likho") || lower.contains("write") || lower.contains("draft"))) {
+        // 5. Message Draft Intent (e.g. "WhatsApp par Rahul ko message bhejo: Main 10 minute mein aa raha hoon")
+        if ((lower.contains("message") || lower.contains("sandesh") || lower.contains("msg")) &&
+            (lower.contains("likho") || lower.contains("write") || lower.contains("draft") || lower.contains("bhejo") || lower.contains("send"))
+        ) {
             var recipient = "Contact"
             var messageContent = ""
 
-            // Extract recipient if specified ("ke liye", "to", "ko")
-            val recipientMatch = Regex("(?i)(?:aur|for|to)?\\s*([a-zA-Z0-9]+)\\s*(?:ke liye|ko)\\s*message").find(trimmed)
+            // Extract recipient if specified ("Rahul ko", "to Rahul", "Rahul ke liye")
+            val recipientMatch = Regex("(?i)(?:aur|for|to)?\\s*([a-zA-Z0-9_]+)\\s*(?:ke liye|ko)\\s*(?:message|msg|sandesh)").find(trimmed)
+                ?: Regex("(?i)(?:message|msg|sandesh)\\s*(?:to|bhejo|send)\\s*([a-zA-Z0-9_]+)").find(trimmed)
             if (recipientMatch != null) {
-                recipient = recipientMatch.groupValues[1]
+                val groupVal = if (recipientMatch.groupValues.size > 1) recipientMatch.groupValues[1] else ""
+                if (groupVal.isNotBlank() && !groupVal.equals("message", ignoreCase = true) && !groupVal.equals("msg", ignoreCase = true)) {
+                    recipient = groupVal
+                }
             }
 
-            // Extract message body if colon is used or after "message likho:"
+            // Extract message body if colon is used or after "message:" / "bhejo:"
             val splitByColon = trimmed.split(":", limit = 2)
             if (splitByColon.size > 1) {
                 messageContent = splitByColon[1].trim()
             } else {
-                messageContent = trimmed.substringAfter("message").replace(Regex("^(?i)\\s*(likho|draft|send|bhejo)\\s*"), "").trim()
+                messageContent = trimmed
+                    .replaceFirst(Regex("(?i)^.*?\\b(message|msg|sandesh)\\b\\s*"), "")
+                    .replaceFirst(Regex("(?i)^\\s*(likho|draft|send|bhejo)\\s*"), "")
+                    .trim()
             }
 
             return ResolvedIntent(
