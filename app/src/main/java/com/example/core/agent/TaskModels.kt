@@ -16,6 +16,10 @@ enum class TaskState {
     PAUSED,
     RETRYING,
     COMPLETED,
+    PARTIALLY_COMPLETED,
+    INCONCLUSIVE,
+    NOT_SUPPORTED,
+    TIMED_OUT,
     FAILED,
     CANCELLED
 }
@@ -100,7 +104,12 @@ enum class VerificationStatus {
     VERIFIED,
     FAILED,
     INCONCLUSIVE,
-    NOT_SUPPORTED
+    NOT_SUPPORTED,
+    REQUIRES_PERMISSION,
+    REQUIRES_CONFIRMATION,
+    CANCELLED,
+    TIMED_OUT,
+    PARTIALLY_COMPLETED
 }
 
 data class VerificationEvidence(

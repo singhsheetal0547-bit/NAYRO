@@ -475,10 +475,9 @@ class NayroFloatingService : Service() {
                 }
             }
 
-            // Also deliver intent to MainActivity if launcher activity is active
+            // Bring MainActivity to foreground to display the updated conversation without re-executing the prompt
             val mainIntent = Intent(this@NayroFloatingService, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                putExtra(EXTRA_FLOATING_PROMPT, userText)
             }
             try {
                 startActivity(mainIntent)

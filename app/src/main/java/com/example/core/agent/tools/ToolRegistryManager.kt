@@ -1,6 +1,8 @@
 package com.example.core.agent.tools
 
+import android.Manifest
 import com.example.core.agent.ActionType
+import com.example.core.agent.AgentAction
 import com.example.core.agent.RiskLevel
 import com.example.core.capability.CapabilityId
 
@@ -22,6 +24,7 @@ data class DynamicToolDefinition(
     val description: String,
     val category: ToolCategory,
     val parametersSchema: Map<String, String>,
+    val requiredParams: Set<String> = emptySet(),
     val riskLevel: RiskLevel,
     val requiredCapability: CapabilityId? = null,
     val requiredPermission: String? = null
@@ -35,8 +38,13 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
         registerBuiltInTools()
     }
 
+    fun resetToDefaults() {
+        catalog.clear()
+        registerBuiltInTools()
+    }
+
     private fun registerBuiltInTools() {
-        // Device & System Tools
+        // 1. Device & System Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.LAUNCH_APP,
@@ -45,6 +53,17 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 description = "Launches an installed Android application by package or display name.",
                 category = ToolCategory.DEVICE_SYSTEM,
                 parametersSchema = mapOf("appName" to "String - Display or package name of the app"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.OPEN_SETTINGS_SECTION,
+                toolId = "android.open_settings_section",
+                displayName = "Open Android Settings Section",
+                description = "Navigates directly to an Android Settings page (wifi, bluetooth, display, sound, battery, accessibility).",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = mapOf("section" to "String - Settings section name"),
                 riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
@@ -81,14 +100,59 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.GET_STORAGE_INFO,
+                toolId = "android.get_storage_info",
+                displayName = "Get Storage Info",
+                description = "Returns internal storage total, available, and free space.",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.GET_DEVICE_TIME,
+                toolId = "android.get_device_time",
+                displayName = "Get Local Device Time",
+                description = "Returns current system date and time on device.",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SEARCH_INSTALLED_APPS,
+                toolId = "android.search_installed_apps",
+                displayName = "Search Installed Apps",
+                description = "Searches installed launchable applications matching a query string.",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = mapOf("query" to "String - Search filter for app label or package"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
 
-        // Screen & Interaction Tools
+        // 2. Screen & Interaction Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.READ_SCREEN,
                 toolId = "screen.read_screen",
                 displayName = "Read Screen Text",
                 description = "Extracts all visible text and accessibility nodes from the current foreground app.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.INSPECT_ACCESSIBILITY_TREE,
+                toolId = "screen.inspect_accessibility_tree",
+                displayName = "Inspect Accessibility Node Tree",
+                description = "Returns structured hierarchy of interactive and visible nodes on the active screen.",
                 category = ToolCategory.SCREEN_CONTROL,
                 parametersSchema = emptyMap(),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY,
@@ -109,6 +173,18 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
         )
         register(
             DynamicToolDefinition(
+                actionType = ActionType.LONG_PRESS_ELEMENT,
+                toolId = "screen.long_press_element",
+                displayName = "Long Press UI Element",
+                description = "Performs an accessibility long-click on a UI node matching target text or view ID.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = mapOf("target" to "String - Text label or ID of UI element"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
                 actionType = ActionType.SET_TEXT,
                 toolId = "screen.set_text",
                 displayName = "Enter Text in Field",
@@ -119,18 +195,78 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 requiredCapability = CapabilityId.ACCESSIBILITY
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SCROLL_FORWARD,
+                toolId = "screen.scroll_forward",
+                displayName = "Scroll Forward",
+                description = "Scrolls the active scrollable container forward.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SCROLL_BACKWARD,
+                toolId = "screen.scroll_backward",
+                displayName = "Scroll Backward",
+                description = "Scrolls the active scrollable container backward.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.NAVIGATE_BACK,
+                toolId = "screen.navigate_back",
+                displayName = "Navigate Back",
+                description = "Performs global Android Back navigation via AccessibilityService.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.TAKE_SCREENSHOT,
+                toolId = "screen.take_screenshot",
+                displayName = "Take Screen Capture",
+                description = "Captures a verified screenshot via AccessibilityService on Android 11+ (API 30+).",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.INTERACT_COORDINATES,
+                toolId = "screen.interact_coordinates",
+                displayName = "Tap Screen Coordinates",
+                description = "Dispatches a verified tap gesture at screen coordinates (x, y) via AccessibilityService.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = mapOf("x" to "Float - X pixel coordinate", "y" to "Float - Y pixel coordinate"),
+                requiredParams = setOf("x", "y"),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
 
-        // Communication Tools
+        // 3. Communication Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.MESSAGE_DRAFT_SEND,
                 toolId = "comm.send_whatsapp_message",
                 displayName = "Send WhatsApp Message",
-                description = "Navigates to WhatsApp contact, prepares draft, requires user confirmation, and sends.",
+                description = "Resolves contact, opens WhatsApp chat, requires user confirmation, and verifies send state.",
                 category = ToolCategory.COMMUNICATION,
-                parametersSchema = mapOf("recipient" to "String - Target contact name", "message" to "String - Message text"),
-                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
-                requiredCapability = CapabilityId.ACCESSIBILITY
+                parametersSchema = mapOf("recipient" to "String - Target contact name or phone", "message" to "String - Message text"),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
             )
         )
         register(
@@ -138,14 +274,49 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 actionType = ActionType.CHECK_INCOMING_CALL,
                 toolId = "comm.check_incoming_call",
                 displayName = "Check Incoming Call Info",
-                description = "Queries active phone call state and resolves caller contact display name.",
+                description = "Queries active phone call state and resolves caller contact display name when permitted.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredPermission = Manifest.permission.READ_PHONE_STATE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.RESOLVE_CONTACT,
+                toolId = "comm.resolve_contact",
+                displayName = "Resolve Contact",
+                description = "Queries Android ContactsContract to resolve a contact name to a verified phone number.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("query" to "String - Contact display name"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredPermission = Manifest.permission.READ_CONTACTS
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.MAKE_PHONE_CALL,
+                toolId = "comm.make_phone_call",
+                displayName = "Open Phone Dialer",
+                description = "Opens the Android dialer with a resolved contact number or phone number for user confirmation.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("target" to "String - Phone number or contact name"),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.READ_NOTIFICATIONS,
+                toolId = "comm.read_notifications",
+                displayName = "Read Active Notifications",
+                description = "Reads active status bar notifications when Notification Listener access is granted.",
                 category = ToolCategory.COMMUNICATION,
                 parametersSchema = emptyMap(),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
 
-        // Workspace & File Tools
+        // 4. Workspace & File Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.FILE_BROWSE,
@@ -164,7 +335,7 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 displayName = "Read File Content",
                 description = "Reads text content from a file in the persistent workspace.",
                 category = ToolCategory.WORKSPACE_FILES,
-                parametersSchema = mapOf("filename" to "String - Target file name"),
+                parametersSchema = mapOf("filename" to "String - Relative file name in workspace"),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
@@ -173,20 +344,54 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 actionType = ActionType.FILE_WRITE_TEXT,
                 toolId = "workspace.file_write_text",
                 displayName = "Create or Edit File",
-                description = "Writes text content to a specified workspace file.",
+                description = "Writes text content to a specified workspace file with path containment checks.",
                 category = ToolCategory.WORKSPACE_FILES,
-                parametersSchema = mapOf("filename" to "String - Target file name", "content" to "String - File content"),
+                parametersSchema = mapOf("filename" to "String - Relative file name", "content" to "String - File content"),
+                requiredParams = setOf("content"),
                 riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.FILE_SEARCH,
+                toolId = "workspace.file_search",
+                displayName = "Search Workspace Files",
+                description = "Searches filenames and text contents within the NAYRO workspace.",
+                category = ToolCategory.WORKSPACE_FILES,
+                parametersSchema = mapOf("query" to "String - Search term"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.PDF_EXTRACT_TEXT,
+                toolId = "workspace.pdf_extract_text",
+                displayName = "Extract Document Text",
+                description = "Extracts readable text streams from a document in the workspace.",
+                category = ToolCategory.WORKSPACE_FILES,
+                parametersSchema = mapOf("filename" to "String - Document file name in workspace"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.DOC_SUMMARIZE,
+                toolId = "workspace.doc_summarize",
+                displayName = "Summarize Workspace Document",
+                description = "Reads a workspace file and generates an executive summary.",
+                category = ToolCategory.WORKSPACE_FILES,
+                parametersSchema = mapOf("filename" to "String - Target workspace file name"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
 
-        // Research & Browser Agent Tools
+        // 5. Research & Browser Agent Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.WEB_SEARCH,
                 toolId = "research.web_search",
                 displayName = "Web Research Search",
-                description = "Queries search sources to gather web articles, summaries, and citations.",
+                description = "Performs a real HTTPS search query with SSRF protection and extracts results.",
                 category = ToolCategory.WEB_RESEARCH,
                 parametersSchema = mapOf("query" to "String - Search query string"),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
@@ -197,22 +402,33 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 actionType = ActionType.FETCH_WEB_PAGE,
                 toolId = "research.fetch_web_page",
                 displayName = "Fetch Web Page Content",
-                description = "Downloads and extracts main article text from a target web URL.",
+                description = "Downloads and extracts text from an HTTPS web URL with SSRF protection.",
                 category = ToolCategory.WEB_RESEARCH,
-                parametersSchema = mapOf("url" to "String - Target website URL"),
+                parametersSchema = mapOf("url" to "String - Target HTTPS website URL"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SUMMARIZE_WEB_CONTENT,
+                toolId = "research.summarize_web_content",
+                displayName = "Summarize Web Content",
+                description = "Synthesizes fetched web content or URL into a concise summary.",
+                category = ToolCategory.WEB_RESEARCH,
+                parametersSchema = mapOf("content" to "String - Web text or URL to summarize"),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
 
-        // Coding Agent Tools
+        // 6. Coding Agent Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.CODE_INSPECT_FILE,
                 toolId = "coding.inspect_code",
                 displayName = "Inspect Code File",
-                description = "Analyzes source code structure, imports, and syntax in a workspace file.",
+                description = "Analyzes source code structure, imports, and brace balance in a workspace file.",
                 category = ToolCategory.CODING_AGENT,
-                parametersSchema = mapOf("path" to "String - Code file path"),
+                parametersSchema = mapOf("path" to "String - Relative workspace code file path"),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
@@ -221,20 +437,43 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 actionType = ActionType.CODE_EDIT_FILE,
                 toolId = "coding.edit_code",
                 displayName = "Edit Source Code",
-                description = "Applies code modifications, patches, or updates to a code file.",
+                description = "Applies code modifications or patches to a workspace code file and verifies changes.",
                 category = ToolCategory.CODING_AGENT,
-                parametersSchema = mapOf("path" to "String - Code file path", "patch" to "String - Modified code block"),
+                parametersSchema = mapOf("path" to "String - Relative code file path", "patch" to "String - Updated code content"),
+                requiredParams = setOf("patch"),
                 riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CODE_DIAGNOSE_ERROR,
+                toolId = "coding.diagnose_error",
+                displayName = "Diagnose Code Errors",
+                description = "Inspects a workspace source file for structural syntax errors, unbalanced braces, and issues.",
+                category = ToolCategory.CODING_AGENT,
+                parametersSchema = mapOf("path" to "String - Relative code file path", "error" to "String - Optional compiler error text"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CODE_GENERATE_DOCS,
+                toolId = "coding.generate_docs",
+                displayName = "Generate Code Documentation",
+                description = "Generates Markdown documentation from declarations in a workspace source file.",
+                category = ToolCategory.CODING_AGENT,
+                parametersSchema = mapOf("path" to "String - Relative code file path"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
 
-        // Skills & Sub-Agents Tools
+        // 7. Skills & Sub-Agents Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.EXECUTE_PROCEDURAL_SKILL,
                 toolId = "skills.execute_skill",
                 displayName = "Execute Procedural Skill",
-                description = "Invokes a pre-configured procedural skill pipeline (e.g. Research Skill, WhatsApp Skill).",
+                description = "Invokes a registered procedural skill pipeline by skill ID.",
                 category = ToolCategory.SKILLS_SUBAGENTS,
                 parametersSchema = mapOf("skillId" to "String - Target skill ID", "input" to "String - Skill parameters"),
                 riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
@@ -242,17 +481,62 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
         )
         register(
             DynamicToolDefinition(
-                actionType = ActionType.DELEGATE_SUBAGENT_TASK,
-                toolId = "subagent.delegate_task",
-                displayName = "Delegate Task to Sub-Agent",
-                description = "Spawns a specialist sub-agent (Research, Coding, Browser, Android) for multi-agent delegation.",
+                actionType = ActionType.REGISTER_CUSTOM_SKILL,
+                toolId = "skills.register_custom_skill",
+                displayName = "Register Custom Skill",
+                description = "Registers a new custom procedural skill definition into SkillManager.",
                 category = ToolCategory.SKILLS_SUBAGENTS,
-                parametersSchema = mapOf("agentType" to "String - Specialist type", "subGoal" to "String - Sub-task instruction"),
+                parametersSchema = mapOf("skillId" to "String - Unique skill ID", "name" to "String - Skill name", "description" to "String - Skill description"),
                 riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.LIST_SKILLS,
+                toolId = "skills.list_skills",
+                displayName = "List Active Skills",
+                description = "Lists all registered and enabled procedural skills.",
+                category = ToolCategory.SKILLS_SUBAGENTS,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.DELEGATE_SUBAGENT_TASK,
+                toolId = "subagent.delegate_task",
+                displayName = "Delegate Task to Sub-Agent",
+                description = "Spawns a bounded specialist sub-agent (Research, Coding, Browser, Android) and executes its sub-goal.",
+                category = ToolCategory.SKILLS_SUBAGENTS,
+                parametersSchema = mapOf("agentType" to "String - Specialist type", "subGoal" to "String - Sub-task instruction"),
+                requiredParams = setOf("subGoal"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CHECK_SUBAGENT_STATUS,
+                toolId = "subagent.check_status",
+                displayName = "Check Sub-Agent Status",
+                description = "Returns the current status and results of all delegated sub-agent tasks.",
+                category = ToolCategory.SKILLS_SUBAGENTS,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.AGGREGATE_SUBAGENT_RESULTS,
+                toolId = "subagent.aggregate_results",
+                displayName = "Aggregate Sub-Agent Results",
+                description = "Aggregates verified outputs from completed sub-agent tasks.",
+                category = ToolCategory.SKILLS_SUBAGENTS,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
 
-        // Productivity Tools
+        // 8. Productivity Tools
         register(
             DynamicToolDefinition(
                 actionType = ActionType.CALCULATE_LOCAL,
@@ -286,6 +570,109 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CREATE_REMINDER,
+                toolId = "util.create_reminder",
+                displayName = "Create Reminder",
+                description = "Persists a reminder item to local storage and schedules a notification.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("title" to "String - Reminder title", "timeMs" to "Long - Optional trigger timestamp"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SCHEDULE_ALARM,
+                toolId = "util.schedule_alarm",
+                displayName = "Schedule Alarm",
+                description = "Sets an Android system alarm via AlarmClock intent or AlarmManager.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("hour" to "Int - Hour (0-23)", "minutes" to "Int - Minutes (0-59)", "message" to "String - Alarm label"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CREATE_CALENDAR_EVENT,
+                toolId = "util.create_calendar_event",
+                displayName = "Create Calendar Event",
+                description = "Inserts a calendar event via CalendarContract (if permitted) or launches Calendar intent.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("title" to "String - Event title", "startTimeMs" to "Long - Start time in millis", "endTimeMs" to "Long - End time in millis"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                requiredPermission = Manifest.permission.WRITE_CALENDAR
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.ASK_USER_CONFIRMATION,
+                toolId = "util.ask_user_confirmation",
+                displayName = "Ask User Confirmation",
+                description = "Pauses task execution and prompts the user to confirm a high-risk operation.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("recipient" to "String - Target entity", "draft" to "String - Proposed content"),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.QUERY_LLM,
+                toolId = "ai.query_llm",
+                displayName = "Query AI Reasoning Provider",
+                description = "Routes a natural language prompt to the active AI provider.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("prompt" to "String - User prompt"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+    }
+
+    /**
+     * Validates an [AgentAction] against its registered tool schema before execution.
+     */
+    fun validateParameters(action: AgentAction): Pair<Boolean, String> {
+        val definition = catalog[action.actionType]
+            ?: return false to "Tool '${action.actionType.name}' is not registered in ToolRegistryManager."
+
+        for (reqKey in definition.requiredParams) {
+            val value = action.parameters[reqKey]
+            if (value.isNullOrBlank()) {
+                return false to "Missing required parameter '$reqKey' for tool '${definition.toolId}' (${action.actionType.name})."
+            }
+        }
+
+        // Additional action-specific parameter checks
+        when (action.actionType) {
+            ActionType.LAUNCH_APP -> {
+                val app = action.target ?: action.parameters["appName"]
+                if (app.isNullOrBlank()) {
+                    return false to "Missing target app name for LAUNCH_APP."
+                }
+            }
+            ActionType.INTERACT_COORDINATES -> {
+                val x = action.parameters["x"]?.toFloatOrNull()
+                val y = action.parameters["y"]?.toFloatOrNull()
+                if (x == null || y == null) {
+                    return false to "Numeric coordinates 'x' and 'y' are required for INTERACT_COORDINATES."
+                }
+            }
+            ActionType.FETCH_WEB_PAGE -> {
+                val url = action.target ?: action.parameters["url"]
+                if (url.isNullOrBlank()) {
+                    return false to "Missing 'url' parameter for FETCH_WEB_PAGE."
+                }
+            }
+            ActionType.WEB_SEARCH -> {
+                val query = action.target ?: action.parameters["query"]
+                if (query.isNullOrBlank()) {
+                    return false to "Missing 'query' parameter for WEB_SEARCH."
+                }
+            }
+            else -> {}
+        }
+
+        return true to "Valid"
     }
 
     fun register(definition: DynamicToolDefinition) = registerTool(definition)

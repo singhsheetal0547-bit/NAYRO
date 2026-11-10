@@ -133,7 +133,7 @@ class NayroForegroundService : Service() {
                 val config = app.voiceManager.configuration.value.copy(isWakeWordEnabled = true)
                 app.voiceManager.updateConfiguration(config)
 
-                app.voiceManager.onSpeechRecognized = { text ->
+                app.voiceManager.attachServiceListener { text ->
                     if (text.isNotBlank()) {
                         serviceScope.launch {
                             app.repository.addConversationMessage(
@@ -158,6 +158,7 @@ class NayroForegroundService : Service() {
     private fun stopWakeWordEngine() {
         try {
             val app = NayroApplication.instance
+            app.voiceManager.detachServiceListener()
             val config = app.voiceManager.configuration.value.copy(isWakeWordEnabled = false)
             app.voiceManager.updateConfiguration(config)
         } catch (e: Exception) {}

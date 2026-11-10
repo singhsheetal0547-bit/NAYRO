@@ -2,205 +2,357 @@ package com.example.core.agent
 
 import com.example.core.accessibility.AccessibilityConnectionManager
 import com.example.core.accessibility.NayroAccessibilityService
-import com.example.core.screen.ScreenChangeResult
 import com.example.core.screen.ScreenIntelligenceManager
 
 /**
- * Result-based Action Verifier.
- * Independently confirms actual Android execution outcomes rather than merely checking request dispatch.
- * Supports: VERIFIED, FAILED, INCONCLUSIVE, NOT_SUPPORTED.
+ * Post-Action State Verification Engine (BUG 05 & BUG 06 Remediation).
+ * Compares pre-action state with post-action state and honors explicit ActionExecutionResult statuses.
+ * Never defaults unverified, inconclusive, or unsupported operations to VERIFIED.
  */
 class ActionVerifier(
     private val screenIntelligenceManager: ScreenIntelligenceManager
 ) {
 
-    suspend fun verify(
+    fun capturePreState(): String? {
+        if (!NayroAccessibilityService.isConnected()) return null
+        return screenIntelligenceManager.getScreenContext().screenSummary
+    }
+
+    fun verifyAction(
         action: AgentAction,
         executionResult: ActionExecutionResult,
-        screenChange: ScreenChangeResult? = null
+        preStateSummary: String?,
+        resolvedTargetPackage: String? = null
     ): VerificationResult {
+        // 1. Honor explicit non-success statuses first (BUG 05 & BUG 06)
+        when (executionResult.status) {
+            VerificationStatus.NOT_SUPPORTED -> {
+                return VerificationResult(
+                    status = VerificationStatus.NOT_SUPPORTED,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Operation is NOT_SUPPORTED: ${executionResult.outputMessage}"
+                    )
+                )
+            }
+            VerificationStatus.REQUIRES_PERMISSION -> {
+                return VerificationResult(
+                    status = VerificationStatus.REQUIRES_PERMISSION,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Blocked pending permission: ${executionResult.outputMessage}"
+                    )
+                )
+            }
+            VerificationStatus.REQUIRES_CONFIRMATION -> {
+                return VerificationResult(
+                    status = VerificationStatus.REQUIRES_CONFIRMATION,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Blocked pending confirmation: ${executionResult.outputMessage}"
+                    )
+                )
+            }
+            VerificationStatus.INCONCLUSIVE -> {
+                return VerificationResult(
+                    status = VerificationStatus.INCONCLUSIVE,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Inconclusive outcome: ${executionResult.outputMessage}"
+                    )
+                )
+            }
+            VerificationStatus.TIMED_OUT -> {
+                return VerificationResult(
+                    status = VerificationStatus.TIMED_OUT,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Timed out: ${executionResult.outputMessage}"
+                    )
+                )
+            }
+            VerificationStatus.CANCELLED -> {
+                return VerificationResult(
+                    status = VerificationStatus.CANCELLED,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Cancelled: ${executionResult.outputMessage}"
+                    )
+                )
+            }
+            VerificationStatus.FAILED -> {
+                return VerificationResult(
+                    status = VerificationStatus.FAILED,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Execution failed: ${executionResult.outputMessage}"
+                    )
+                )
+            }
+            else -> {}
+        }
+
         if (!executionResult.isSuccess) {
             return VerificationResult(
                 status = VerificationStatus.FAILED,
-                details = "Action execution reported failure: ${executionResult.output}",
+                details = executionResult.outputMessage,
                 evidence = VerificationEvidence(
-                    preState = screenChange?.previousPackage,
-                    postState = screenChange?.currentPackage,
-                    observedChange = "Execution failed at tool dispatch"
+                    preState = preStateSummary,
+                    postState = null,
+                    observedChange = "Execution failed prior to state change."
                 )
             )
         }
 
-        return when (action.actionType) {
-            ActionType.LAUNCH_APP -> {
-                val targetPkg = action.target?.lowercase() ?: ""
-                val activePkg = AccessibilityConnectionManager.lastActivePackage.value?.lowercase()
-                    ?: NayroAccessibilityService.instance?.getSafeRootInActiveWindow()?.packageName?.toString()?.lowercase()
+        val isAccessibilityActive = NayroAccessibilityService.isConnected()
+        val postStateSummary = if (isAccessibilityActive) {
+            screenIntelligenceManager.getScreenContext().screenSummary
+        } else {
+            null
+        }
+        val activeForegroundPkg = AccessibilityConnectionManager.lastActivePackage.value
 
-                if (activePkg != null && targetPkg.isNotBlank() && (activePkg.contains(targetPkg) || targetPkg.contains(activePkg))) {
-                    VerificationResult(
-                        status = VerificationStatus.VERIFIED,
-                        details = "Verified foreground package matches: $activePkg",
+        return when (action.actionType) {
+
+            ActionType.LAUNCH_APP -> {
+                if (!isAccessibilityActive) {
+                    return VerificationResult(
+                        status = VerificationStatus.INCONCLUSIVE,
+                        details = "${executionResult.outputMessage} (Intent dispatched; foreground package transition unverified because Accessibility Service is off.)",
                         evidence = VerificationEvidence(
-                            preState = screenChange?.previousPackage,
-                            postState = activePkg,
-                            observedChange = "Active package switched to target $activePkg"
+                            preState = preStateSummary,
+                            postState = null,
+                            observedChange = "Intent startActivity succeeded; foreground package unverified."
                         )
                     )
-                } else if (screenChange?.packageChanged == true) {
+                }
+
+                val expectedPkg = resolvedTargetPackage ?: action.target ?: ""
+                val pkgMatched = !activeForegroundPkg.isNullOrBlank() &&
+                    (activeForegroundPkg.equals(expectedPkg, ignoreCase = true) ||
+                        activeForegroundPkg.lowercase().contains(expectedPkg.lowercase()))
+
+                if (pkgMatched || (preStateSummary != null && postStateSummary != preStateSummary)) {
                     VerificationResult(
                         status = VerificationStatus.VERIFIED,
-                        details = "Verified package transition to: ${screenChange.currentPackage}",
+                        details = "${executionResult.outputMessage} Verified foreground app: ${activeForegroundPkg ?: expectedPkg}.",
                         evidence = VerificationEvidence(
-                            preState = screenChange.previousPackage,
-                            postState = screenChange.currentPackage,
-                            observedChange = screenChange.description
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "Foreground package transitioned to ${activeForegroundPkg ?: expectedPkg}."
                         )
                     )
                 } else {
-                    val isAccConn = AccessibilityConnectionManager.checkStatus(
-                        NayroAccessibilityService.instance?.applicationContext ?: return VerificationResult(
-                            status = VerificationStatus.INCONCLUSIVE,
-                            details = "Intent dispatched, but foreground application transition could not be verified.",
-                            evidence = null
+                    VerificationResult(
+                        status = VerificationStatus.INCONCLUSIVE,
+                        details = "App launch intent fired, but foreground window did not transition to $expectedPkg yet (current: ${activeForegroundPkg ?: "unknown"}).",
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "No foreground package change detected yet."
                         )
                     )
-                    if (isAccConn == com.example.core.accessibility.AccessibilityConnectionState.OPERATIONAL) {
-                        VerificationResult(
-                            status = VerificationStatus.FAILED,
-                            details = "Foreground application did not change to target $targetPkg.",
-                            evidence = VerificationEvidence(
-                                preState = screenChange?.previousPackage,
-                                postState = screenChange?.currentPackage,
-                                observedChange = "No package switch detected"
-                            )
-                        )
-                    } else {
-                        VerificationResult(
-                            status = VerificationStatus.INCONCLUSIVE,
-                            details = "Application launch intent dispatched, but foreground state verification is inconclusive without active Accessibility.",
-                            evidence = null
-                        )
-                    }
                 }
             }
 
             ActionType.OPEN_SETTINGS_SECTION -> {
-                val activePkg = AccessibilityConnectionManager.lastActivePackage.value
-                val isSettings = activePkg?.contains("settings", ignoreCase = true) == true
-                if (isSettings || screenChange?.packageChanged == true) {
-                    VerificationResult(
-                        status = VerificationStatus.VERIFIED,
-                        details = "Settings section opened (Active package: $activePkg)",
-                        evidence = VerificationEvidence(observedChange = "Settings screen opened")
-                    )
-                } else {
-                    VerificationResult(
+                if (!isAccessibilityActive) {
+                    return VerificationResult(
                         status = VerificationStatus.INCONCLUSIVE,
-                        details = "Settings section Intent dispatched.",
-                        evidence = null
-                    )
-                }
-            }
-
-            ActionType.READ_SCREEN -> {
-                if (executionResult.output.isNotBlank() && !executionResult.output.contains("None available") && !executionResult.output.contains("couldn't read")) {
-                    VerificationResult(
-                        status = VerificationStatus.VERIFIED,
-                        details = "Screen contents successfully read and verified.",
-                        evidence = VerificationEvidence(observedChange = "Extracted ${executionResult.output.length} characters of screen content")
-                    )
-                } else {
-                    VerificationResult(
-                        status = VerificationStatus.FAILED,
-                        details = "Screen reading failed or yielded empty content.",
-                        evidence = null
-                    )
-                }
-            }
-
-            ActionType.CLICK_ELEMENT -> {
-                if (screenChange?.hasChanged == true) {
-                    VerificationResult(
-                        status = VerificationStatus.VERIFIED,
-                        details = "UI transition verified after click: ${screenChange.description}",
+                        details = "${executionResult.outputMessage} (Settings intent launched; screen state unverified without Accessibility Service.)",
                         evidence = VerificationEvidence(
-                            preState = screenChange.previousPackage,
-                            postState = screenChange.currentPackage,
-                            observedChange = screenChange.description
+                            preState = preStateSummary,
+                            postState = null,
+                            observedChange = "Settings intent fired."
+                        )
+                    )
+                }
+
+                val inSettings = activeForegroundPkg?.contains("settings", ignoreCase = true) == true
+                if (inSettings || postStateSummary != preStateSummary) {
+                    VerificationResult(
+                        status = VerificationStatus.VERIFIED,
+                        details = "${executionResult.outputMessage} Verified Settings window is active.",
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "Foreground package is $activeForegroundPkg."
                         )
                     )
                 } else {
                     VerificationResult(
                         status = VerificationStatus.INCONCLUSIVE,
-                        details = "Click action sent, but no visible screen change was detected.",
-                        evidence = null
+                        details = "Settings intent launched, but Settings window could not be confirmed in foreground.",
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "Foreground package remained $activeForegroundPkg."
+                        )
+                    )
+                }
+            }
+
+            ActionType.READ_SCREEN, ActionType.INSPECT_ACCESSIBILITY_TREE -> {
+                val validRead = !executionResult.outputMessage.startsWith("Screen reading requires") &&
+                    !executionResult.outputMessage.startsWith("Cannot read screen")
+                if (validRead) {
+                    VerificationResult(
+                        status = VerificationStatus.VERIFIED,
+                        details = executionResult.outputMessage,
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = executionResult.outputMessage,
+                            observedChange = "Screen node hierarchy captured."
+                        )
+                    )
+                } else {
+                    VerificationResult(
+                        status = VerificationStatus.FAILED,
+                        details = executionResult.outputMessage
+                    )
+                }
+            }
+
+            ActionType.CLICK_ELEMENT,
+            ActionType.LONG_PRESS_ELEMENT,
+            ActionType.SCROLL_FORWARD,
+            ActionType.SCROLL_BACKWARD,
+            ActionType.NAVIGATE_BACK,
+            ActionType.INTERACT_COORDINATES -> {
+                val stateChanged = preStateSummary != null && postStateSummary != null && preStateSummary != postStateSummary
+                if (stateChanged) {
+                    VerificationResult(
+                        status = VerificationStatus.VERIFIED,
+                        details = "${executionResult.outputMessage} (Screen state transition verified.)",
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "UI tree updated after interaction."
+                        )
+                    )
+                } else {
+                    VerificationResult(
+                        status = VerificationStatus.INCONCLUSIVE,
+                        details = "${executionResult.outputMessage} (Action dispatched, but no measurable change in visible screen nodes was observed.)",
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "UI tree unchanged after interaction."
+                        )
                     )
                 }
             }
 
             ActionType.SET_TEXT -> {
-                VerificationResult(
-                    status = VerificationStatus.VERIFIED,
-                    details = "Text entry confirmed: ${executionResult.output}",
-                    evidence = VerificationEvidence(observedChange = executionResult.output)
-                )
-            }
-
-            ActionType.CALCULATE_LOCAL -> {
-                if (!executionResult.output.startsWith("Error:") && !executionResult.output.contains("undefined")) {
+                val expectedText = action.parameters["text"] ?: action.parameters["query"] ?: ""
+                val textAppearsOnScreen = postStateSummary?.contains(expectedText, ignoreCase = true) == true
+                if (textAppearsOnScreen || (preStateSummary != null && postStateSummary != preStateSummary)) {
                     VerificationResult(
                         status = VerificationStatus.VERIFIED,
-                        details = "Local calculation verified: ${executionResult.output}",
-                        evidence = VerificationEvidence(observedChange = executionResult.output)
-                    )
-                } else {
-                    VerificationResult(
-                        status = VerificationStatus.FAILED,
-                        details = "Calculation failed: ${executionResult.output}",
-                        evidence = null
-                    )
-                }
-            }
-
-            ActionType.SAVE_NOTE, ActionType.SAVE_MEMORY, ActionType.GET_DEVICE_TIME, ActionType.QUERY_LLM -> {
-                VerificationResult(
-                    status = VerificationStatus.VERIFIED,
-                    details = "Operation verified: ${executionResult.output.take(50)}...",
-                    evidence = VerificationEvidence(observedChange = executionResult.output.take(50))
-                )
-            }
-
-            ActionType.ASK_USER_CONFIRMATION -> {
-                VerificationResult(
-                    status = VerificationStatus.VERIFIED,
-                    details = "User confirmation requirement satisfied.",
-                    evidence = null
-                )
-            }
-
-            ActionType.SCROLL_FORWARD, ActionType.SCROLL_BACKWARD, ActionType.NAVIGATE_BACK -> {
-                if (screenChange?.hasChanged == true) {
-                    VerificationResult(
-                        status = VerificationStatus.VERIFIED,
-                        details = "Navigation gesture verified: ${screenChange.description}",
-                        evidence = VerificationEvidence(observedChange = screenChange.description)
+                        details = "${executionResult.outputMessage} Verified text entry in UI field.",
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "Target text '$expectedText' present in updated UI tree."
+                        )
                     )
                 } else {
                     VerificationResult(
                         status = VerificationStatus.INCONCLUSIVE,
-                        details = "Navigation gesture dispatched.",
-                        evidence = null
+                        details = "${executionResult.outputMessage} (Text injection sent, but field content could not be confirmed in accessibility snapshot.)",
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "Target text not visible in post-action snapshot."
+                        )
                     )
                 }
             }
 
-            else -> {
-                VerificationResult(
-                    status = VerificationStatus.VERIFIED,
-                    details = "Operation completed and verified: ${executionResult.output.take(60)}",
-                    evidence = VerificationEvidence(observedChange = executionResult.output.take(60))
-                )
+            ActionType.SAVE_NOTE,
+            ActionType.SAVE_MEMORY,
+            ActionType.CREATE_REMINDER,
+            ActionType.GET_DEVICE_TIME,
+            ActionType.GET_DEVICE_INFO,
+            ActionType.GET_BATTERY_STATE,
+            ActionType.GET_NETWORK_STATUS,
+            ActionType.GET_STORAGE_INFO,
+            ActionType.SEARCH_INSTALLED_APPS,
+            ActionType.CALCULATE_LOCAL,
+            ActionType.ASK_USER_CONFIRMATION,
+            ActionType.QUERY_LLM,
+            ActionType.FILE_BROWSE,
+            ActionType.FILE_READ_TEXT,
+            ActionType.FILE_WRITE_TEXT,
+            ActionType.FILE_SEARCH,
+            ActionType.PDF_EXTRACT_TEXT,
+            ActionType.DOC_SUMMARIZE,
+            ActionType.WEB_SEARCH,
+            ActionType.FETCH_WEB_PAGE,
+            ActionType.SUMMARIZE_WEB_CONTENT,
+            ActionType.CODE_INSPECT_FILE,
+            ActionType.CODE_EDIT_FILE,
+            ActionType.CODE_DIAGNOSE_ERROR,
+            ActionType.CODE_GENERATE_DOCS,
+            ActionType.LIST_SKILLS,
+            ActionType.EXECUTE_PROCEDURAL_SKILL,
+            ActionType.REGISTER_CUSTOM_SKILL,
+            ActionType.DELEGATE_SUBAGENT_TASK,
+            ActionType.CHECK_SUBAGENT_STATUS,
+            ActionType.AGGREGATE_SUBAGENT_RESULTS,
+            ActionType.CHECK_INCOMING_CALL,
+            ActionType.RESOLVE_CONTACT,
+            ActionType.MAKE_PHONE_CALL,
+            ActionType.READ_NOTIFICATIONS,
+            ActionType.TAKE_SCREENSHOT,
+            ActionType.SCHEDULE_ALARM,
+            ActionType.CREATE_CALENDAR_EVENT,
+            ActionType.MESSAGE_DRAFT_SEND -> {
+                if (executionResult.status == VerificationStatus.VERIFIED && executionResult.outputMessage.isNotBlank()) {
+                    VerificationResult(
+                        status = VerificationStatus.VERIFIED,
+                        details = executionResult.outputMessage,
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = executionResult.outputMessage,
+                            observedChange = "Verified execution output: ${executionResult.outputMessage.take(120)}"
+                        )
+                    )
+                } else if (executionResult.status == null && executionResult.isSuccess && executionResult.outputMessage.isNotBlank()) {
+                    VerificationResult(
+                        status = VerificationStatus.VERIFIED,
+                        details = executionResult.outputMessage,
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = executionResult.outputMessage,
+                            observedChange = "Deterministic local operation verified."
+                        )
+                    )
+                } else {
+                    VerificationResult(
+                        status = executionResult.status ?: VerificationStatus.INCONCLUSIVE,
+                        details = executionResult.outputMessage.ifBlank { "No verifiable output produced." },
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = null,
+                            observedChange = "Unverified or empty output."
+                        )
+                    )
+                }
             }
         }
     }

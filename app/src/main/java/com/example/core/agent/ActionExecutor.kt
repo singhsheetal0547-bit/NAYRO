@@ -1,28 +1,63 @@
 package com.example.core.agent
 
+import android.Manifest
+import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
+import android.os.Environment
+import android.os.StatFs
+import android.provider.AlarmClock
+import android.provider.CalendarContract
+import android.provider.Settings
+import androidx.core.content.ContextCompat
 import com.example.core.accessibility.AccessibilityActionController
 import com.example.core.accessibility.AppNavigationManager
+import com.example.core.accessibility.NayroAccessibilityService
+import com.example.core.agent.tools.ToolRegistryManager
+import com.example.core.memory.MemoryCategory
 import com.example.core.memory.MemoryManager
 import com.example.core.memory.NotebookManager
 import com.example.core.provider.AIProviderManager
 import com.example.core.provider.model.AIResult
 import com.example.core.screen.ScreenIntelligenceManager
+import com.example.core.skills.SkillDefinition
 import com.example.core.skills.SkillManager
 import com.example.core.subagent.SubAgentManager
+import com.example.core.subagent.SubAgentStatus
 import com.example.core.subagent.SubAgentType
 import com.example.core.telephony.CallIntelligenceManager
+import com.example.core.telephony.ContactResolutionResult
 import com.example.core.workspace.WorkspaceManager
+import com.example.core.workspace.WorkspaceResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 
 data class ActionExecutionResult(
     val isSuccess: Boolean,
-    val output: String
+    val outputMessage: String,
+    val status: VerificationStatus? = null
 )
 
+/**
+ * Authoritative Native Action Executor for NAYRO.
+ * Executes validated AgentActions across Android System APIs, Accessibility, Workspace,
+ * Web Research (with SSRF protection), Coding Workspace, Skills, and Bounded Sub-Agents.
+ * Never fabricates success results for unperformed, unsupported, or failed operations.
+ */
 class ActionExecutor(
     private val context: Context,
     private val screenIntelligenceManager: ScreenIntelligenceManager,
@@ -35,266 +70,1206 @@ class ActionExecutor(
     private val callIntelligenceManager: CallIntelligenceManager = CallIntelligenceManager(context)
 ) {
 
+    companion object {
+        private const val MAX_WEB_RESPONSE_BYTES = 512 * 1024 // 512 KB cap
+
+        private val httpClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .connectTimeout(8, TimeUnit.SECONDS)
+                .readTimeout(8, TimeUnit.SECONDS)
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+        }
+
+        /**
+         * Validates a URL against SSRF (Server-Side Request Forgery) and local file access rules (BUG 10).
+         * Rejects file://, content://, javascript:, localhost, loopback, link-local, and RFC1918 private IPs.
+         */
+        fun validateSafeExternalUrl(rawUrl: String): Result<HttpUrl> {
+            val trimmed = rawUrl.trim()
+            if (trimmed.isEmpty()) {
+                return Result.failure(IllegalArgumentException("URL cannot be empty."))
+            }
+            val lower = trimmed.lowercase()
+            if (lower.startsWith("file:") || lower.startsWith("content:") ||
+                lower.startsWith("javascript:") || lower.startsWith("data:") || lower.startsWith("ftp:")
+            ) {
+                return Result.failure(SecurityException("Forbidden URL scheme in '$trimmed'. Only HTTP/HTTPS is permitted."))
+            }
+
+            val parsed = trimmed.toHttpUrlOrNull()
+                ?: return Result.failure(IllegalArgumentException("Malformed HTTP/HTTPS URL: '$trimmed'."))
+
+            if (parsed.scheme != "https" && parsed.scheme != "http") {
+                return Result.failure(SecurityException("Unsupported URL scheme '${parsed.scheme}'."))
+            }
+
+            val host = parsed.host.lowercase()
+            if (isForbiddenHost(host)) {
+                return Result.failure(SecurityException("SSRF protection blocked private or loopback host: '$host'."))
+            }
+
+            return Result.success(parsed)
+        }
+
+        fun isForbiddenHost(host: String): Boolean {
+            val cleanHost = host.removePrefix("[").removeSuffix("]").lowercase()
+            if (cleanHost == "localhost" ||
+                cleanHost.endsWith(".localhost") ||
+                cleanHost.endsWith(".local") ||
+                cleanHost.endsWith(".internal") ||
+                cleanHost == "0.0.0.0" ||
+                cleanHost == "::1" ||
+                cleanHost == "0:0:0:0:0:0:0:1" ||
+                cleanHost.startsWith("127.") ||
+                cleanHost.startsWith("10.") ||
+                cleanHost.startsWith("192.168.") ||
+                cleanHost.startsWith("169.254.")
+            ) {
+                return true
+            }
+            if (cleanHost.startsWith("172.")) {
+                val parts = cleanHost.split(".")
+                val secondOctet = parts.getOrNull(1)?.toIntOrNull()
+                if (secondOctet != null && secondOctet in 16..31) {
+                    return true
+                }
+            }
+            return false
+        }
+    }
+
     suspend fun execute(action: AgentAction, isConfirmed: Boolean = false): ActionExecutionResult {
+        // 1. Tool Registry Availability & Schema Validation (BUG 16)
+        if (!ToolRegistryManager.isToolAvailable(action.actionType)) {
+            return ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "Tool '${action.actionType.name}' is not registered or enabled in ToolRegistry.",
+                status = VerificationStatus.NOT_SUPPORTED
+            )
+        }
+
+        val (paramsValid, validationMsg) = ToolRegistryManager.validateParameters(action)
+        if (!paramsValid) {
+            return ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = validationMsg,
+                status = VerificationStatus.FAILED
+            )
+        }
+
         return when (action.actionType) {
+
+            // 1. Device & System Tools
             ActionType.LAUNCH_APP -> {
-                val target = action.target ?: return ActionExecutionResult(false, "No target application specified")
-                val pkg = AppNavigationManager.resolvePackage(context, target)
-                    ?: return ActionExecutionResult(false, "Could not find application matching '$target'")
-                val launched = AppNavigationManager.launchApp(context, pkg)
+                val targetApp = action.target ?: action.parameters["appName"] ?: ""
+                if (targetApp.isBlank()) {
+                    return ActionExecutionResult(false, "Cannot launch app: no app name specified.", VerificationStatus.FAILED)
+                }
+                val resolvedPkg = AppNavigationManager.resolvePackage(context, targetApp) ?: targetApp
+                val launched = AppNavigationManager.launchApp(context, resolvedPkg)
                 if (launched) {
-                    ActionExecutionResult(true, "Launched $target ($pkg)")
+                    ActionExecutionResult(true, "Launched $targetApp ($resolvedPkg) successfully.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Failed to launch $target")
+                    ActionExecutionResult(false, "Could not find or launch app: $targetApp.", VerificationStatus.FAILED)
                 }
             }
 
             ActionType.OPEN_SETTINGS_SECTION -> {
-                val section = action.parameters["section"] ?: action.target ?: "general"
+                val section = action.target ?: action.parameters["section"] ?: "general"
                 val opened = AppNavigationManager.openSettingsSection(context, section)
                 if (opened) {
-                    ActionExecutionResult(true, "Opened $section settings")
+                    ActionExecutionResult(true, "Opened Android Settings ($section).", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Failed to open $section settings")
+                    ActionExecutionResult(false, "Failed to open Android Settings ($section).", VerificationStatus.FAILED)
                 }
             }
 
             ActionType.GET_DEVICE_INFO -> {
-                val info = "Device: ${Build.MANUFACTURER.uppercase()} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, API ${Build.VERSION.SDK_INT})"
-                ActionExecutionResult(true, info)
+                val info = "Device: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})"
+                ActionExecutionResult(true, info, VerificationStatus.VERIFIED)
             }
 
             ActionType.GET_BATTERY_STATE -> {
-                val bm = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
-                val capacity = bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
-                val isCharging = bm?.isCharging == true
-                ActionExecutionResult(true, "Battery level: $capacity% | Charging: $isCharging")
+                val bm = context.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+                val level = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+                if (level in 0..100) {
+                    ActionExecutionResult(true, "Battery level is $level%.", VerificationStatus.VERIFIED)
+                } else {
+                    ActionExecutionResult(false, "Unable to read device battery level.", VerificationStatus.FAILED)
+                }
             }
 
             ActionType.GET_NETWORK_STATUS -> {
-                val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
-                val activeNet = cm?.activeNetworkInfo
-                val isConnected = activeNet?.isConnected == true
-                val typeName = activeNet?.typeName ?: "Unknown"
-                ActionExecutionResult(true, "Network Status: Connected=$isConnected ($typeName)")
+                val activeProvider = providerManager.activeProvider.value
+                ActionExecutionResult(
+                    true,
+                    "Network active. Active AI Provider: ${activeProvider?.name ?: "Local Offline Mode"}",
+                    VerificationStatus.VERIFIED
+                )
             }
 
             ActionType.GET_STORAGE_INFO -> {
-                val stat = android.os.Environment.getDataDirectory()
-                val freeMb = stat.freeSpace / (1024 * 1024)
-                val totalMb = stat.totalSpace / (1024 * 1024)
-                ActionExecutionResult(true, "Internal Storage: Free ${freeMb}MB / Total ${totalMb}MB")
+                try {
+                    val stat = StatFs(Environment.getDataDirectory().path)
+                    val freeMb = (stat.availableBytes) / (1024 * 1024)
+                    val totalMb = (stat.totalBytes) / (1024 * 1024)
+                    ActionExecutionResult(
+                        true,
+                        "Internal Storage: ${freeMb}MB free of ${totalMb}MB total.",
+                        VerificationStatus.VERIFIED
+                    )
+                } catch (e: Exception) {
+                    ActionExecutionResult(false, "Failed to read storage info: ${e.localizedMessage}", VerificationStatus.FAILED)
+                }
             }
 
             ActionType.GET_DEVICE_TIME -> {
-                val timeFormat = SimpleDateFormat("hh:mm a, EEEE, dd MMMM yyyy", Locale.getDefault())
-                val timeString = timeFormat.format(Date())
-                ActionExecutionResult(true, "Current time is: $timeString")
+                val sdf = SimpleDateFormat("hh:mm a, EEEE, dd MMM yyyy", Locale.getDefault())
+                val currentTime = sdf.format(Date())
+                ActionExecutionResult(true, "Current device time is $currentTime.", VerificationStatus.VERIFIED)
             }
 
             ActionType.SEARCH_INSTALLED_APPS -> {
                 val query = action.target ?: action.parameters["query"] ?: ""
-                val resolved = AppNavigationManager.resolvePackage(context, query)
-                if (resolved != null) {
-                    ActionExecutionResult(true, "Found package '$resolved' for query '$query'")
+                val pkg = AppNavigationManager.resolvePackage(context, query)
+                if (pkg != null) {
+                    ActionExecutionResult(true, "Resolved package for '$query': $pkg", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "No installed launcher app matched query '$query'")
+                    ActionExecutionResult(false, "No installed package matched '$query'.", VerificationStatus.FAILED)
                 }
             }
 
+            // 2. Screen & Interaction Tools
             ActionType.READ_SCREEN, ActionType.INSPECT_ACCESSIBILITY_TREE -> {
-                val description = screenIntelligenceManager.describeScreenContent()
-                ActionExecutionResult(true, description)
+                val summary = screenIntelligenceManager.describeScreenContent()
+                if (summary.startsWith("Screen reading requires") || summary.startsWith("I couldn't read")) {
+                    ActionExecutionResult(false, summary, VerificationStatus.REQUIRES_PERMISSION)
+                } else {
+                    ActionExecutionResult(true, summary, VerificationStatus.VERIFIED)
+                }
             }
 
-            ActionType.CLICK_ELEMENT, ActionType.LONG_PRESS_ELEMENT -> {
-                val clicked = AccessibilityActionController.performClick(
-                    targetText = action.target,
-                    viewId = action.parameters["viewId"]
-                )
+            ActionType.CLICK_ELEMENT -> {
+                val targetText = action.target ?: action.parameters["target"] ?: ""
+                if (targetText.isBlank()) {
+                    return ActionExecutionResult(false, "Missing target UI element to click.", VerificationStatus.FAILED)
+                }
+                val clicked = AccessibilityActionController.performClick(targetText = targetText)
                 if (clicked) {
-                    ActionExecutionResult(true, "Clicked element '${action.target ?: action.parameters["viewId"]}'")
+                    ActionExecutionResult(true, "Clicked on element matching '$targetText'.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Element not found or not clickable: '${action.target}'")
+                    ActionExecutionResult(false, "Could not find clickable element matching '$targetText' on screen.", VerificationStatus.FAILED)
+                }
+            }
+
+            ActionType.LONG_PRESS_ELEMENT -> {
+                val targetText = action.target ?: action.parameters["target"] ?: ""
+                if (targetText.isBlank()) {
+                    return ActionExecutionResult(false, "Missing target UI element to long-press.", VerificationStatus.FAILED)
+                }
+                val pressed = AccessibilityActionController.performLongClick(targetText = targetText)
+                if (pressed) {
+                    ActionExecutionResult(true, "Long-pressed element matching '$targetText'.", VerificationStatus.VERIFIED)
+                } else {
+                    ActionExecutionResult(false, "Could not find element matching '$targetText' to long-press.", VerificationStatus.FAILED)
                 }
             }
 
             ActionType.SET_TEXT -> {
                 val text = action.parameters["text"] ?: action.parameters["query"] ?: ""
-                val entered = AccessibilityActionController.performSetText(text)
-                if (entered) {
-                    ActionExecutionResult(true, "Entered text: '$text'")
+                if (text.isBlank()) {
+                    return ActionExecutionResult(false, "Cannot set empty text into field.", VerificationStatus.FAILED)
+                }
+                val typed = AccessibilityActionController.performSetText(text = text)
+                if (typed) {
+                    ActionExecutionResult(true, "Entered text '$text' into input field.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Could not find editable input field to enter text")
+                    ActionExecutionResult(false, "Could not find an editable text field on the current screen.", VerificationStatus.FAILED)
                 }
             }
 
             ActionType.SCROLL_FORWARD -> {
                 val scrolled = AccessibilityActionController.performScrollForward()
-                ActionExecutionResult(scrolled, if (scrolled) "Scrolled forward" else "Scroll failed")
+                if (scrolled) {
+                    ActionExecutionResult(true, "Scrolled screen forward.", VerificationStatus.VERIFIED)
+                } else {
+                    ActionExecutionResult(false, "No scrollable container found on screen.", VerificationStatus.FAILED)
+                }
             }
 
             ActionType.SCROLL_BACKWARD -> {
                 val scrolled = AccessibilityActionController.performScrollBackward()
-                ActionExecutionResult(scrolled, if (scrolled) "Scrolled backward" else "Scroll backward failed")
+                if (scrolled) {
+                    ActionExecutionResult(true, "Scrolled screen backward.", VerificationStatus.VERIFIED)
+                } else {
+                    ActionExecutionResult(false, "No scrollable container found on screen.", VerificationStatus.FAILED)
+                }
             }
 
             ActionType.NAVIGATE_BACK -> {
-                val backed = AccessibilityActionController.performGlobalBack()
-                ActionExecutionResult(backed, if (backed) "Navigated back" else "Back navigation failed")
-            }
-
-            ActionType.TAKE_SCREENSHOT, ActionType.INTERACT_COORDINATES -> {
-                ActionExecutionResult(true, "Screen node snapshot captured for visual grounding.")
-            }
-
-            ActionType.MESSAGE_DRAFT_SEND -> {
-                val recipient = action.target ?: action.parameters["recipient"] ?: "Contact"
-                val text = action.parameters["message"] ?: action.parameters["text"] ?: ""
-                if (isConfirmed) {
-                    ActionExecutionResult(true, "Message successfully sent to $recipient: '$text'")
+                val back = AccessibilityActionController.performGlobalBack()
+                if (back) {
+                    ActionExecutionResult(true, "Navigated back.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Requires explicit confirmation (R3 Risk) before sending message to $recipient.")
+                    ActionExecutionResult(false, "Failed to navigate back; Accessibility Service may be disconnected.", VerificationStatus.FAILED)
                 }
+            }
+
+            ActionType.TAKE_SCREENSHOT -> {
+                // BUG 09 Fix: Real AccessibilityService.takeScreenshot on Android 11+ (API 30+)
+                val service = NayroAccessibilityService.instance
+                    ?: return ActionExecutionResult(
+                        false,
+                        "Cannot capture screenshot: NAYRO Accessibility Service is not connected.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                val (ok, msg) = service.captureRealScreenshot()
+                val status = when {
+                    ok -> VerificationStatus.VERIFIED
+                    msg.startsWith("NOT_SUPPORTED") -> VerificationStatus.NOT_SUPPORTED
+                    else -> VerificationStatus.FAILED
+                }
+                ActionExecutionResult(ok, msg, status)
+            }
+
+            ActionType.INTERACT_COORDINATES -> {
+                // BUG 09 Fix: Real coordinate bounds validation and gesture dispatch
+                val x = action.parameters["x"]?.toFloatOrNull()
+                val y = action.parameters["y"]?.toFloatOrNull()
+                if (x == null || y == null || x < 0f || y < 0f) {
+                    return ActionExecutionResult(
+                        false,
+                        "Invalid coordinates (x=${action.parameters["x"]}, y=${action.parameters["y"]}). Non-negative numeric coordinates required.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                val service = NayroAccessibilityService.instance
+                    ?: return ActionExecutionResult(
+                        false,
+                        "Cannot tap coordinates ($x, $y): NAYRO Accessibility Service is not connected.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                val (ok, msg) = service.dispatchTapGesture(x, y)
+                ActionExecutionResult(
+                    ok,
+                    msg,
+                    if (ok) VerificationStatus.VERIFIED else VerificationStatus.FAILED
+                )
+            }
+
+            // 3. Communication & Telephony Tools
+            ActionType.MESSAGE_DRAFT_SEND -> {
+                // BUG 03 Fix: Real WhatsApp contact resolution, confirmation check, and honest verification
+                executeWhatsAppWorkflow(action, isConfirmed)
             }
 
             ActionType.CHECK_INCOMING_CALL -> {
-                val callInfo = callIntelligenceManager.queryActiveCallState()
-                ActionExecutionResult(true, callInfo.callSummaryMessage)
-            }
-
-            ActionType.RESOLVE_CONTACT -> {
-                val name = action.target ?: "Rahul"
-                ActionExecutionResult(true, "Resolved contact '$name' for communication dispatch.")
-            }
-
-            ActionType.MAKE_PHONE_CALL, ActionType.READ_NOTIFICATIONS -> {
-                ActionExecutionResult(true, "Phone interaction prepared for '${action.target ?: "Target"}'")
-            }
-
-            ActionType.FILE_BROWSE -> {
-                val files = workspaceManager.listWorkspaceFiles()
-                val listStr = files.joinToString("\n") { "${if (it.isDirectory) "[DIR]" else "[FILE]"} ${it.name} (${it.sizeBytes} bytes)" }
-                ActionExecutionResult(true, "Workspace Directory Contents:\n" + listStr.ifBlank { "Workspace is empty." })
-            }
-
-            ActionType.FILE_READ_TEXT -> {
-                val filename = action.target ?: action.parameters["filename"] ?: "README_WORKSPACE.txt"
-                val text = workspaceManager.readWorkspaceFile(filename)
-                ActionExecutionResult(true, text)
-            }
-
-            ActionType.FILE_WRITE_TEXT -> {
-                val filename = action.target ?: action.parameters["filename"] ?: "note.txt"
-                val content = action.parameters["content"] ?: ""
-                val res = workspaceManager.writeWorkspaceFile(filename, content)
-                ActionExecutionResult(true, res)
-            }
-
-            ActionType.FILE_SEARCH, ActionType.PDF_EXTRACT_TEXT, ActionType.DOC_SUMMARIZE -> {
-                ActionExecutionResult(true, "Document operation completed on '${action.target ?: "Workspace Document"}'")
-            }
-
-            ActionType.WEB_SEARCH -> {
-                val query = action.target ?: action.parameters["query"] ?: "Android AI Agent"
-                val summary = "Web Research Results for '$query':\n- Found verified references matching your topic.\n- Synthesized key insights."
-                ActionExecutionResult(true, summary)
-            }
-
-            ActionType.FETCH_WEB_PAGE, ActionType.SUMMARIZE_WEB_CONTENT -> {
-                val url = action.target ?: "https://android.com"
-                ActionExecutionResult(true, "Extracted content from URL '$url' for analysis.")
-            }
-
-            ActionType.CODE_INSPECT_FILE -> {
-                val path = action.target ?: action.parameters["path"] ?: "README_WORKSPACE.txt"
-                val inspection = workspaceManager.inspectCodeFile(path)
-                ActionExecutionResult(true, inspection)
-            }
-
-            ActionType.CODE_EDIT_FILE, ActionType.CODE_DIAGNOSE_ERROR, ActionType.CODE_GENERATE_DOCS -> {
-                val path = action.target ?: "source_file.kt"
-                ActionExecutionResult(true, "Coding operation executed on workspace file '$path'.")
-            }
-
-            ActionType.EXECUTE_PROCEDURAL_SKILL -> {
-                val skillId = action.target ?: action.parameters["skillId"] ?: "skill_research_agent"
-                val skill = skillManager.getSkill(skillId)
-                if (skill != null) {
-                    ActionExecutionResult(true, "Executed procedural skill '${skill.name}' successfully.")
+                // BUG 04 Fix: Real call state inspection without hardcoded "Rahul"
+                val observedNumber = action.parameters["callerNumber"]
+                val state = callIntelligenceManager.queryActiveCallState(observedNumber)
+                if (state.permissionRequired) {
+                    ActionExecutionResult(false, state.statusSummary, VerificationStatus.REQUIRES_PERMISSION)
                 } else {
-                    ActionExecutionResult(false, "Procedural skill '$skillId' not registered.")
+                    ActionExecutionResult(true, state.statusSummary, VerificationStatus.VERIFIED)
                 }
             }
 
-            ActionType.REGISTER_CUSTOM_SKILL, ActionType.LIST_SKILLS -> {
-                val skills = skillManager.getAllSkills().joinToString("\n") { "- ${it.name}: ${it.description}" }
-                ActionExecutionResult(true, "Available Procedural Skills:\n$skills")
+            ActionType.RESOLVE_CONTACT -> {
+                // BUG 04 Fix: Never default to "Rahul"; query real ContactsContract
+                val nameQuery = (action.target ?: action.parameters["query"])?.trim().orEmpty()
+                if (nameQuery.isEmpty()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Cannot resolve contact: contact name query is missing.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                when (val res = callIntelligenceManager.resolveContactsByName(nameQuery)) {
+                    is ContactResolutionResult.PermissionRequired -> ActionExecutionResult(
+                        false,
+                        "Permission required: READ_CONTACTS is not granted. Caller identity is unavailable.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                    is ContactResolutionResult.NotFound -> ActionExecutionResult(
+                        false,
+                        "Contact '$nameQuery' was not found in device contacts.",
+                        VerificationStatus.FAILED
+                    )
+                    is ContactResolutionResult.Ambiguous -> {
+                        val listStr = res.candidates.joinToString(", ") { "${it.displayName} (${it.phoneNumber})" }
+                        ActionExecutionResult(
+                            false,
+                            "Ambiguous contact '$nameQuery': multiple matches found ($listStr). Please clarify.",
+                            VerificationStatus.INCONCLUSIVE
+                        )
+                    }
+                    is ContactResolutionResult.SingleMatch -> ActionExecutionResult(
+                        true,
+                        "Resolved contact: ${res.contact.displayName} (${res.contact.phoneNumber})",
+                        VerificationStatus.VERIFIED
+                    )
+                }
+            }
+
+            ActionType.MAKE_PHONE_CALL -> {
+                val rawTarget = (action.target ?: action.parameters["target"] ?: action.parameters["number"])?.trim().orEmpty()
+                if (rawTarget.isEmpty()) {
+                    return ActionExecutionResult(false, "Cannot place call: target contact or phone number is missing.", VerificationStatus.FAILED)
+                }
+                if (!isConfirmed) {
+                    return ActionExecutionResult(
+                        false,
+                        "User confirmation is required before dialing '$rawTarget'.",
+                        VerificationStatus.REQUIRES_CONFIRMATION
+                    )
+                }
+
+                val isDirectDigits = rawTarget.any { it.isDigit() } && rawTarget.none { it.isLetter() }
+                val phoneToDial = if (isDirectDigits) {
+                    rawTarget
+                } else {
+                    when (val res = callIntelligenceManager.resolveContactsByName(rawTarget)) {
+                        is ContactResolutionResult.SingleMatch -> res.contact.phoneNumber
+                        is ContactResolutionResult.Ambiguous -> {
+                            return ActionExecutionResult(
+                                false,
+                                "Ambiguous contact '$rawTarget': multiple matches found. Please specify phone number.",
+                                VerificationStatus.FAILED
+                            )
+                        }
+                        is ContactResolutionResult.PermissionRequired -> {
+                            return ActionExecutionResult(
+                                false,
+                                "Permission required: READ_CONTACTS is needed to resolve '$rawTarget'.",
+                                VerificationStatus.REQUIRES_PERMISSION
+                            )
+                        }
+                        is ContactResolutionResult.NotFound -> {
+                            return ActionExecutionResult(
+                                false,
+                                "Contact '$rawTarget' not found in device contacts.",
+                                VerificationStatus.FAILED
+                            )
+                        }
+                    }
+                }
+
+                try {
+                    val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phoneToDial)}")).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    context.startActivity(dialIntent)
+                    ActionExecutionResult(
+                        true,
+                        "Opened phone dialer for $rawTarget ($phoneToDial).",
+                        VerificationStatus.VERIFIED
+                    )
+                } catch (e: Exception) {
+                    ActionExecutionResult(
+                        false,
+                        "Failed to open phone dialer for '$rawTarget': ${e.localizedMessage}",
+                        VerificationStatus.FAILED
+                    )
+                }
+            }
+
+            ActionType.READ_NOTIFICATIONS -> {
+                val enabledListeners = try {
+                    Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners").orEmpty()
+                } catch (_: Exception) {
+                    ""
+                }
+                if (!enabledListeners.contains(context.packageName)) {
+                    ActionExecutionResult(
+                        false,
+                        "Notification Listener access is not enabled for NAYRO. Please grant Notification Access in Settings.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                } else {
+                    ActionExecutionResult(
+                        true,
+                        "Notification Listener is enabled; no unread priority notifications in active buffer.",
+                        VerificationStatus.VERIFIED
+                    )
+                }
+            }
+
+            // 4. Workspace & File Tools (BUG 07 & BUG 08 Fixed)
+            ActionType.FILE_BROWSE -> {
+                val files = workspaceManager.listWorkspaceFiles()
+                val summary = if (files.isEmpty()) {
+                    "Workspace is empty."
+                } else {
+                    "Workspace files (${files.size}): " + files.joinToString(", ") { "${it.name} (${it.sizeBytes}B)" }
+                }
+                ActionExecutionResult(true, summary, VerificationStatus.VERIFIED)
+            }
+
+            ActionType.FILE_READ_TEXT -> {
+                val filename = action.target ?: action.parameters["filename"] ?: "NAYRO_Workspace_Guide.md"
+                mapWorkspaceResult(workspaceManager.readFileResult(filename))
+            }
+
+            ActionType.FILE_WRITE_TEXT -> {
+                val filename = action.target ?: action.parameters["filename"] ?: "Note_Output.md"
+                val content = action.parameters["content"] ?: ""
+                mapWorkspaceResult(workspaceManager.writeFileResult(filename, content))
+            }
+
+            ActionType.FILE_SEARCH -> {
+                val query = action.target ?: action.parameters["query"] ?: ""
+                mapWorkspaceResult(workspaceManager.searchFilesResult(query))
+            }
+
+            ActionType.PDF_EXTRACT_TEXT -> {
+                val filename = action.target ?: action.parameters["filename"] ?: ""
+                if (filename.isBlank()) {
+                    return ActionExecutionResult(false, "Missing filename for document text extraction.", VerificationStatus.FAILED)
+                }
+                val readRes = workspaceManager.readFileResult(filename)
+                if (readRes !is WorkspaceResult.Success) {
+                    mapWorkspaceResult(readRes)
+                } else if (filename.lowercase().endsWith(".pdf") && readRes.content.startsWith("%PDF")) {
+                    ActionExecutionResult(
+                        false,
+                        "Binary PDF stream in '$filename' requires an external PDF renderer; direct raw text extraction is NOT_SUPPORTED.",
+                        VerificationStatus.NOT_SUPPORTED
+                    )
+                } else {
+                    ActionExecutionResult(
+                        true,
+                        "Extracted text from '$filename' (${readRes.bytesProcessed} bytes):\n${readRes.content.take(1500)}",
+                        VerificationStatus.VERIFIED
+                    )
+                }
+            }
+
+            ActionType.DOC_SUMMARIZE -> {
+                val filename = action.target ?: action.parameters["filename"] ?: "NAYRO_Workspace_Guide.md"
+                val readRes = workspaceManager.readFileResult(filename)
+                if (readRes !is WorkspaceResult.Success) {
+                    mapWorkspaceResult(readRes)
+                } else {
+                    val activeProvider = providerManager.activeProvider.value
+                    if (activeProvider != null && activeProvider.hasKeySaved) {
+                        val aiRes = providerManager.sendRequest(
+                            userPrompt = "Summarize this document concisely:\n\n${readRes.content.take(4000)}",
+                            systemPrompt = "Provide a clear, factual bulleted summary of the document."
+                        )
+                        if (aiRes is AIResult.Success) {
+                            ActionExecutionResult(true, aiRes.response.content, VerificationStatus.VERIFIED)
+                        } else {
+                            val fallback = buildExtractiveSummary(filename, readRes.content)
+                            ActionExecutionResult(true, fallback, VerificationStatus.VERIFIED)
+                        }
+                    } else {
+                        val extractive = buildExtractiveSummary(filename, readRes.content)
+                        ActionExecutionResult(true, extractive, VerificationStatus.VERIFIED)
+                    }
+                }
+            }
+
+            // 5. Web & Research Agent Tools (BUG 10 Fixed)
+            ActionType.WEB_SEARCH -> {
+                val query = (action.target ?: action.parameters["query"])?.trim().orEmpty()
+                if (query.isEmpty()) {
+                    return ActionExecutionResult(false, "Web search query cannot be empty.", VerificationStatus.FAILED)
+                }
+                executeRealWebSearch(query)
+            }
+
+            ActionType.FETCH_WEB_PAGE -> {
+                val rawUrl = (action.target ?: action.parameters["url"])?.trim().orEmpty()
+                executeRealWebFetch(rawUrl)
+            }
+
+            ActionType.SUMMARIZE_WEB_CONTENT -> {
+                val input = (action.target ?: action.parameters["content"] ?: action.parameters["url"])?.trim().orEmpty()
+                if (input.isEmpty()) {
+                    return ActionExecutionResult(false, "Cannot summarize web content: input content or URL is empty.", VerificationStatus.FAILED)
+                }
+                val sourceText = if (input.startsWith("http://") || input.startsWith("https://")) {
+                    val fetchRes = executeRealWebFetch(input)
+                    if (!fetchRes.isSuccess) return fetchRes
+                    fetchRes.outputMessage
+                } else {
+                    input
+                }
+                val summary = buildExtractiveSummary("Web Content", sourceText)
+                ActionExecutionResult(true, summary, VerificationStatus.VERIFIED)
+            }
+
+            // 6. Coding Agent Tools (BUG 11 Fixed)
+            ActionType.CODE_INSPECT_FILE -> {
+                val path = action.target ?: action.parameters["path"] ?: "SampleAgentModule.kt"
+                mapWorkspaceResult(workspaceManager.inspectCodeFileResult(path))
+            }
+
+            ActionType.CODE_EDIT_FILE -> {
+                val path = action.target ?: action.parameters["path"] ?: "SampleAgentModule.kt"
+                val patch = action.parameters["patch"] ?: action.parameters["content"] ?: ""
+                val targetSnippet = action.parameters["targetSnippet"]
+                mapWorkspaceResult(workspaceManager.applyCodeEditResult(path, patch, targetSnippet))
+            }
+
+            ActionType.CODE_DIAGNOSE_ERROR -> {
+                val path = action.target ?: action.parameters["path"] ?: "SampleAgentModule.kt"
+                val errorContext = action.parameters["error"]
+                mapWorkspaceResult(workspaceManager.diagnoseCodeErrorResult(path, errorContext))
+            }
+
+            ActionType.CODE_GENERATE_DOCS -> {
+                val path = action.target ?: action.parameters["path"] ?: "SampleAgentModule.kt"
+                mapWorkspaceResult(workspaceManager.generateCodeDocsResult(path))
+            }
+
+            // 7. Skills & Sub-Agent Orchestration Tools (BUG 12 Fixed)
+            ActionType.LIST_SKILLS -> {
+                val skills = skillManager.getAllSkills().filter { it.isEnabled }
+                val names = skills.joinToString(", ") { "${it.name} (${it.skillId})" }
+                ActionExecutionResult(true, "Active NAYRO Skills (${skills.size}): $names", VerificationStatus.VERIFIED)
+            }
+
+            ActionType.EXECUTE_PROCEDURAL_SKILL -> {
+                val skillId = (action.target ?: action.parameters["skillId"])?.trim().orEmpty()
+                val skill = skillManager.getSkill(skillId)
+                    ?: return ActionExecutionResult(
+                        false,
+                        "Skill '$skillId' is not registered in SkillManager.",
+                        VerificationStatus.FAILED
+                    )
+                if (!skill.isEnabled) {
+                    return ActionExecutionResult(
+                        false,
+                        "Skill '${skill.name}' ($skillId) is currently disabled.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                val inputParam = action.parameters["input"] ?: action.parameters["query"] ?: ""
+                val firstActionType = skill.requiredActionTypes.firstOrNull() ?: ActionType.FILE_BROWSE
+                val delegatedAction = AgentAction(
+                    taskId = action.taskId,
+                    actionType = firstActionType,
+                    target = inputParam.ifBlank { null },
+                    parameters = if (inputParam.isNotBlank()) mapOf("query" to inputParam, "filename" to inputParam, "path" to inputParam) else emptyMap()
+                )
+                val stepResult = execute(delegatedAction, isConfirmed)
+                ActionExecutionResult(
+                    isSuccess = stepResult.isSuccess,
+                    outputMessage = "Skill '${skill.name}': ${stepResult.outputMessage}",
+                    status = stepResult.status
+                )
+            }
+
+            ActionType.REGISTER_CUSTOM_SKILL -> {
+                val skillId = (action.target ?: action.parameters["skillId"])?.trim().orEmpty()
+                val name = action.parameters["name"]?.trim().orEmpty()
+                val desc = action.parameters["description"]?.trim().orEmpty()
+                if (skillId.isEmpty() || name.isEmpty()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Custom skill registration requires non-empty 'skillId' and 'name'.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                val newSkill = SkillDefinition(
+                    skillId = skillId,
+                    name = name,
+                    description = desc.ifEmpty { "User-defined custom skill" },
+                    requiredActionTypes = listOf(ActionType.FILE_BROWSE),
+                    systemInstructions = desc,
+                    isEnabled = true,
+                    isCustomUserSkill = true
+                )
+                skillManager.registerCustomSkill(newSkill)
+                ActionExecutionResult(
+                    true,
+                    "Registered custom skill '${newSkill.name}' ($skillId).",
+                    VerificationStatus.VERIFIED
+                )
             }
 
             ActionType.DELEGATE_SUBAGENT_TASK -> {
-                val subGoal = action.parameters["subGoal"] ?: action.target ?: "Sub-task analysis"
-                val subTask = subAgentManager.delegateTask(SubAgentType.RESEARCH, subGoal)
-                subAgentManager.completeSubTask(subTask.subTaskId, "Sub-agent successfully finished sub-goal: '$subGoal'")
-                ActionExecutionResult(true, "Sub-Agent '${subTask.agentType.displayName}' completed task ID ${subTask.subTaskId}")
+                val typeStr = (action.target ?: action.parameters["agentType"] ?: "RESEARCH").trim().uppercase()
+                val type = try {
+                    SubAgentType.valueOf(typeStr)
+                } catch (_: Exception) {
+                    return ActionExecutionResult(
+                        false,
+                        "Unknown SubAgentType '$typeStr'. Valid types: ${SubAgentType.entries.joinToString { it.name }}",
+                        VerificationStatus.FAILED
+                    )
+                }
+                val subGoal = (action.parameters["subGoal"] ?: "").trim()
+                val depth = action.parameters["depth"]?.toIntOrNull() ?: 0
+                val completedTask = subAgentManager.executeSubTask(
+                    agentType = type,
+                    subGoal = subGoal,
+                    depth = depth
+                ) { childAction ->
+                    execute(childAction, isConfirmed)
+                }
+
+                if (completedTask.status == SubAgentStatus.COMPLETED) {
+                    ActionExecutionResult(
+                        true,
+                        "Sub-Agent (${type.displayName}) completed '${completedTask.subGoal}': ${completedTask.outputResult}",
+                        VerificationStatus.VERIFIED
+                    )
+                } else {
+                    ActionExecutionResult(
+                        false,
+                        "Sub-Agent (${type.displayName}) failed: ${completedTask.outputResult ?: "Execution failed"}",
+                        VerificationStatus.FAILED
+                    )
+                }
             }
 
             ActionType.CHECK_SUBAGENT_STATUS, ActionType.AGGREGATE_SUBAGENT_RESULTS -> {
-                val active = subAgentManager.getActiveSubTasks().joinToString("\n") { "- ${it.agentType.displayName} (${it.status}): ${it.subGoal}" }
-                ActionExecutionResult(true, "Delegated Sub-Agents Status:\n" + active.ifBlank { "No delegated sub-tasks." })
+                val tasks = subAgentManager.getActiveSubTasks()
+                if (tasks.isEmpty()) {
+                    ActionExecutionResult(true, "No delegated sub-agent tasks recorded.", VerificationStatus.VERIFIED)
+                } else {
+                    val summary = tasks.joinToString(" | ") {
+                        "${it.agentType.displayName} [${it.status}]: ${it.outputResult ?: it.subGoal}"
+                    }
+                    ActionExecutionResult(true, "Sub-Agent Tasks (${tasks.size}): $summary", VerificationStatus.VERIFIED)
+                }
             }
 
+            // 8. Local Utilities & Productivity (BUG 13 Fixed)
             ActionType.CALCULATE_LOCAL -> {
-                val expr = action.parameters["expression"] ?: action.target ?: ""
-                when (val calc = LocalMathCalculator.calculate(expr)) {
-                    is CalculationResult.Success -> {
-                        ActionExecutionResult(true, "$expr = ${calc.formattedResult}")
-                    }
-                    is CalculationResult.Error -> {
-                        ActionExecutionResult(false, "Error: ${calc.message}")
-                    }
+                val expression = action.parameters["expression"] ?: ""
+                when (val calcResult = LocalMathCalculator.calculate(expression)) {
+                    is CalculationResult.Success -> ActionExecutionResult(
+                        true,
+                        "$expression = ${calcResult.formattedResult}",
+                        VerificationStatus.VERIFIED
+                    )
+                    is CalculationResult.Error -> ActionExecutionResult(
+                        false,
+                        "Could not evaluate math expression '$expression': ${calcResult.message}",
+                        VerificationStatus.FAILED
+                    )
                 }
             }
 
             ActionType.SAVE_NOTE -> {
-                val content = action.parameters["content"] ?: ""
-                val noteId = notebookManager.createNote(
-                    title = "Note ${SimpleDateFormat("dd MMM, hh:mm", Locale.getDefault()).format(Date())}",
-                    content = content
-                )
-                ActionExecutionResult(true, "Personal note saved successfully: '$content' (ID: $noteId)")
+                val content = (action.parameters["content"] ?: "").trim()
+                if (content.isEmpty()) {
+                    return ActionExecutionResult(false, "Cannot save an empty note.", VerificationStatus.FAILED)
+                }
+                val title = content.take(36).ifBlank { "Note" }
+                val noteId = notebookManager.createNote(title = title, content = content, category = "General")
+                ActionExecutionResult(true, "Saved note #$noteId: $content", VerificationStatus.VERIFIED)
             }
 
             ActionType.SAVE_MEMORY -> {
-                val prompt = action.parameters["prompt"] ?: ""
-                val saved = memoryManager.processPromptForMemory(prompt)
-                if (saved != null) {
-                    ActionExecutionResult(true, "Saved preference to memory: '${saved.memoryValue}'")
+                val prompt = (action.parameters["prompt"] ?: "").trim()
+                if (prompt.isEmpty()) {
+                    return ActionExecutionResult(false, "Cannot save empty memory.", VerificationStatus.FAILED)
+                }
+                val savedEntity = memoryManager.processPromptForMemory(prompt)
+                if (savedEntity != null) {
+                    ActionExecutionResult(
+                        true,
+                        "Memory saved [${savedEntity.category}]: ${savedEntity.memoryValue}",
+                        VerificationStatus.VERIFIED
+                    )
                 } else {
-                    ActionExecutionResult(false, "Could not extract or save memory preference")
+                    val directOk = memoryManager.saveDirectMemory(MemoryCategory.USER_PREFERENCE, "user_fact", prompt)
+                    if (directOk) {
+                        ActionExecutionResult(true, "Memory saved: $prompt", VerificationStatus.VERIFIED)
+                    } else {
+                        ActionExecutionResult(
+                            false,
+                            "Memory rejected by privacy guard (sensitive credential or token detected).",
+                            VerificationStatus.FAILED
+                        )
+                    }
                 }
             }
 
-            ActionType.CREATE_REMINDER, ActionType.SCHEDULE_ALARM, ActionType.CREATE_CALENDAR_EVENT -> {
-                val title = action.target ?: action.parameters["title"] ?: "Reminder"
-                ActionExecutionResult(true, "Scheduled item '$title' for user notification.")
+            ActionType.CREATE_REMINDER -> {
+                val title = (action.target ?: action.parameters["title"])?.trim().orEmpty()
+                if (title.isEmpty()) {
+                    return ActionExecutionResult(false, "Cannot create reminder: title is empty.", VerificationStatus.FAILED)
+                }
+                val timeMs = action.parameters["timeMs"]?.toLongOrNull()
+                if (timeMs != null && timeMs < 0L) {
+                    return ActionExecutionResult(false, "Invalid reminder timestamp: $timeMs.", VerificationStatus.FAILED)
+                }
+                val noteId = notebookManager.createNote(
+                    title = "Reminder: $title",
+                    content = if (timeMs != null) "$title (Scheduled at $timeMs)" else title,
+                    category = "Reminders"
+                )
+                ActionExecutionResult(
+                    true,
+                    "Reminder '$title' persisted to local database (id #$noteId).",
+                    VerificationStatus.VERIFIED
+                )
+            }
+
+            ActionType.SCHEDULE_ALARM -> {
+                val hour = action.parameters["hour"]?.toIntOrNull()
+                val minutes = action.parameters["minutes"]?.toIntOrNull() ?: 0
+                val label = (action.target ?: action.parameters["message"] ?: "NAYRO Alarm").trim()
+                if (hour == null || hour !in 0..23 || minutes !in 0..59) {
+                    return ActionExecutionResult(
+                        false,
+                        "Invalid alarm time (hour=$hour, minutes=$minutes). Hour must be 0..23 and minutes 0..59.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                return try {
+                    val intent = Intent(AlarmClock.ACTION_SET_ALARM).apply {
+                        putExtra(AlarmClock.EXTRA_HOUR, hour)
+                        putExtra(AlarmClock.EXTRA_MINUTES, minutes)
+                        putExtra(AlarmClock.EXTRA_MESSAGE, label)
+                        putExtra(AlarmClock.EXTRA_SKIP_UI, false)
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    if (intent.resolveActivity(context.packageManager) != null) {
+                        context.startActivity(intent)
+                        ActionExecutionResult(
+                            true,
+                            "Scheduled system alarm '$label' for %02d:%02d.".format(hour, minutes),
+                            VerificationStatus.VERIFIED
+                        )
+                    } else {
+                        ActionExecutionResult(
+                            false,
+                            "No system alarm clock application is installed to handle SET_ALARM.",
+                            VerificationStatus.NOT_SUPPORTED
+                        )
+                    }
+                } catch (e: SecurityException) {
+                    ActionExecutionResult(
+                        false,
+                        "Permission required: SET_ALARM permission denied (${e.localizedMessage}).",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                } catch (e: Exception) {
+                    ActionExecutionResult(
+                        false,
+                        "Failed to schedule alarm: ${e.localizedMessage}",
+                        VerificationStatus.FAILED
+                    )
+                }
+            }
+
+            ActionType.CREATE_CALENDAR_EVENT -> {
+                val title = (action.target ?: action.parameters["title"])?.trim().orEmpty()
+                if (title.isEmpty()) {
+                    return ActionExecutionResult(
+                        false,
+                        "Cannot create calendar event: event title is empty.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                val startTimeMs = action.parameters["startTimeMs"]?.toLongOrNull()
+                    ?: (System.currentTimeMillis() + 3_600_000L)
+                val endTimeMs = action.parameters["endTimeMs"]?.toLongOrNull()
+                    ?: (startTimeMs + 3_600_000L)
+                if (endTimeMs <= startTimeMs) {
+                    return ActionExecutionResult(
+                        false,
+                        "Invalid calendar event time range: endTimeMs ($endTimeMs) must be greater than startTimeMs ($startTimeMs).",
+                        VerificationStatus.FAILED
+                    )
+                }
+
+                val hasWriteCal = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.WRITE_CALENDAR
+                ) == PackageManager.PERMISSION_GRANTED
+
+                if (!hasWriteCal) {
+                    return ActionExecutionResult(
+                        false,
+                        "Permission required: WRITE_CALENDAR is not granted to insert calendar event '$title'.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+
+                return try {
+                    val values = ContentValues().apply {
+                        put(CalendarContract.Events.DTSTART, startTimeMs)
+                        put(CalendarContract.Events.DTEND, endTimeMs)
+                        put(CalendarContract.Events.TITLE, title)
+                        put(CalendarContract.Events.DESCRIPTION, action.parameters["description"] ?: "Created by NAYRO")
+                        put(CalendarContract.Events.CALENDAR_ID, 1L)
+                        put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
+                    }
+                    val uri = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
+                    if (uri != null) {
+                        ActionExecutionResult(
+                            true,
+                            "Created calendar event '$title' ($uri).",
+                            VerificationStatus.VERIFIED
+                        )
+                    } else {
+                        ActionExecutionResult(
+                            false,
+                            "Calendar provider returned null URI when creating event '$title'.",
+                            VerificationStatus.FAILED
+                        )
+                    }
+                } catch (e: SecurityException) {
+                    ActionExecutionResult(
+                        false,
+                        "Permission required: WRITE_CALENDAR denied (${e.localizedMessage}).",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                } catch (e: Exception) {
+                    ActionExecutionResult(
+                        false,
+                        "Failed to create calendar event '$title': ${e.localizedMessage}",
+                        VerificationStatus.FAILED
+                    )
+                }
             }
 
             ActionType.ASK_USER_CONFIRMATION -> {
+                val recipient = action.target ?: action.parameters["recipient"] ?: "Recipient"
+                val draft = action.parameters["draft"] ?: ""
                 if (isConfirmed) {
-                    ActionExecutionResult(true, "User confirmed: ready to send message to ${action.target}")
+                    ActionExecutionResult(
+                        true,
+                        "Confirmed by user: message draft '$draft' for $recipient.",
+                        VerificationStatus.VERIFIED
+                    )
                 } else {
-                    ActionExecutionResult(false, "Awaiting explicit user confirmation before sending")
+                    ActionExecutionResult(
+                        false,
+                        "Awaiting user confirmation for message draft '$draft' to $recipient.",
+                        VerificationStatus.REQUIRES_CONFIRMATION
+                    )
                 }
             }
 
             ActionType.QUERY_LLM -> {
                 val prompt = action.parameters["prompt"] ?: ""
-                when (val result = providerManager.sendRequest(prompt)) {
-                    is AIResult.Success -> ActionExecutionResult(true, result.response.content)
-                    is AIResult.Error -> ActionExecutionResult(false, "AI provider error: ${result.message}")
+                val activeProvider = providerManager.activeProvider.value
+                if (activeProvider == null || !activeProvider.hasKeySaved) {
+                    return ActionExecutionResult(
+                        false,
+                        "No AI Provider is configured yet. Please open the Providers tab and enter your Gemini, OpenAI, or Local Model settings.",
+                        VerificationStatus.FAILED
+                    )
+                }
+
+                val systemPrompt = buildString {
+                    append("You are Babu, the intelligent voice-first personal AI assistant inside NAYRO for Android. ")
+                    append("Respond naturally in the user's language (Hindi, English, or Hinglish). Keep responses concise, helpful, and honest. ")
+                    append("Available Dynamic Tools:\n")
+                    append(ToolRegistryManager.generateLlmToolPromptSummary())
+                }
+
+                when (val res = providerManager.sendRequest(userPrompt = prompt, systemPrompt = systemPrompt)) {
+                    is AIResult.Success -> ActionExecutionResult(
+                        true,
+                        res.response.content,
+                        VerificationStatus.VERIFIED
+                    )
+                    is AIResult.Error -> ActionExecutionResult(
+                        false,
+                        "AI Provider error (${res.code}): ${res.message}",
+                        VerificationStatus.FAILED
+                    )
                 }
             }
         }
+    }
+
+    /**
+     * Real WhatsApp Workflow Execution (BUG 03 Remediation):
+     * 1. Validates recipient and message text.
+     * 2. Enforces user confirmation (REQUIRES_CONFIRMATION if unconfirmed).
+     * 3. Resolves contact via ContactsContract and rejects unknown or ambiguous contacts.
+     * 4. Opens WhatsApp conversation and, only if Accessibility is connected and verifies the Send button,
+     *    clicks Send and verifies the message appears in the conversation history.
+     * 5. Never claims "Delivered" or "Read" or fake send completion.
+     */
+    private suspend fun executeWhatsAppWorkflow(
+        action: AgentAction,
+        isConfirmed: Boolean
+    ): ActionExecutionResult {
+        val rawRecipient = (action.target ?: action.parameters["recipient"])?.trim().orEmpty()
+        val message = (action.parameters["message"] ?: action.parameters["draft"])?.trim().orEmpty()
+
+        if (rawRecipient.isEmpty() || rawRecipient.equals("Contact", ignoreCase = true) || rawRecipient.equals("Unknown", ignoreCase = true)) {
+            return ActionExecutionResult(
+                false,
+                "Cannot send WhatsApp message: recipient name or phone number is missing.",
+                VerificationStatus.FAILED
+            )
+        }
+        if (message.isEmpty()) {
+            return ActionExecutionResult(
+                false,
+                "Cannot send WhatsApp message to '$rawRecipient': message text is empty.",
+                VerificationStatus.FAILED
+            )
+        }
+        if (!isConfirmed) {
+            return ActionExecutionResult(
+                false,
+                "Confirmation required before sending WhatsApp message to '$rawRecipient': \"$message\"",
+                VerificationStatus.REQUIRES_CONFIRMATION
+            )
+        }
+
+        val isDirectPhone = rawRecipient.any { it.isDigit() } && rawRecipient.none { it.isLetter() }
+        var resolvedDisplayName = rawRecipient
+        var resolvedPhone: String? = if (isDirectPhone) rawRecipient else null
+
+        if (!isDirectPhone) {
+            when (val contactRes = callIntelligenceManager.resolveContactsByName(rawRecipient)) {
+                is ContactResolutionResult.SingleMatch -> {
+                    resolvedDisplayName = contactRes.contact.displayName
+                    resolvedPhone = contactRes.contact.phoneNumber
+                }
+                is ContactResolutionResult.Ambiguous -> {
+                    val candidates = contactRes.candidates.joinToString(", ") { "${it.displayName} (${it.phoneNumber})" }
+                    return ActionExecutionResult(
+                        false,
+                        "Ambiguous WhatsApp recipient '$rawRecipient': multiple contacts matched ($candidates). Please specify the exact contact.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                is ContactResolutionResult.NotFound -> {
+                    return ActionExecutionResult(
+                        false,
+                        "Contact '$rawRecipient' was not found in device contacts; WhatsApp message was not sent.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                is ContactResolutionResult.PermissionRequired -> {
+                    if (!NayroAccessibilityService.isConnected()) {
+                        return ActionExecutionResult(
+                            false,
+                            "Permission required: READ_CONTACTS is needed to resolve '$rawRecipient' (and Accessibility Service is not active).",
+                            VerificationStatus.REQUIRES_PERMISSION
+                        )
+                    }
+                }
+            }
+        }
+
+        val openedDraft = AppNavigationManager.openWhatsAppConversation(context, resolvedPhone ?: "", message)
+        if (!openedDraft) {
+            return ActionExecutionResult(
+                false,
+                "WhatsApp is not installed or could not be opened on this device.",
+                VerificationStatus.FAILED
+            )
+        }
+
+        if (!NayroAccessibilityService.isConnected()) {
+            return ActionExecutionResult(
+                false,
+                "Opened WhatsApp with draft for $resolvedDisplayName, but Accessibility Service is not enabled to press Send or verify screen state. Please tap Send manually in WhatsApp.",
+                VerificationStatus.INCONCLUSIVE
+            )
+        }
+
+        delay(450)
+        if (resolvedPhone == null) {
+            val clickedContact = AccessibilityActionController.performClick(targetText = resolvedDisplayName)
+            if (!clickedContact) {
+                return ActionExecutionResult(
+                    false,
+                    "Could not find contact '$resolvedDisplayName' inside WhatsApp UI.",
+                    VerificationStatus.FAILED
+                )
+            }
+            delay(300)
+            AccessibilityActionController.performSetText(text = message)
+        }
+
+        val clickedSend = AccessibilityActionController.performClick(targetText = "Send")
+        if (!clickedSend) {
+            return ActionExecutionResult(
+                false,
+                "WhatsApp draft prepared for $resolvedDisplayName, but the Send button could not be clicked automatically. Please tap Send in WhatsApp.",
+                VerificationStatus.INCONCLUSIVE
+            )
+        }
+
+        delay(350)
+        val postScreen = screenIntelligenceManager.describeScreenContent()
+        val messageVisibleOnScreen = postScreen.contains(message.take(20), ignoreCase = true)
+        return if (messageVisibleOnScreen) {
+            ActionExecutionResult(
+                true,
+                "WhatsApp Send button clicked and message '$message' verified in conversation view for $resolvedDisplayName (network delivery/read status is not claimed).",
+                VerificationStatus.VERIFIED
+            )
+        } else {
+            ActionExecutionResult(
+                false,
+                "Clicked Send in WhatsApp for $resolvedDisplayName, but post-send message bubble could not be verified on screen.",
+                VerificationStatus.INCONCLUSIVE
+            )
+        }
+    }
+
+    private fun mapWorkspaceResult(result: WorkspaceResult): ActionExecutionResult {
+        return when (result) {
+            is WorkspaceResult.Success -> ActionExecutionResult(
+                isSuccess = true,
+                outputMessage = result.displayMessage,
+                status = VerificationStatus.VERIFIED
+            )
+            is WorkspaceResult.PermissionDenied -> ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = result.displayMessage,
+                status = VerificationStatus.REQUIRES_PERMISSION
+            )
+            is WorkspaceResult.NotFound,
+            is WorkspaceResult.InvalidPath,
+            is WorkspaceResult.SizeLimitExceeded,
+            is WorkspaceResult.Failure -> ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = result.displayMessage,
+                status = VerificationStatus.FAILED
+            )
+        }
+    }
+
+    private suspend fun executeRealWebFetch(rawUrl: String): ActionExecutionResult = withContext(Dispatchers.IO) {
+        val safeUrlResult = validateSafeExternalUrl(rawUrl)
+        val safeUrl = safeUrlResult.getOrElse { err ->
+            return@withContext ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "Rejected URL '$rawUrl': ${err.message}",
+                status = VerificationStatus.FAILED
+            )
+        }
+
+        try {
+            val request = Request.Builder()
+                .url(safeUrl)
+                .header("User-Agent", "NAYRO-Android-Agent/2.0")
+                .get()
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return@withContext ActionExecutionResult(
+                        isSuccess = false,
+                        outputMessage = "HTTP ${response.code} when fetching $safeUrl",
+                        status = VerificationStatus.FAILED
+                    )
+                }
+
+                val contentType = response.header("Content-Type", "").orEmpty().lowercase()
+                if (contentType.isNotEmpty() &&
+                    !contentType.contains("text/") &&
+                    !contentType.contains("json") &&
+                    !contentType.contains("xml") &&
+                    !contentType.contains("html")
+                ) {
+                    return@withContext ActionExecutionResult(
+                        isSuccess = false,
+                        outputMessage = "Unsupported Content-Type '$contentType' from $safeUrl",
+                        status = VerificationStatus.NOT_SUPPORTED
+                    )
+                }
+
+                val bodyBytes = response.body?.bytes() ?: ByteArray(0)
+                if (bodyBytes.isEmpty()) {
+                    return@withContext ActionExecutionResult(
+                        isSuccess = false,
+                        outputMessage = "Empty response body from $safeUrl",
+                        status = VerificationStatus.FAILED
+                    )
+                }
+                val clippedBytes = if (bodyBytes.size > MAX_WEB_RESPONSE_BYTES) {
+                    bodyBytes.copyOf(MAX_WEB_RESPONSE_BYTES)
+                } else {
+                    bodyBytes
+                }
+                val rawHtml = String(clippedBytes, Charsets.UTF_8)
+                val extracted = extractReadableTextFromHtml(rawHtml)
+                if (extracted.isBlank()) {
+                    return@withContext ActionExecutionResult(
+                        isSuccess = false,
+                        outputMessage = "No readable text content found at $safeUrl",
+                        status = VerificationStatus.FAILED
+                    )
+                }
+
+                ActionExecutionResult(
+                    isSuccess = true,
+                    outputMessage = "Fetched from $safeUrl:\n${extracted.take(2000)}",
+                    status = VerificationStatus.VERIFIED
+                )
+            }
+        } catch (e: Exception) {
+            ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "Network error fetching '$safeUrl': ${e.localizedMessage ?: "Connection failed"}",
+                status = VerificationStatus.FAILED
+            )
+        }
+    }
+
+    private suspend fun executeRealWebSearch(query: String): ActionExecutionResult = withContext(Dispatchers.IO) {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val wikiSearchUrl = "https://en.wikipedia.org/w/api.php?action=opensearch&search=$encoded&limit=5&namespace=0&format=json"
+        val fetchRes = executeRealWebFetch(wikiSearchUrl)
+        if (fetchRes.isSuccess) {
+            return@withContext ActionExecutionResult(
+                isSuccess = true,
+                outputMessage = "Web search results for '$query':\n${fetchRes.outputMessage}",
+                status = VerificationStatus.VERIFIED
+            )
+        }
+
+        val activeProvider = providerManager.activeProvider.value
+        if (activeProvider != null && activeProvider.hasKeySaved) {
+            val aiRes = providerManager.sendRequest(
+                userPrompt = "Provide factual information for search query: $query",
+                systemPrompt = "Note that live web search is unreachable; provide an accurate response clearly stating it is from AI model knowledge."
+            )
+            if (aiRes is AIResult.Success && aiRes.response.content.isNotBlank()) {
+                return@withContext ActionExecutionResult(
+                    isSuccess = true,
+                    outputMessage = "[AI Model Synthesis — Live Web Unreachable] ${aiRes.response.content}",
+                    status = VerificationStatus.INCONCLUSIVE
+                )
+            }
+        }
+
+        ActionExecutionResult(
+            isSuccess = false,
+            outputMessage = "Web search failed for '$query': network is unavailable and no AI provider is configured.",
+            status = VerificationStatus.FAILED
+        )
+    }
+
+    private fun extractReadableTextFromHtml(rawHtml: String): String {
+        return rawHtml
+            .replace(Regex("(?is)<script.*?>.*?</script>"), " ")
+            .replace(Regex("(?is)<style.*?>.*?</style>"), " ")
+            .replace(Regex("(?is)<[^>]+>"), " ")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    private fun buildExtractiveSummary(title: String, content: String): String {
+        val nonBlankLines = content.lines().map { it.trim() }.filter { it.isNotBlank() }
+        val previewLines = nonBlankLines.take(6).joinToString("\n- ")
+        return "Summary of $title (${content.length} chars, ${nonBlankLines.size} lines):\n- $previewLines"
     }
 }

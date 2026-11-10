@@ -117,4 +117,20 @@ object AppNavigationManager {
             false
         }
     }
+
+    fun openWhatsAppConversation(context: Context, phoneNumber: String, message: String = ""): Boolean {
+        return try {
+            val pkg = "com.whatsapp"
+            val uri = android.net.Uri.parse("https://api.whatsapp.com/send?phone=$phoneNumber&text=${android.net.Uri.encode(message)}")
+            val intent = Intent(Intent.ACTION_VIEW, uri).apply {
+                setPackage(pkg)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open WhatsApp: ${e.message}")
+            false
+        }
+    }
 }

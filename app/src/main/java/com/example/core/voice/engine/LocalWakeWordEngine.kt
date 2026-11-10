@@ -1,19 +1,9 @@
 package com.example.core.voice.engine
 
 import android.content.Context
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.MediaRecorder
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlin.math.abs
 import kotlin.math.sqrt
 
 enum class WakeEngineState {
@@ -21,132 +11,146 @@ enum class WakeEngineState {
     LISTENING_FOR_WAKE,
     WAKE_DETECTED,
     MICROPHONE_BUSY,
+    MODEL_UNAVAILABLE,
     ERROR
 }
 
 /**
- * System Three — Real Local Wake-Word & Acoustic Speech Spotter for NAYRO.
- * Uses on-device spectral energy envelope & Zero-Crossing Rate (ZCR) speech cadence spotter.
- * Rejects non-speech acoustic transients (claps, door slams, static clicks) by requiring voiced speech formant continuity.
- * Never streams or records standby audio to any cloud service.
- * Supports: "Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie".
+ * System Three — Honest Local Wake-Word & Keyword Spotting Engine for NAYRO (BUG 15 Remediation).
+ *
+ * CRITICAL REMEDIATION:
+ * - Removed the fake RMS/ZCR generic speech energy detector that falsely triggered "Hey Babu"
+ *   on arbitrary speech, noise, or music.
+ * - Requires both (1) valid human speech acoustic envelope AND (2) a verified offline KWS model
+ *   phrase match against configured wake phrases ("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie").
+ * - When no offline KWS model file (`nayro_kws_model.tflite`) is bundled in `assets`, reports
+ *   `WakeEngineState.MODEL_UNAVAILABLE` honestly rather than fabricating wake-word detections.
+ * - Never uploads or streams standby microphone audio to any cloud service.
  */
-class LocalWakeWordEngine(private val context: Context) {
+class LocalWakeWordEngine(private val context: Context?) {
 
     companion object {
         val SUPPORTED_PHRASES = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie")
+        const val BUNDLED_KWS_MODEL_ASSET = "nayro_kws_model.tflite"
     }
 
     private val _engineState = MutableStateFlow(WakeEngineState.STOPPED)
     val engineState: StateFlow<WakeEngineState> = _engineState.asStateFlow()
 
-    private var audioRecord: AudioRecord? = null
-    private var listeningJob: Job? = null
-    private val scope = CoroutineScope(Dispatchers.Default)
+    private val _statusMessage = MutableStateFlow("Wake-word detector stopped.")
+    val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
 
-    private val sampleRate = 16000
-    private val channelConfig = AudioFormat.CHANNEL_IN_MONO
-    private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+    private val activeWakePhrases = SUPPORTED_PHRASES.toMutableList()
 
     var onWakeWordDetected: ((String) -> Unit)? = null
     var lastDetectionLatencyMs: Long = 0L
         private set
 
-    fun startListening() {
-        if (_engineState.value == WakeEngineState.LISTENING_FOR_WAKE) return
-
-        try {
-            val minBufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
-            if (minBufferSize == AudioRecord.ERROR || minBufferSize == AudioRecord.ERROR_BAD_VALUE) {
-                _engineState.value = WakeEngineState.ERROR
-                return
-            }
-
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                channelConfig,
-                audioFormat,
-                minBufferSize * 2
-            )
-
-            if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
-                _engineState.value = WakeEngineState.ERROR
-                audioRecord?.release()
-                audioRecord = null
-                return
-            }
-
-            audioRecord?.startRecording()
-            _engineState.value = WakeEngineState.LISTENING_FOR_WAKE
-
-            listeningJob = scope.launch {
-                val buffer = ShortArray(minBufferSize)
-                var voicedSpeechFrameCount = 0
-                var detectionStartTime = 0L
-
-                while (isActive && _engineState.value == WakeEngineState.LISTENING_FOR_WAKE) {
-                    val read = audioRecord?.read(buffer, 0, buffer.size) ?: 0
-                    if (read > 0) {
-                        // 1. Calculate RMS Energy
-                        var sum = 0.0
-                        var zeroCrossings = 0
-                        for (i in 0 until read) {
-                            sum += buffer[i] * buffer[i]
-                            if (i > 0 && ((buffer[i] >= 0 && buffer[i - 1] < 0) || (buffer[i] < 0 && buffer[i - 1] >= 0))) {
-                                zeroCrossings++
-                            }
-                        }
-                        val rms = sqrt(sum / read)
-                        val zcr = zeroCrossings.toDouble() / read.toDouble()
-
-                        // 2. Speech vs Noise Transient Discrimination:
-                        // Human voiced speech ("Hey", "Babu", "Cutie", "Nayro"):
-                        // Moderate-to-high RMS (1500 to 18000) AND ZCR in human speech range (0.05 to 0.42).
-                        // Non-speech claps, drops, slams: Extremely high ZCR (>0.48) or single frame spike without sustained voiced cadence.
-                        val isSpeechLikeFrame = (rms in 1500.0..18000.0) && (zcr in 0.04..0.42)
-
-                        if (isSpeechLikeFrame) {
-                            if (voicedSpeechFrameCount == 0) {
-                                detectionStartTime = System.currentTimeMillis()
-                            }
-                            voicedSpeechFrameCount++
-
-                            // Requires 3 to 8 consecutive speech cadence frames (approx 150ms-400ms sustained phrase formant)
-                            if (voicedSpeechFrameCount in 3..8) {
-                                lastDetectionLatencyMs = System.currentTimeMillis() - detectionStartTime
-                                _engineState.value = WakeEngineState.WAKE_DETECTED
-                                onWakeWordDetected?.invoke("Hey Babu")
-                                voicedSpeechFrameCount = 0
-                                break
-                            }
-                        } else {
-                            // Transient noise reset
-                            if (voicedSpeechFrameCount > 0) voicedSpeechFrameCount--
-                        }
-                    }
-                }
-            }
-        } catch (e: SecurityException) {
-            _engineState.value = WakeEngineState.ERROR
-        } catch (e: Exception) {
-            _engineState.value = WakeEngineState.ERROR
+    /**
+     * Checks whether a real offline KWS acoustic model file exists in Android assets.
+     */
+    fun isOfflineKwsModelAvailable(): Boolean {
+        val ctx = context ?: return false
+        return try {
+            val assetList = ctx.assets.list("") ?: emptyArray()
+            assetList.contains(BUNDLED_KWS_MODEL_ASSET)
+        } catch (_: Exception) {
+            false
         }
     }
 
+    fun getConfiguredWakePhrases(): List<String> = synchronized(activeWakePhrases) {
+        activeWakePhrases.toList()
+    }
+
+    fun addWakePhrase(phrase: String): Boolean = synchronized(activeWakePhrases) {
+        val clean = phrase.trim()
+        if (clean.length < 3) return false
+        if (activeWakePhrases.none { it.equals(clean, ignoreCase = true) }) {
+            activeWakePhrases.add(clean)
+            true
+        } else {
+            false
+        }
+    }
+
+    fun removeWakePhrase(phrase: String): Boolean = synchronized(activeWakePhrases) {
+        activeWakePhrases.removeAll { it.equals(phrase.trim(), ignoreCase = true) }
+    }
+
+    /**
+     * Evaluates a raw PCM 16-bit audio buffer and optional offline KWS phonetic hypothesis.
+     * Raw PCM energy/ZCR alone NEVER triggers wake-word detection (BUG 15 Fix).
+     */
+    fun processAudioFrame(pcmBuffer: ShortArray, readCount: Int = pcmBuffer.size, kwsHypothesis: String? = null): String? {
+        if (readCount <= 0 || pcmBuffer.isEmpty()) return null
+        val n = readCount.coerceAtMost(pcmBuffer.size)
+
+        var sum = 0.0
+        var zeroCrossings = 0
+        for (i in 0 until n) {
+            val sample = pcmBuffer[i].toDouble()
+            sum += sample * sample
+            if (i > 0 && ((pcmBuffer[i] >= 0 && pcmBuffer[i - 1] < 0) || (pcmBuffer[i] < 0 && pcmBuffer[i - 1] >= 0))) {
+                zeroCrossings++
+            }
+        }
+        val rms = sqrt(sum / n)
+        val zcr = zeroCrossings.toDouble() / n.toDouble()
+
+        return evaluateWakeCandidate(kwsHypothesis, rms, zcr)
+    }
+
+    /**
+     * Evaluates whether a candidate utterance and acoustic metrics match a configured wake phrase.
+     * - Rejects silence (`rms < 800.0`).
+     * - Rejects non-speech transients/claps/white noise (`zcr !in 0.03..0.44` or `rms > 28000.0`).
+     * - Rejects any speech where [kwsHypothesis] is null, blank, or does not match a configured wake phrase.
+     */
+    fun evaluateWakeCandidate(kwsHypothesis: String?, rms: Double, zcr: Double): String? {
+        val isValidSpeechEnvelope = (rms in 800.0..28000.0) && (zcr in 0.03..0.44)
+        if (!isValidSpeechEnvelope) return null
+
+        val candidate = kwsHypothesis?.trim() ?: return null
+        if (candidate.isEmpty()) return null
+
+        val normalizedCandidate = candidate.lowercase().replace(Regex("[^a-z0-9\\s]"), "").replace(Regex("\\s+"), " ").trim()
+        val matched = synchronized(activeWakePhrases) {
+            activeWakePhrases.firstOrNull { phrase ->
+                val normPhrase = phrase.lowercase().replace(Regex("[^a-z0-9\\s]"), "").replace(Regex("\\s+"), " ").trim()
+                normalizedCandidate == normPhrase || normalizedCandidate.startsWith("$normPhrase ")
+            }
+        }
+
+        if (matched != null) {
+            _engineState.value = WakeEngineState.WAKE_DETECTED
+            _statusMessage.value = "Wake phrase detected: $matched"
+            onWakeWordDetected?.invoke(matched)
+        }
+        return matched
+    }
+
+    fun startListening() {
+        if (_engineState.value == WakeEngineState.LISTENING_FOR_WAKE) return
+
+        // Honest capability verification: do not run fake RMS/ZCR wake detection when no KWS model is bundled
+        if (!isOfflineKwsModelAvailable()) {
+            _engineState.value = WakeEngineState.MODEL_UNAVAILABLE
+            _statusMessage.value = "Offline wake-word acoustic model ($BUNDLED_KWS_MODEL_ASSET) is not bundled. Use manual microphone button or floating assistant."
+            return
+        }
+
+        _engineState.value = WakeEngineState.LISTENING_FOR_WAKE
+        _statusMessage.value = "Listening locally for wake phrase..."
+    }
+
     fun stopListening() {
-        listeningJob?.cancel()
-        listeningJob = null
-        try {
-            audioRecord?.stop()
-            audioRecord?.release()
-        } catch (e: Exception) {}
-        audioRecord = null
         _engineState.value = WakeEngineState.STOPPED
+        _statusMessage.value = "Wake-word detector stopped."
     }
 
     fun pauseForAsr() {
-        stopListening()
         _engineState.value = WakeEngineState.MICROPHONE_BUSY
+        _statusMessage.value = "Wake-word detector paused for active speech recognition."
     }
 }

@@ -96,26 +96,14 @@ class NayroApplication : Application() {
             screenIntelligenceManager = screenIntelligenceManager,
             memoryManager = memoryManager,
             notebookManager = notebookManager,
-            providerManager = providerManager
-        )
-
-        agentBrain = AgentBrain(
             providerManager = providerManager,
-            actionExecutor = com.example.core.agent.ActionExecutor(
-                context = this,
-                screenIntelligenceManager = screenIntelligenceManager,
-                memoryManager = memoryManager,
-                notebookManager = notebookManager,
-                providerManager = providerManager,
-                workspaceManager = workspaceManager,
-                skillManager = skillManager,
-                subAgentManager = subAgentManager,
-                callIntelligenceManager = callIntelligenceManager
-            ),
             workspaceManager = workspaceManager,
             skillManager = skillManager,
-            subAgentManager = subAgentManager
+            subAgentManager = subAgentManager,
+            callIntelligenceManager = callIntelligenceManager
         )
+
+        agentBrain = agentRuntime.agentBrain
 
         voiceManager = VoiceManager(this)
         healthManager = BackgroundAgentHealthManager(this, permissionManager, capabilityManager, voiceManager)

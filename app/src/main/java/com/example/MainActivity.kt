@@ -163,7 +163,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        voiceManager.destroy()
+        voiceManager.onActivityDestroyed()
     }
 }
 

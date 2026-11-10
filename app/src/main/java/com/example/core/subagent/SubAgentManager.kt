@@ -3,6 +3,7 @@ package com.example.core.subagent
 import com.example.core.agent.ActionExecutionResult
 import com.example.core.agent.ActionType
 import com.example.core.agent.AgentAction
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
 
 enum class SubAgentType(val displayName: String, val description: String) {
@@ -34,14 +35,24 @@ data class SubAgentTask(
     var status: SubAgentStatus = SubAgentStatus.IDLE,
     var assignedActions: List<ActionType> = emptyList(),
     var outputResult: String? = null,
+    val depth: Int = 0,
     val timestamp: Long = System.currentTimeMillis()
 )
 
+/**
+ * Bounded Sub-Agent Delegation Manager (BUG 12 Remediation).
+ * Enforces delegation depth limits, timeouts, and real tool execution rather than immediate fake completion.
+ */
 class SubAgentManager {
+
+    companion object {
+        const val MAX_DELEGATION_DEPTH = 2
+        const val DEFAULT_SUBAGENT_TIMEOUT_MS = 15_000L
+    }
 
     private val activeSubTasks = mutableListOf<SubAgentTask>()
 
-    fun delegateTask(agentType: SubAgentType, subGoal: String): SubAgentTask {
+    fun delegateTask(agentType: SubAgentType, subGoal: String, depth: Int = 0): SubAgentTask {
         val actions = when (agentType) {
             SubAgentType.RESEARCH -> listOf(ActionType.WEB_SEARCH, ActionType.FETCH_WEB_PAGE, ActionType.FILE_WRITE_TEXT)
             SubAgentType.BROWSER -> listOf(ActionType.FETCH_WEB_PAGE, ActionType.SUMMARIZE_WEB_CONTENT)
@@ -55,35 +66,168 @@ class SubAgentManager {
             SubAgentType.VERIFICATION -> listOf(ActionType.READ_SCREEN)
         }
 
+        val initialStatus = if (depth > MAX_DELEGATION_DEPTH || subGoal.isBlank()) {
+            SubAgentStatus.FAILED
+        } else {
+            SubAgentStatus.DELEGATED
+        }
+
+        val initialOutput = when {
+            depth > MAX_DELEGATION_DEPTH -> "Sub-agent delegation rejected: recursion depth $depth exceeds limit ($MAX_DELEGATION_DEPTH)."
+            subGoal.isBlank() -> "Sub-agent delegation rejected: subGoal cannot be empty."
+            else -> null
+        }
+
         val subTask = SubAgentTask(
             agentType = agentType,
             subGoal = subGoal,
-            status = SubAgentStatus.DELEGATED,
-            assignedActions = actions
+            status = initialStatus,
+            assignedActions = actions,
+            outputResult = initialOutput,
+            depth = depth
         )
-        activeSubTasks.add(subTask)
+        synchronized(activeSubTasks) {
+            activeSubTasks.add(subTask)
+        }
         return subTask
     }
 
-    fun completeSubTask(subTaskId: String, output: String) {
-        val index = activeSubTasks.indexOfFirst { it.subTaskId == subTaskId }
-        if (index != -1) {
-            val item = activeSubTasks[index]
-            activeSubTasks[index] = item.copy(status = SubAgentStatus.COMPLETED, outputResult = output)
+    /**
+     * Executes a delegated sub-task through the real action runner with recursion bounds and timeout.
+     */
+    suspend fun executeSubTask(
+        agentType: SubAgentType,
+        subGoal: String,
+        depth: Int = 0,
+        timeoutMs: Long = DEFAULT_SUBAGENT_TIMEOUT_MS,
+        actionRunner: suspend (AgentAction) -> ActionExecutionResult
+    ): SubAgentTask {
+        val task = delegateTask(agentType, subGoal, depth)
+        if (task.status == SubAgentStatus.FAILED) {
+            return task
         }
+
+        updateStatus(task.subTaskId, SubAgentStatus.RUNNING, null)
+
+        val concreteAction = buildConcreteSubAgentAction(task.subTaskId, agentType, subGoal, depth)
+        val execResult = withTimeoutOrNull(timeoutMs) {
+            actionRunner(concreteAction)
+        }
+
+        if (execResult == null) {
+            failSubTask(task.subTaskId, "Sub-agent (${agentType.displayName}) timed out after ${timeoutMs}ms.")
+        } else if (execResult.isSuccess) {
+            completeSubTask(task.subTaskId, execResult.outputMessage)
+        } else {
+            failSubTask(task.subTaskId, execResult.outputMessage)
+        }
+
+        return getSubTask(task.subTaskId) ?: task
+    }
+
+    private fun buildConcreteSubAgentAction(
+        subTaskId: String,
+        agentType: SubAgentType,
+        subGoal: String,
+        depth: Int
+    ): AgentAction {
+        return when (agentType) {
+            SubAgentType.RESEARCH -> AgentAction(
+                taskId = subTaskId,
+                actionType = ActionType.WEB_SEARCH,
+                target = subGoal,
+                parameters = mapOf("query" to subGoal, "depth" to (depth + 1).toString())
+            )
+            SubAgentType.BROWSER -> {
+                val isUrl = subGoal.startsWith("http://") || subGoal.startsWith("https://")
+                AgentAction(
+                    taskId = subTaskId,
+                    actionType = if (isUrl) ActionType.FETCH_WEB_PAGE else ActionType.WEB_SEARCH,
+                    target = subGoal,
+                    parameters = if (isUrl) mapOf("url" to subGoal) else mapOf("query" to subGoal)
+                )
+            }
+            SubAgentType.CODING -> AgentAction(
+                taskId = subTaskId,
+                actionType = ActionType.CODE_INSPECT_FILE,
+                target = subGoal.ifBlank { "SampleAgentModule.kt" },
+                parameters = mapOf("path" to subGoal.ifBlank { "SampleAgentModule.kt" })
+            )
+            SubAgentType.FILE_WORKSPACE -> AgentAction(
+                taskId = subTaskId,
+                actionType = ActionType.FILE_BROWSE,
+                parameters = mapOf("path" to ".")
+            )
+            SubAgentType.DOCUMENT -> AgentAction(
+                taskId = subTaskId,
+                actionType = ActionType.FILE_READ_TEXT,
+                target = subGoal.ifBlank { "NAYRO_Workspace_Guide.md" },
+                parameters = mapOf("filename" to subGoal.ifBlank { "NAYRO_Workspace_Guide.md" })
+            )
+            SubAgentType.PRODUCTIVITY -> {
+                val isMath = subGoal.any { it.isDigit() } && (subGoal.contains("+") || subGoal.contains("-") || subGoal.contains("*") || subGoal.contains("/"))
+                if (isMath) {
+                    AgentAction(
+                        taskId = subTaskId,
+                        actionType = ActionType.CALCULATE_LOCAL,
+                        parameters = mapOf("expression" to subGoal)
+                    )
+                } else {
+                    AgentAction(
+                        taskId = subTaskId,
+                        actionType = ActionType.SAVE_NOTE,
+                        parameters = mapOf("content" to subGoal)
+                    )
+                }
+            }
+            SubAgentType.SCREEN_ANALYSIS, SubAgentType.VERIFICATION -> AgentAction(
+                taskId = subTaskId,
+                actionType = ActionType.READ_SCREEN
+            )
+            SubAgentType.ANDROID_AUTOMATION -> AgentAction(
+                taskId = subTaskId,
+                actionType = ActionType.LAUNCH_APP,
+                target = subGoal
+            )
+            SubAgentType.PLANNING -> AgentAction(
+                taskId = subTaskId,
+                actionType = ActionType.QUERY_LLM,
+                parameters = mapOf("prompt" to subGoal)
+            )
+        }
+    }
+
+    private fun updateStatus(subTaskId: String, status: SubAgentStatus, output: String?) {
+        synchronized(activeSubTasks) {
+            val index = activeSubTasks.indexOfFirst { it.subTaskId == subTaskId }
+            if (index != -1) {
+                val item = activeSubTasks[index]
+                activeSubTasks[index] = item.copy(status = status, outputResult = output ?: item.outputResult)
+            }
+        }
+    }
+
+    fun completeSubTask(subTaskId: String, output: String) {
+        updateStatus(subTaskId, SubAgentStatus.COMPLETED, output)
     }
 
     fun failSubTask(subTaskId: String, errorMsg: String) {
-        val index = activeSubTasks.indexOfFirst { it.subTaskId == subTaskId }
-        if (index != -1) {
-            val item = activeSubTasks[index]
-            activeSubTasks[index] = item.copy(status = SubAgentStatus.FAILED, outputResult = errorMsg)
-        }
+        updateStatus(subTaskId, SubAgentStatus.FAILED, errorMsg)
     }
 
-    fun getActiveSubTasks(): List<SubAgentTask> = activeSubTasks.toList()
+    fun cancelSubTask(subTaskId: String) {
+        updateStatus(subTaskId, SubAgentStatus.CANCELLED, "Cancelled by user or runtime.")
+    }
 
-    fun clearSubTasks() {
+    fun getSubTask(subTaskId: String): SubAgentTask? = synchronized(activeSubTasks) {
+        activeSubTasks.find { it.subTaskId == subTaskId }
+    }
+
+    fun getActiveSubTasks(): List<SubAgentTask> = synchronized(activeSubTasks) {
+        activeSubTasks.toList()
+    }
+
+    fun clearSubTasks() = synchronized(activeSubTasks) {
         activeSubTasks.clear()
     }
 }
