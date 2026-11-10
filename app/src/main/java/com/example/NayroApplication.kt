@@ -1,16 +1,21 @@
 package com.example
 
 import android.app.Application
-import com.example.core.screen.ScreenIntelligenceManager
+import com.example.core.agent.AgentBrain
 import com.example.core.agent.AgentRuntime
 import com.example.core.capability.CapabilityManager
 import com.example.core.memory.MemoryManager
 import com.example.core.memory.NotebookManager
 import com.example.core.permission.PermissionManager
 import com.example.core.provider.AIProviderManager
+import com.example.core.screen.ScreenIntelligenceManager
 import com.example.core.security.EncryptedStorageManager
 import com.example.core.service.BackgroundAgentHealthManager
+import com.example.core.skills.SkillManager
+import com.example.core.subagent.SubAgentManager
+import com.example.core.telephony.CallIntelligenceManager
 import com.example.core.voice.VoiceManager
+import com.example.core.workspace.WorkspaceManager
 import com.example.data.local.NayroDatabase
 import com.example.data.repository.NayroRepository
 import kotlinx.coroutines.CoroutineScope
@@ -45,7 +50,17 @@ class NayroApplication : Application() {
         private set
     lateinit var notebookManager: NotebookManager
         private set
+    lateinit var workspaceManager: WorkspaceManager
+        private set
+    lateinit var skillManager: SkillManager
+        private set
+    lateinit var subAgentManager: SubAgentManager
+        private set
+    lateinit var callIntelligenceManager: CallIntelligenceManager
+        private set
     lateinit var agentRuntime: AgentRuntime
+        private set
+    lateinit var agentBrain: AgentBrain
         private set
     lateinit var voiceManager: VoiceManager
         private set
@@ -68,6 +83,10 @@ class NayroApplication : Application() {
         val screenIntelligenceManager = ScreenIntelligenceManager(this)
         memoryManager = MemoryManager(repository)
         notebookManager = NotebookManager(repository)
+        workspaceManager = WorkspaceManager(this)
+        skillManager = SkillManager()
+        subAgentManager = SubAgentManager()
+        callIntelligenceManager = CallIntelligenceManager(this)
 
         agentRuntime = AgentRuntime(
             context = this,
@@ -78,6 +97,24 @@ class NayroApplication : Application() {
             memoryManager = memoryManager,
             notebookManager = notebookManager,
             providerManager = providerManager
+        )
+
+        agentBrain = AgentBrain(
+            providerManager = providerManager,
+            actionExecutor = com.example.core.agent.ActionExecutor(
+                context = this,
+                screenIntelligenceManager = screenIntelligenceManager,
+                memoryManager = memoryManager,
+                notebookManager = notebookManager,
+                providerManager = providerManager,
+                workspaceManager = workspaceManager,
+                skillManager = skillManager,
+                subAgentManager = subAgentManager,
+                callIntelligenceManager = callIntelligenceManager
+            ),
+            workspaceManager = workspaceManager,
+            skillManager = skillManager,
+            subAgentManager = subAgentManager
         )
 
         voiceManager = VoiceManager(this)

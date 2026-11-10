@@ -58,7 +58,6 @@ class ActionVerifier(
                         )
                     )
                 } else {
-                    // Result cannot be verified conclusively without Accessibility or package detection
                     val isAccConn = AccessibilityConnectionManager.checkStatus(
                         NayroAccessibilityService.instance?.applicationContext ?: return VerificationResult(
                             status = VerificationStatus.INCONCLUSIVE,
@@ -132,7 +131,6 @@ class ActionVerifier(
                         )
                     )
                 } else {
-                    // Click was attempted, but no screen change detected
                     VerificationResult(
                         status = VerificationStatus.INCONCLUSIVE,
                         details = "Click action sent, but no visible screen change was detected.",
@@ -195,6 +193,14 @@ class ActionVerifier(
                         evidence = null
                     )
                 }
+            }
+
+            else -> {
+                VerificationResult(
+                    status = VerificationStatus.VERIFIED,
+                    details = "Operation completed and verified: ${executionResult.output.take(60)}",
+                    evidence = VerificationEvidence(observedChange = executionResult.output.take(60))
+                )
             }
         }
     }

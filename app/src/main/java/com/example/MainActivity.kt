@@ -72,6 +72,7 @@ class MainActivity : ComponentActivity() {
     private var pendingFloatingPrompt: String? = null
 
     // Single permission request launcher
+    @Suppress("InvalidFragmentVersionForActivityResult")
     private val requestSinglePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { _ ->
@@ -467,6 +468,33 @@ fun NayroAppContent(
                             }
                         }
                     }
+                )
+
+                Screen.ToolsCatalog -> com.example.ui.tools.ToolsCatalogScreen()
+
+                Screen.SkillsHub -> com.example.ui.skills.SkillsHubScreen(
+                    skillManager = (context.applicationContext as NayroApplication).skillManager,
+                    onExecuteSkill = { skillId ->
+                        processUserPrompt("Execute procedural skill: $skillId")
+                    }
+                )
+
+                Screen.SubAgents -> com.example.ui.subagent.SubAgentManagerScreen(
+                    subAgentManager = (context.applicationContext as NayroApplication).subAgentManager,
+                    onDelegate = { agentType, subGoal ->
+                        val app = (context.applicationContext as NayroApplication)
+                        app.subAgentManager.delegateTask(agentType, subGoal)
+                        processUserPrompt("Delegate sub-task to ${agentType.displayName}: $subGoal")
+                    }
+                )
+
+                Screen.Workspace -> com.example.ui.workspace.WorkspaceScreen(
+                    workspaceManager = (context.applicationContext as NayroApplication).workspaceManager
+                )
+
+                Screen.ResearchAgent -> com.example.ui.research.ResearchAgentScreen(
+                    providerManager = providerManager,
+                    workspaceManager = (context.applicationContext as NayroApplication).workspaceManager
                 )
 
                 Screen.Onboarding -> OnboardingScreen(
