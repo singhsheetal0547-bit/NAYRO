@@ -1,0 +1,51 @@
+{
+  "modelFormat": "NAYRO_LOCAL_KWS_MFCC_DTW_V2",
+  "sampleRateHz": 16000,
+  "frameLengthSamples": 512,
+  "frameStepSamples": 256,
+  "numMfccCoefficients": 13,
+  "preEmphasisAlpha": 0.97,
+  "defaultConfidenceThreshold": 0.72,
+  "wakePhraseTemplates": [
+    {
+      "phrase": "Hi Babu",
+      "phonemeSequence": ["HH", "AY", "B", "AA", "B", "UW"],
+      "expectedDurationMs": [420, 1250],
+      "mfccCentroid": [12.4, -3.2, 4.1, -1.8, 2.5, -0.9, 1.4, -0.6, 0.8, -0.3, 0.5, -0.2, 0.3],
+      "voicedRatioRange": [0.35, 0.92],
+      "zcrRange": [0.04, 0.38]
+    },
+    {
+      "phrase": "Hey Babu",
+      "phonemeSequence": ["HH", "EY", "B", "AA", "B", "UW"],
+      "expectedDurationMs": [440, 1300],
+      "mfccCentroid": [13.1, -2.9, 3.8, -1.5, 2.2, -1.1, 1.3, -0.5, 0.7, -0.4, 0.4, -0.2, 0.3],
+      "voicedRatioRange": [0.35, 0.92],
+      "zcrRange": [0.04, 0.38]
+    },
+    {
+      "phrase": "Hi Nayro",
+      "phonemeSequence": ["HH", "AY", "N", "AY", "R", "OW"],
+      "expectedDurationMs": [450, 1350],
+      "mfccCentroid": [11.8, -3.5, 4.4, -2.1, 2.7, -0.8, 1.6, -0.7, 0.9, -0.3, 0.6, -0.2, 0.4],
+      "voicedRatioRange": [0.38, 0.94],
+      "zcrRange": [0.04, 0.36]
+    },
+    {
+      "phrase": "Hey Nayro",
+      "phonemeSequence": ["HH", "EY", "N", "AY", "R", "OW"],
+      "expectedDurationMs": [460, 1380],
+      "mfccCentroid": [12.2, -3.1, 4.0, -1.9, 2.4, -1.0, 1.5, -0.6, 0.8, -0.4, 0.5, -0.2, 0.3],
+      "voicedRatioRange": [0.38, 0.94],
+      "zcrRange": [0.04, 0.36]
+    },
+    {
+      "phrase": "Hey Cutie",
+      "phonemeSequence": ["HH", "EY", "K", "Y", "UW", "T", "IY"],
+      "expectedDurationMs": [450, 1350],
+      "mfccCentroid": [11.5, -2.4, 4.8, -1.4, 2.9, -1.2, 1.7, -0.8, 1.0, -0.5, 0.6, -0.3, 0.4],
+      "voicedRatioRange": [0.32, 0.90],
+      "zcrRange": [0.05, 0.42]
+    }
+  ]
+}

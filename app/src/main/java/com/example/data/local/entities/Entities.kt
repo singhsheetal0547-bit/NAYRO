@@ -73,5 +73,19 @@ data class TaskHistoryEntity(
     val stepsCount: Int,
     val resultSummary: String,
     val durationMs: Long = 0L,
-    val timestamp: Long = System.currentTimeMillis()
+    val timestamp: Long = System.currentTimeMillis(),
+    // Section 17 Durable Task Persistence & Recovery Metadata
+    val conversationContext: String = "",
+    val planJson: String = "",
+    val currentStepIndex: Int = 0,
+    val completedStepsJson: String = "[]",
+    val pendingStepsJson: String = "[]",
+    val toolNames: String = "",
+    val toolArgumentsJson: String = "{}",
+    val toolResultsJson: String = "[]",
+    val verificationEvidenceJson: String = "",
+    val retryCount: Int = 0,
+    val failureReason: String = "",
+    val recoveryMetadata: String = "",
+    val updatedAt: Long = System.currentTimeMillis()
 )

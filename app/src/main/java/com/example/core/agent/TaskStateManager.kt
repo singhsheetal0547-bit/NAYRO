@@ -10,21 +10,25 @@ class TaskStateManager {
         val current = task.state
 
         val isValid = when (nextState) {
-            TaskState.PENDING -> current == TaskState.CREATED
-            TaskState.UNDERSTANDING -> current == TaskState.CREATED || current == TaskState.PENDING || current == TaskState.RETRYING || current == TaskState.RECOVERING
-            TaskState.PLANNING -> current == TaskState.UNDERSTANDING || current == TaskState.CREATED || current == TaskState.PENDING
-            TaskState.VALIDATING -> current == TaskState.PLANNING
-            TaskState.WAITING_FOR_PERMISSION -> current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.VERIFYING
-            TaskState.WAITING_FOR_CONFIRMATION -> current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.VERIFYING
+            TaskState.IDLE -> true
+            TaskState.LISTENING -> current == TaskState.IDLE || current == TaskState.CREATED || current == TaskState.WAITING_FOR_USER_INPUT
+            TaskState.PENDING -> current == TaskState.CREATED || current == TaskState.IDLE || current == TaskState.LISTENING
+            TaskState.UNDERSTANDING -> current == TaskState.CREATED || current == TaskState.IDLE || current == TaskState.LISTENING || current == TaskState.PENDING || current == TaskState.RETRYING || current == TaskState.RECOVERING
+            TaskState.REASONING -> current == TaskState.UNDERSTANDING || current == TaskState.CREATED || current == TaskState.PENDING
+            TaskState.PLANNING -> current == TaskState.UNDERSTANDING || current == TaskState.REASONING || current == TaskState.CREATED || current == TaskState.PENDING || current == TaskState.REPLANNING
+            TaskState.VALIDATING -> current == TaskState.PLANNING || current == TaskState.REPLANNING
+            TaskState.WAITING_FOR_PERMISSION, TaskState.AWAITING_PERMISSION -> current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.VERIFYING
+            TaskState.WAITING_FOR_CONFIRMATION, TaskState.AWAITING_CONFIRMATION -> current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.VERIFYING
             TaskState.WAITING_FOR_USER_INPUT -> current == TaskState.UNDERSTANDING || current == TaskState.PLANNING || current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING
-            TaskState.READY -> current == TaskState.VALIDATING || current == TaskState.WAITING_FOR_CONFIRMATION || current == TaskState.WAITING_FOR_PERMISSION || current == TaskState.WAITING_FOR_USER_INPUT
-            TaskState.RUNNING -> current == TaskState.READY || current == TaskState.PLANNING || current == TaskState.PAUSED || current == TaskState.RECOVERING
-            TaskState.EXECUTING -> current == TaskState.READY || current == TaskState.RUNNING || current == TaskState.VERIFYING || current == TaskState.OBSERVING || current == TaskState.PAUSED || current == TaskState.RETRYING || current == TaskState.RECOVERING
+            TaskState.READY -> current == TaskState.VALIDATING || current == TaskState.WAITING_FOR_CONFIRMATION || current == TaskState.AWAITING_CONFIRMATION || current == TaskState.WAITING_FOR_PERMISSION || current == TaskState.AWAITING_PERMISSION || current == TaskState.WAITING_FOR_USER_INPUT
+            TaskState.RUNNING -> current == TaskState.READY || current == TaskState.PLANNING || current == TaskState.PAUSED || current == TaskState.RECOVERING || current == TaskState.REPLANNING
+            TaskState.EXECUTING -> current == TaskState.READY || current == TaskState.RUNNING || current == TaskState.VERIFYING || current == TaskState.OBSERVING || current == TaskState.PAUSED || current == TaskState.RETRYING || current == TaskState.RECOVERING || current == TaskState.REPLANNING
             TaskState.OBSERVING -> current == TaskState.EXECUTING || current == TaskState.RUNNING
             TaskState.VERIFYING -> current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.OBSERVING
-            TaskState.RECOVERING -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.FAILED || current == TaskState.INCONCLUSIVE
+            TaskState.REPLANNING -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.FAILED || current == TaskState.INCONCLUSIVE
+            TaskState.RECOVERING -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.FAILED || current == TaskState.INCONCLUSIVE || current == TaskState.REPLANNING
             TaskState.PAUSED -> current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.READY
-            TaskState.RETRYING -> current == TaskState.VERIFYING || current == TaskState.FAILED || current == TaskState.PAUSED || current == TaskState.INCONCLUSIVE || current == TaskState.RECOVERING
+            TaskState.RETRYING -> current == TaskState.VERIFYING || current == TaskState.FAILED || current == TaskState.PAUSED || current == TaskState.INCONCLUSIVE || current == TaskState.RECOVERING || current == TaskState.REPLANNING
             TaskState.COMPLETED -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.RUNNING
             TaskState.PARTIALLY_COMPLETED -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.RUNNING
             TaskState.INCONCLUSIVE -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.RUNNING

@@ -6,11 +6,16 @@ enum class UserIntentType {
     YOUTUBE_SEARCH,
     SETTINGS_NAVIGATE,
     MESSAGE_DRAFT,
+    WHATSAPP_READ,
     PHONE_CALL,
     FLASHLIGHT_CONTROL,
     NOTIFICATION_READ,
     FILE_FIND,
     REMINDER_CREATE,
+    CALENDAR_READ,
+    CALENDAR_CREATE,
+    CALENDAR_UPDATE,
+    CALENDAR_DELETE,
     NOTE_CREATE,
     MEMORY_SAVE,
     LOCAL_TIME,
@@ -46,11 +51,65 @@ object TaskClassifier {
         }
 
         // 2. Note Create Intent
-        if (lower.startsWith("note banao") || lower.startsWith("note likho") || lower.startsWith("create note") || lower.startsWith("take a note")) {
-            val content = trimmed.replaceFirst(Regex("^(?i)(note banao:|note banao|note likho:|note likho|create note:|create note|take a note:)\\s*"), "")
+        if (lower.startsWith("note banao") || lower.startsWith("note likho") || lower.startsWith("create note") || lower.startsWith("take a note") || lower.startsWith("save a note") || lower.startsWith("save note")) {
+            val content = trimmed.replaceFirst(Regex("^(?i)(note banao:|note banao|note likho:|note likho|create note:|create note|take a note:|save a note:|save a note|save note:|save note)\\s*"), "")
             return ResolvedIntent(
                 type = UserIntentType.NOTE_CREATE,
                 searchQueryOrContent = content.ifBlank { "Untitled Note" },
+                rawPrompt = prompt
+            )
+        }
+
+        // 2a. Calendar Delete / Update / Create / Read Intents (Section 10)
+        if (lower.contains("delete") && (lower.contains("calendar") || lower.contains("event") || lower.contains("meeting")) && Regex("\\d+").containsMatchIn(lower)) {
+            val eventId = Regex("\\d+").find(lower)?.value ?: ""
+            return ResolvedIntent(
+                type = UserIntentType.CALENDAR_DELETE,
+                targetAppOrEntity = eventId,
+                rawPrompt = prompt
+            )
+        }
+
+        if ((lower.contains("update") || lower.contains("reschedule")) && (lower.contains("calendar") || lower.contains("event")) && Regex("\\d+").containsMatchIn(lower)) {
+            val eventId = Regex("\\d+").find(lower)?.value ?: ""
+            val newTitle = Regex("(?i)\\bto\\s+(.+)$").find(trimmed)?.groupValues?.getOrNull(1)?.trim()?.removeSuffix(".") ?: "Updated Event"
+            return ResolvedIntent(
+                type = UserIntentType.CALENDAR_UPDATE,
+                targetAppOrEntity = eventId,
+                searchQueryOrContent = newTitle,
+                rawPrompt = prompt
+            )
+        }
+
+        if ((lower.startsWith("create calendar event") || lower.startsWith("schedule a meeting") || lower.startsWith("schedule meeting") || lower.startsWith("add calendar event")) &&
+            !lower.contains("check") && !lower.contains("read")
+        ) {
+            val title = trimmed
+                .replaceFirst(Regex("^(?i)(create calendar event|schedule a meeting|schedule meeting|add calendar event)\\s*(:|for|called|titled)?\\s*"), "")
+                .trim()
+                .removeSuffix(".")
+                .ifBlank { "Scheduled Meeting" }
+            return ResolvedIntent(
+                type = UserIntentType.CALENDAR_CREATE,
+                searchQueryOrContent = title,
+                rawPrompt = prompt
+            )
+        }
+
+        if ((lower.contains("calendar") || lower.contains("meeting") || lower.contains("meetings") || lower.contains("schedule") || lower.contains("agenda")) &&
+            (lower.contains("check") || lower.contains("read") || lower.contains("show") || lower.contains("what") || lower.contains("tell") || lower.contains("batao") || lower.contains("dekho") || lower.contains("upcoming") || lower.contains("tomorrow") || lower.contains("today") || lower.contains("kal")) &&
+            !lower.contains("conversation") && !lower.contains("whatsapp")
+        ) {
+            val dateQuery = when {
+                lower.contains("day after tomorrow") || lower.contains("parso") -> "day after tomorrow"
+                lower.contains("tomorrow") || lower.contains("kal") -> "tomorrow"
+                lower.contains("today") || lower.contains("aaj") -> "today"
+                else -> "upcoming"
+            }
+            return ResolvedIntent(
+                type = UserIntentType.CALENDAR_READ,
+                targetAppOrEntity = dateQuery,
+                searchQueryOrContent = dateQuery,
                 rawPrompt = prompt
             )
         }
@@ -139,7 +198,25 @@ object TaskClassifier {
             }
         }
 
-        // 5. Message Draft Intent (supports single-turn, multi-clause "Open WhatsApp, find Rahul, send him a message that...", and short "Message Rahul")
+        // 4c. WhatsApp Conversation Read / Summarize / Search Intent (Section 8)
+        if ((lower.contains("conversation") || (lower.contains("whatsapp") && (lower.contains("summarize") || lower.contains("read") || lower.contains("search")))) &&
+            (lower.contains("summarize") || lower.contains("visible") || lower.contains("recent messages") || lower.contains("search for the conversation"))
+        ) {
+            val withMatch = Regex("(?i)\\bconversation\\s+with\\s+([a-zA-Z0-9_]+)").find(trimmed)
+            val aboutMatch = Regex("(?i)\\bconversation\\s+about\\s+(.+)$").find(trimmed)
+            val query = withMatch?.groupValues?.getOrNull(1)?.trim()
+                ?: aboutMatch?.groupValues?.getOrNull(1)?.trim()?.removeSuffix(".")
+                ?: trimmed
+            return ResolvedIntent(
+                type = UserIntentType.WHATSAPP_READ,
+                targetAppOrEntity = "com.whatsapp",
+                searchQueryOrContent = query,
+                rawPrompt = prompt
+            )
+        }
+
+        // 5. Message Draft Intent (supports single-turn, multi-clause "Open WhatsApp, find Rahul, send him a message that...",
+        // "message Rahul that I will attend tomorrow's meeting", "send Rahul a message saying I will arrive tomorrow", and short "Message Rahul")
         val isShortMessageCmd = Regex("^(?i)(message|msg|text)\\s+([a-zA-Z0-9_]+)\\.?$").find(trimmed)
         if (isShortMessageCmd != null) {
             val shortRecipient = isShortMessageCmd.groupValues[2]
@@ -152,22 +229,57 @@ object TaskClassifier {
             )
         }
 
+        val directMessageThat = Regex("(?i)(?:open\\s+whatsapp\\s*,?\\s*)?(?:and\\s+)?(?:message|msg|text)\\s+([a-zA-Z0-9_]+)\\s+(?:that|saying)\\s+(.+)$").find(trimmed)
+        if (directMessageThat != null) {
+            val rec = directMessageThat.groupValues[1].trim()
+            val body = directMessageThat.groupValues[2].trim().removeSuffix(".")
+            return ResolvedIntent(
+                type = UserIntentType.MESSAGE_DRAFT,
+                targetAppOrEntity = "com.whatsapp",
+                recipient = rec,
+                searchQueryOrContent = body,
+                rawPrompt = prompt
+            )
+        }
+
+        val sendPersonMessageSaying = Regex("(?i)(?:open\\s+whatsapp\\s*,?\\s*)?(?:and\\s+)?send\\s+([a-zA-Z0-9_]+)\\s+a\\s+(?:whatsapp\\s+)?(?:message|msg)\\s+(?:saying|that)\\s+(.+)$").find(trimmed)
+        if (sendPersonMessageSaying != null) {
+            val rawRec = sendPersonMessageSaying.groupValues[1].trim()
+            val rec = if (rawRec.equals("him", ignoreCase = true) || rawRec.equals("her", ignoreCase = true)) {
+                Regex("(?i)\\bfind\\s+([a-zA-Z0-9_]+)\\b").find(trimmed)?.groupValues?.getOrNull(1)?.trim() ?: rawRec
+            } else {
+                rawRec
+            }
+            val body = sendPersonMessageSaying.groupValues[2].trim().removeSuffix(".")
+            return ResolvedIntent(
+                type = UserIntentType.MESSAGE_DRAFT,
+                targetAppOrEntity = "com.whatsapp",
+                recipient = rec,
+                searchQueryOrContent = body,
+                rawPrompt = prompt
+            )
+        }
+
         if ((lower.contains("message") || lower.contains("sandesh") || lower.contains("msg")) &&
-            (lower.contains("likho") || lower.contains("write") || lower.contains("draft") || lower.contains("bhejo") || lower.contains("bhejna") || lower.contains("send"))
+            (lower.contains("likho") || lower.contains("write") || lower.contains("draft") || lower.contains("bhejo") || lower.contains("bhejna") || lower.contains("send") || lower.contains("saying") || lower.contains("that"))
         ) {
             var recipient = "Contact"
             var messageContent = ""
 
-            // Extract recipient ("find Rahul", "Rahul ko", "to Rahul", "message Rahul")
+            // Extract recipient ("find Rahul", "Rahul ko", "to Rahul", "message Rahul", "send Rahul")
             val findMatch = Regex("(?i)\\bfind\\s+([a-zA-Z0-9_]+)\\b").find(trimmed)
+            val msgTargetMatch = Regex("(?i)\\b(?:message|msg|send)\\s+([a-zA-Z0-9_]+)\\b").find(trimmed)
             val recipientMatch = findMatch
                 ?: Regex("(?i)(?:aur|for|to)?\\s*([a-zA-Z0-9_]+)\\s*(?:ke liye|ko)\\s*(?:whatsapp\\s*)?(?:par\\s*)?(?:message|msg|sandesh)").find(trimmed)
                 ?: Regex("(?i)(?:message|msg|sandesh)\\s*(?:to|bhejo|bhejna|send)\\s*([a-zA-Z0-9_]+)").find(trimmed)
+                ?: msgTargetMatch
             if (recipientMatch != null) {
                 val groupVal = if (recipientMatch.groupValues.size > 1) recipientMatch.groupValues[1] else ""
                 if (groupVal.isNotBlank() &&
                     !groupVal.equals("message", ignoreCase = true) &&
                     !groupVal.equals("msg", ignoreCase = true) &&
+                    !groupVal.equals("a", ignoreCase = true) &&
+                    !groupVal.equals("the", ignoreCase = true) &&
                     !groupVal.equals("whatsapp", ignoreCase = true) &&
                     !groupVal.equals("him", ignoreCase = true) &&
                     !groupVal.equals("her", ignoreCase = true)
@@ -176,9 +288,10 @@ object TaskClassifier {
                 }
             }
 
-            // Extract message body if colon or "that <message>" is used
+            // Extract message body if colon or "that/saying <message>" is used
             val splitByColon = trimmed.split(":", limit = 2)
-            val thatMatch = Regex("(?i)\\b(?:message|msg)\\s+that\\s+(.+)$").find(trimmed)
+            val thatMatch = Regex("(?i)\\b(?:message|msg)\\s+(?:that|saying)\\s+(.+)$").find(trimmed)
+                ?: Regex("(?i)\\b(?:saying|that)\\s+(.+)$").find(trimmed)
             if (splitByColon.size > 1) {
                 messageContent = splitByColon[1].trim()
             } else if (thatMatch != null) {
@@ -275,3 +388,4 @@ object TaskClassifier {
         )
     }
 }
+

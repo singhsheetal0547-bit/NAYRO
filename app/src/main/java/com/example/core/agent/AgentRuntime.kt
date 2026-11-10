@@ -39,11 +39,13 @@ data class AgentExecutionSummary(
     val verificationStatus: VerificationStatus = VerificationStatus.VERIFIED
 )
 
+typealias UnifiedAgentRuntime = AgentRuntime
+
 /**
- * Authoritative Agent Runtime Engine for NAYRO (BUG 01, BUG 02, BUG 05, BUG 06 Remediation + Parts 2–11).
+ * Authoritative Agent Runtime Engine for NAYRO (Sections 4, 17, 18).
  * Unifies AgentBrain planning/reasoning with ConversationContinuityManager multi-turn slot filling,
  * AutonomyPolicyManager (Levels 1-5), permission validation, R0-R4 risk confirmation,
- * ActionExecutor execution, and strict ActionVerifier state verification.
+ * ActionExecutor execution, strict ActionVerifier state verification, and durable step checkpointing.
  * Never marks a task COMPLETED or isSuccess=true when any step is FAILED, INCONCLUSIVE, or NOT_SUPPORTED.
  */
 class AgentRuntime(
@@ -63,7 +65,7 @@ class AgentRuntime(
     val continuityManager: ConversationContinuityManager = ConversationContinuityManager(),
     val workflowEngine: CrossAppWorkflowEngine = CrossAppWorkflowEngine(),
     val proactiveEngine: ProactiveIntelligenceEngine = ProactiveIntelligenceEngine(),
-    val automationEngine: AutomationEngine = AutomationEngine(),
+    val automationEngine: AutomationEngine = AutomationEngine(context),
     val operatingStateManager: DeviceOperatingStateManager = DeviceOperatingStateManager(context)
 ) {
 
@@ -100,15 +102,47 @@ class AgentRuntime(
 
     private val actionVerifier = ActionVerifier(screenIntelligenceManager)
 
+    private val completedSideEffectSignatures = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
     @Volatile
     private var isTaskCancelled = false
+
+    @Volatile
+    private var isTaskPaused = false
 
     fun setState(newState: AgentState) {
         _currentState.value = newState
     }
 
+    fun isPaused(): Boolean = isTaskPaused
+
+    fun pauseCurrentTask() {
+        isTaskPaused = true
+        _currentTask.value?.let { task ->
+            stateManager.transition(task, TaskState.PAUSED, "Task paused by user.")
+        }
+    }
+
+    fun resumeCurrentTask() {
+        isTaskPaused = false
+        _currentTask.value?.let { task ->
+            if (task.state == TaskState.PAUSED) {
+                stateManager.transition(task, TaskState.EXECUTING, "Task resumed by user.")
+            }
+        }
+    }
+
+    fun hasSideEffectAlreadyExecuted(taskId: String, actionId: String): Boolean {
+        return completedSideEffectSignatures.contains("$taskId:$actionId")
+    }
+
+    fun markSideEffectExecuted(taskId: String, actionId: String) {
+        completedSideEffectSignatures.add("$taskId:$actionId")
+    }
+
     fun cancelCurrentTask() {
         isTaskCancelled = true
+        isTaskPaused = false
         agentBrain.cancelActiveLoop()
         workflowEngine.cancelAllActiveWorkflows()
         confirmationManager.clear()
@@ -125,17 +159,30 @@ class AgentRuntime(
     }
 
     /**
-     * Startup Recovery: Inspects incomplete tasks from previous sessions and marks them
-     * cleanly interrupted without blindly re-executing side-effect actions.
+     * Startup Recovery (Section 17): Inspects incomplete tasks from previous sessions, restores
+     * completed step signatures so non-idempotent side-effect actions are never repeated, and
+     * records safe recovery audit state.
      */
     suspend fun recoverInterruptedTasksOnBoot() {
         try {
+            automationEngine.rescheduleAllEnabledRules()
             val incomplete = repository.getIncompleteTasks()
             for (entity in incomplete) {
+                // Parse any completed step IDs so side-effect steps are never duplicated
+                try {
+                    val arr = org.json.JSONArray(entity.completedStepsJson)
+                    for (i in 0 until arr.length()) {
+                        val stepId = arr.optString(i, "")
+                        if (stepId.isNotBlank()) {
+                            completedSideEffectSignatures.add("${entity.taskId}:$stepId")
+                        }
+                    }
+                } catch (_: Exception) {}
+
                 repository.recordTaskExecution(
                     entity.copy(
                         status = TaskState.FAILED.name,
-                        resultSummary = "Task interrupted by application shutdown. Safe recovery halted automatic re-execution."
+                        resultSummary = "Task interrupted by application shutdown at step ${entity.currentStepIndex + 1}/${entity.stepsCount}. Safe recovery halted automatic re-execution of non-idempotent actions."
                     )
                 )
                 repository.logAuditAction(
@@ -143,7 +190,7 @@ class AgentRuntime(
                     target = entity.resolvedIntent,
                     riskLevel = "R0",
                     outcome = "INTERRUPTED_RECOVERED",
-                    details = "Cleaned up incomplete task #${entity.id} on boot."
+                    details = "Cleaned up incomplete task #${entity.id} (${entity.taskId}) on boot."
                 )
             }
         } catch (_: Exception) {}
@@ -348,12 +395,16 @@ class AgentRuntime(
         val stepOutputs = mutableListOf<String>()
         val brainTraceSteps = mutableListOf<BrainReasoningStep>()
         val stepContext = mutableMapOf<String, String>()
+        val completedStepIds = mutableListOf<String>()
         var verifiedStepCount = 0
 
         for ((index, rawAction) in task.actions.withIndex()) {
+            while (isTaskPaused && !isTaskCancelled) {
+                delay(150)
+            }
             if (isTaskCancelled) {
                 stateManager.transition(task, TaskState.CANCELLED, "Cancelled during multi-step loop.")
-                logAndPersistTask(task, "Cancelled by user at step ${index + 1}.")
+                logAndPersistTask(task, "Cancelled by user at step ${index + 1}.", completedStepIds, stepContext)
                 return AgentExecutionSummary(
                     task = task,
                     isSuccess = false,
@@ -363,6 +414,18 @@ class AgentRuntime(
             }
 
             task.currentActionIndex = index
+
+            // Duplicate Side-Effect Guard (Section 17): Never repeat an already completed NON_IDEMPOTENT action
+            if (rawAction.idempotencyClassification == "NON_IDEMPOTENT" &&
+                hasSideEffectAlreadyExecuted(task.taskId, rawAction.actionId)
+            ) {
+                val skipMsg = "Skipped duplicate side-effect action ${rawAction.actionType.name} (${rawAction.actionId})."
+                verifiedStepCount++
+                completedStepIds.add(rawAction.actionId)
+                stepOutputs.add(skipMsg)
+                continue
+            }
+
             val enrichedParams = rawAction.parameters.toMutableMap()
             stepContext["previousStepOutput"]?.let { prev ->
                 enrichedParams.putIfAbsent("previousStepOutput", prev)
@@ -541,6 +604,10 @@ class AgentRuntime(
             when (verification.status) {
                 VerificationStatus.VERIFIED -> {
                     verifiedStepCount++
+                    completedStepIds.add(action.actionId)
+                    if (action.idempotencyClassification == "NON_IDEMPOTENT") {
+                        markSideEffectExecuted(task.taskId, action.actionId)
+                    }
                     stepOutputs.add(verification.details)
                     stepContext["previousStepOutput"] = verification.details
                 }
@@ -551,7 +618,7 @@ class AgentRuntime(
                         action.requiredPermission ?: "ANDROID_PERMISSION",
                         verification.details
                     )
-                    logAndPersistTask(task, verification.details)
+                    logAndPersistTask(task, verification.details, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
                         isSuccess = false,
@@ -563,7 +630,7 @@ class AgentRuntime(
                 VerificationStatus.REQUIRES_CONFIRMATION -> {
                     stateManager.transition(task, TaskState.WAITING_FOR_CONFIRMATION, verification.details)
                     _currentState.value = AgentState.Error(verification.details)
-                    logAndPersistTask(task, verification.details)
+                    logAndPersistTask(task, verification.details, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
                         isSuccess = false,
@@ -583,7 +650,7 @@ class AgentRuntime(
                     }
                     task.finalResult = fullMsg
                     _currentState.value = AgentState.Error(fullMsg)
-                    logAndPersistTask(task, fullMsg)
+                    logAndPersistTask(task, fullMsg, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
                         isSuccess = false,
@@ -604,7 +671,7 @@ class AgentRuntime(
                     }
                     task.finalResult = fullMsg
                     _currentState.value = AgentState.Error(fullMsg)
-                    logAndPersistTask(task, fullMsg)
+                    logAndPersistTask(task, fullMsg, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
                         isSuccess = false,
@@ -624,7 +691,7 @@ class AgentRuntime(
                     }
                     task.finalResult = fullMsg
                     _currentState.value = AgentState.Error(fullMsg)
-                    logAndPersistTask(task, fullMsg)
+                    logAndPersistTask(task, fullMsg, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
                         isSuccess = false,
@@ -636,7 +703,7 @@ class AgentRuntime(
                 VerificationStatus.CANCELLED -> {
                     stateManager.transition(task, TaskState.CANCELLED, verification.details)
                     _currentState.value = AgentState.Cancelled(verification.details)
-                    logAndPersistTask(task, verification.details)
+                    logAndPersistTask(task, verification.details, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
                         isSuccess = false,
@@ -656,7 +723,7 @@ class AgentRuntime(
                     }
                     task.finalResult = fullMsg
                     _currentState.value = AgentState.Error(fullMsg)
-                    logAndPersistTask(task, fullMsg)
+                    logAndPersistTask(task, fullMsg, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
                         isSuccess = false,
@@ -673,7 +740,7 @@ class AgentRuntime(
         task.finalResult = finalResponse
         _currentState.value = AgentState.Completed(finalResponse)
         AgentEventBus.emit(AgentEvent.TaskFinished(task.taskId, true, finalResponse))
-        logAndPersistTask(task, finalResponse)
+        logAndPersistTask(task, finalResponse, completedStepIds, stepContext)
 
         return AgentExecutionSummary(
             task = task,
@@ -683,7 +750,18 @@ class AgentRuntime(
         )
     }
 
-    private suspend fun logAndPersistTask(task: AgentTask, summary: String) {
+    private suspend fun logAndPersistTask(
+        task: AgentTask,
+        summary: String,
+        completedStepIds: List<String> = emptyList(),
+        stepContext: Map<String, String> = emptyMap()
+    ) {
+        val completedArr = org.json.JSONArray()
+        completedStepIds.forEach { completedArr.put(it) }
+        val contextObj = org.json.JSONObject()
+        stepContext.forEach { (k, v) -> contextObj.put(k, v) }
+        val allIdempotent = task.actions.all { it.idempotencyClassification == "IDEMPOTENT" }
+
         repository.recordTaskExecution(
             TaskHistoryEntity(
                 taskId = task.taskId,
@@ -691,6 +769,10 @@ class AgentRuntime(
                 resolvedIntent = task.resolvedIntent,
                 status = task.state.name,
                 stepsCount = task.actions.size,
+                currentStepIndex = task.currentActionIndex,
+                completedStepsJson = completedArr.toString(),
+                conversationContext = contextObj.toString(),
+                recoveryMetadata = if (allIdempotent) "IDEMPOTENT_SAFE" else "CONTAINS_SIDE_EFFECTS",
                 resultSummary = summary,
                 durationMs = System.currentTimeMillis() - task.createdAt
             )

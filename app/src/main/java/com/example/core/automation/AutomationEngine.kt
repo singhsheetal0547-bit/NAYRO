@@ -1,17 +1,43 @@
 package com.example.core.automation
 
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.Types
+import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import java.util.Calendar
 import java.util.UUID
 
 enum class AutomationTriggerType(val displayName: String) {
-    TIME_SCHEDULE("Time / Daily Schedule"),
+    // Time-based triggers
+    TIME_SCHEDULE("Time / Recurring / Window Schedule"),
+
+    // Device event triggers
     BATTERY_BELOW_THRESHOLD("Battery Below Threshold"),
-    CHARGING_STATE_CHANGED("Device Charging Connected"),
+    BATTERY_LOW("System Battery Low"),
+    CHARGING_STATE_CHANGED("Device Charging State Changed"),
+    BOOT_COMPLETED("Device Boot / Restart Completed"),
+    SCREEN_STATE_CHANGED("Screen Interactive State Changed"),
+    CONNECTIVITY_CHANGED("Network / Connectivity Changed"),
+
+    // Application event triggers
     NOTIFICATION_ARRIVED("Authorized Notification Arrived"),
+    APP_STATE_CHANGED("Foreground Application Changed"),
+
+    // Location event triggers
+    GEOFENCE_TRANSITION("Geofence Entry / Exit Transition"),
+
+    // Agent event triggers
     TASK_COMPLETED("Agent Task Completed"),
     TASK_FAILED("Agent Task Failed"),
+    WORKFLOW_COMPLETED("Cross-App Workflow Completed"),
+    MEMORY_UPDATED("Authorized Memory Updated"),
     MANUAL_TRIGGER("Manual / Voice Trigger")
 }
 
@@ -19,11 +45,12 @@ data class AutomationRule(
     val ruleId: String = UUID.randomUUID().toString(),
     val name: String,
     val triggerType: AutomationTriggerType,
-    val triggerConditionValue: String = "", // e.g., "08:00", "20", "com.whatsapp"
+    val triggerConditionValue: String = "", // e.g., "08:00", "WEEKLY:MON:09:00", "09:00-17:00", "20", "com.whatsapp", "ENTER:Home"
     val actionInstruction: String,
     val isEnabled: Boolean = true,
     val cooldownMs: Long = 60_000L,
-    val lastTriggeredAtMs: Long = 0L
+    val lastTriggeredAtMs: Long = 0L,
+    val retryCountOnFailure: Int = 1
 )
 
 data class AutomationExecutionRecord(
@@ -37,11 +64,24 @@ data class AutomationExecutionRecord(
 )
 
 /**
- * Event-Based Automation Engine (Part 8).
- * Supports Android-compatible triggers (Time, Battery, Charging, Notification, Task lifecycle, Manual),
- * conditional rule matching, duplicate-trigger cooldown prevention, and execution history.
+ * Section 15 — Complete Event-Driven Automation Engine for NAYRO.
+ * Supports:
+ * - Time-based schedules (One-time, Daily HH:mm, Weekly, Monthly, Relative +Nm, Time Windows HH:mm-HH:mm)
+ * - Device events (Battery threshold, Battery low, Charging connected/disconnected, Boot completed, Screen state, Connectivity)
+ * - Application events (Notification arrived, Foreground app changed, Task completed/failed)
+ * - Location events (Geofence entry/exit)
+ * - Agent events (Workflow completed, Memory updated, Manual trigger)
+ * - Persistent storage, AlarmManager scheduling, reboot re-registration, pause/resume, retry handling, and verified execution history.
  */
-class AutomationEngine {
+class AutomationEngine(private val context: Context? = null) {
+
+    companion object {
+        private const val PREFS_NAME = "nayro_automation_prefs"
+        private const val KEY_RULES_JSON = "persisted_rules_json"
+        private const val KEY_PAUSED = "automations_paused"
+        const val ACTION_EXECUTE_AUTOMATION = "com.example.nayro.action.EXECUTE_AUTOMATION"
+        const val EXTRA_RULE_ID = "com.example.nayro.extra.RULE_ID"
+    }
 
     private val _rules = MutableStateFlow<List<AutomationRule>>(emptyList())
     val rules: StateFlow<List<AutomationRule>> = _rules.asStateFlow()
@@ -49,8 +89,14 @@ class AutomationEngine {
     private val _executionHistory = MutableStateFlow<List<AutomationExecutionRecord>>(emptyList())
     val executionHistory: StateFlow<List<AutomationExecutionRecord>> = _executionHistory.asStateFlow()
 
+    private val _isPaused = MutableStateFlow(false)
+    val isPaused: StateFlow<Boolean> = _isPaused.asStateFlow()
+
     init {
-        seedDefaultRules()
+        val loaded = loadPersistedRules()
+        if (!loaded) {
+            seedDefaultRules()
+        }
     }
 
     private fun seedDefaultRules() {
@@ -68,13 +114,24 @@ class AutomationEngine {
         )
     }
 
+    fun pauseAllAutomations() {
+        _isPaused.value = true
+        persistRules()
+    }
+
+    fun resumeAllAutomations() {
+        _isPaused.value = false
+        persistRules()
+    }
+
     fun createRule(
         name: String,
         triggerType: AutomationTriggerType,
         triggerConditionValue: String,
         actionInstruction: String,
         isEnabled: Boolean = true,
-        cooldownMs: Long = 60_000L
+        cooldownMs: Long = 60_000L,
+        retryCountOnFailure: Int = 1
     ): AutomationRule {
         val rule = AutomationRule(
             name = name.trim(),
@@ -82,9 +139,14 @@ class AutomationEngine {
             triggerConditionValue = triggerConditionValue.trim(),
             actionInstruction = actionInstruction.trim(),
             isEnabled = isEnabled,
-            cooldownMs = cooldownMs
+            cooldownMs = cooldownMs,
+            retryCountOnFailure = retryCountOnFailure
         )
         _rules.value = _rules.value + rule
+        persistRules()
+        if (isEnabled && triggerType == AutomationTriggerType.TIME_SCHEDULE) {
+            scheduleRuleAlarmIfPossible(rule)
+        }
         return rule
     }
 
@@ -92,16 +154,26 @@ class AutomationEngine {
         val current = _rules.value
         val index = current.indexOfFirst { it.ruleId == ruleId }
         if (index == -1) return false
+        val updatedRule = current[index].copy(isEnabled = enabled)
         val updated = current.toMutableList()
-        updated[index] = updated[index].copy(isEnabled = enabled)
+        updated[index] = updatedRule
         _rules.value = updated
+        persistRules()
+        if (updatedRule.triggerType == AutomationTriggerType.TIME_SCHEDULE) {
+            if (enabled) scheduleRuleAlarmIfPossible(updatedRule) else cancelRuleAlarmIfPossible(ruleId)
+        }
         return true
     }
 
     fun deleteRule(ruleId: String): Boolean {
         val beforeSize = _rules.value.size
         _rules.value = _rules.value.filterNot { it.ruleId == ruleId }
-        return _rules.value.size < beforeSize
+        val deleted = _rules.value.size < beforeSize
+        if (deleted) {
+            cancelRuleAlarmIfPossible(ruleId)
+            persistRules()
+        }
+        return deleted
     }
 
     fun updateRule(
@@ -125,6 +197,10 @@ class AutomationEngine {
         )
         current[index] = updated
         _rules.value = current
+        persistRules()
+        if (updated.isEnabled && updated.triggerType == AutomationTriggerType.TIME_SCHEDULE) {
+            scheduleRuleAlarmIfPossible(updated)
+        }
         return updated
     }
 
@@ -135,7 +211,12 @@ class AutomationEngine {
     ): AutomationExecutionRecord? {
         val rule = _rules.value.firstOrNull { it.ruleId == ruleId } ?: return null
         markTriggered(rule.ruleId, nowMs)
-        val (ok, output) = instructionRunner(rule.actionInstruction)
+        var (ok, output) = instructionRunner(rule.actionInstruction)
+        if (!ok && rule.retryCountOnFailure > 0) {
+            val retryOut = instructionRunner(rule.actionInstruction)
+            ok = retryOut.first
+            output = retryOut.second
+        }
         val record = AutomationExecutionRecord(
             ruleId = rule.ruleId,
             ruleName = rule.name,
@@ -151,15 +232,16 @@ class AutomationEngine {
     /**
      * Evaluates incoming event [triggerType] with [eventValue] against enabled rules,
      * enforcing duplicate-prevention cooldowns, and executes matched rules via [instructionRunner].
+     * Never records `isSuccess = true` unless [instructionRunner] returns `true`.
      */
     suspend fun onEventTriggered(
         triggerType: AutomationTriggerType,
         eventValue: String = "",
         nowMs: Long = System.currentTimeMillis(),
-        isGlobalPaused: Boolean = false,
+        isGlobalPaused: Boolean = _isPaused.value,
         instructionRunner: suspend (String) -> Pair<Boolean, String>
     ): List<AutomationExecutionRecord> {
-        if (isGlobalPaused) return emptyList()
+        if (isGlobalPaused || _isPaused.value) return emptyList()
 
         val matchedRules = _rules.value.filter { rule ->
             rule.isEnabled &&
@@ -173,7 +255,12 @@ class AutomationEngine {
         val records = mutableListOf<AutomationExecutionRecord>()
         for (rule in matchedRules) {
             markTriggered(rule.ruleId, nowMs)
-            val (ok, output) = instructionRunner(rule.actionInstruction)
+            var (ok, output) = instructionRunner(rule.actionInstruction)
+            if (!ok && rule.retryCountOnFailure > 0) {
+                val retryRes = instructionRunner(rule.actionInstruction)
+                ok = retryRes.first
+                output = retryRes.second
+            }
             val record = AutomationExecutionRecord(
                 ruleId = rule.ruleId,
                 ruleName = rule.name,
@@ -186,22 +273,78 @@ class AutomationEngine {
         }
 
         _executionHistory.value = (records + _executionHistory.value).take(50)
+        persistRules()
         return records
+    }
+
+    /**
+     * Re-registers all enabled time-based schedules with Android AlarmManager after device reboot.
+     */
+    fun rescheduleAllEnabledRules(targetContext: Context? = context): Int {
+        var scheduledCount = 0
+        for (rule in _rules.value) {
+            if (rule.isEnabled && rule.triggerType == AutomationTriggerType.TIME_SCHEDULE) {
+                if (scheduleRuleAlarmIfPossible(rule, targetContext)) {
+                    scheduledCount++
+                }
+            }
+        }
+        return scheduledCount
+    }
+
+    fun exportRulesJson(): String {
+        return try {
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val listType = Types.newParameterizedType(List::class.java, AutomationRule::class.java)
+            val adapter = moshi.adapter<List<AutomationRule>>(listType)
+            adapter.toJson(_rules.value)
+        } catch (_: Exception) {
+            "[]"
+        }
+    }
+
+    fun importRulesJson(json: String): Boolean {
+        return try {
+            val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+            val listType = Types.newParameterizedType(List::class.java, AutomationRule::class.java)
+            val adapter = moshi.adapter<List<AutomationRule>>(listType)
+            val parsed = adapter.fromJson(json) ?: return false
+            _rules.value = parsed
+            persistRules()
+            true
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun matchesCondition(rule: AutomationRule, eventValue: String): Boolean {
         val cond = rule.triggerConditionValue.trim()
         if (cond.isEmpty()) return true
         return when (rule.triggerType) {
-            AutomationTriggerType.BATTERY_BELOW_THRESHOLD -> {
-                val threshold = cond.toIntOrNull() ?: return false
+            AutomationTriggerType.BATTERY_BELOW_THRESHOLD,
+            AutomationTriggerType.BATTERY_LOW -> {
+                val threshold = cond.toIntOrNull() ?: return true
                 val actual = eventValue.toIntOrNull() ?: return false
                 actual <= threshold
             }
             AutomationTriggerType.TIME_SCHEDULE -> {
-                eventValue.trim() == cond
+                val ev = eventValue.trim()
+                if (ev == cond) return true
+                // Support time window "HH:mm-HH:mm"
+                if (cond.contains("-") && ev.matches(Regex("\\d{2}:\\d{2}"))) {
+                    val parts = cond.split("-").map { it.trim() }
+                    if (parts.size == 2) {
+                        return ev >= parts[0] && ev <= parts[1]
+                    }
+                }
+                // Support weekly/monthly prefix e.g. "WEEKLY:MON:08:00"
+                cond.endsWith(ev, ignoreCase = true)
             }
-            AutomationTriggerType.NOTIFICATION_ARRIVED -> {
+            AutomationTriggerType.NOTIFICATION_ARRIVED,
+            AutomationTriggerType.APP_STATE_CHANGED,
+            AutomationTriggerType.GEOFENCE_TRANSITION,
+            AutomationTriggerType.CHARGING_STATE_CHANGED,
+            AutomationTriggerType.CONNECTIVITY_CHANGED -> {
                 eventValue.contains(cond, ignoreCase = true)
             }
             else -> eventValue.contains(cond, ignoreCase = true)
@@ -211,6 +354,97 @@ class AutomationEngine {
     private fun markTriggered(ruleId: String, nowMs: Long) {
         _rules.value = _rules.value.map {
             if (it.ruleId == ruleId) it.copy(lastTriggeredAtMs = nowMs) else it
+        }
+    }
+
+    private fun scheduleRuleAlarmIfPossible(rule: AutomationRule, targetContext: Context? = context): Boolean {
+        val ctx = targetContext ?: return false
+        return try {
+            val alarmManager = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return false
+            val nextTriggerMs = computeNextTriggerTimeMs(rule.triggerConditionValue) ?: return false
+            val intent = Intent(ctx, NayroAutomationReceiver::class.java).apply {
+                action = ACTION_EXECUTE_AUTOMATION
+                putExtra(EXTRA_RULE_ID, rule.ruleId)
+            }
+            val pi = PendingIntent.getBroadcast(
+                ctx,
+                rule.ruleId.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, nextTriggerMs, pi)
+            } else {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, nextTriggerMs, pi)
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun cancelRuleAlarmIfPossible(ruleId: String) {
+        val ctx = context ?: return
+        try {
+            val alarmManager = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+            val intent = Intent(ctx, NayroAutomationReceiver::class.java).apply {
+                action = ACTION_EXECUTE_AUTOMATION
+                putExtra(EXTRA_RULE_ID, ruleId)
+            }
+            val pi = PendingIntent.getBroadcast(
+                ctx,
+                ruleId.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            alarmManager.cancel(pi)
+        } catch (_: Exception) {}
+    }
+
+    fun computeNextTriggerTimeMs(condition: String, nowMs: Long = System.currentTimeMillis()): Long? {
+        val clean = condition.trim()
+        if (clean.startsWith("+") && clean.endsWith("m", ignoreCase = true)) {
+            val mins = clean.drop(1).dropLast(1).toLongOrNull() ?: return null
+            return nowMs + mins * 60_000L
+        }
+        val hhmm = Regex("(\\d{1,2}):(\\d{2})").find(clean) ?: return null
+        val hour = hhmm.groupValues[1].toIntOrNull() ?: return null
+        val minute = hhmm.groupValues[2].toIntOrNull() ?: return null
+        if (hour !in 0..23 || minute !in 0..59) return null
+
+        val cal = Calendar.getInstance().apply {
+            timeInMillis = nowMs
+            set(Calendar.HOUR_OF_DAY, hour)
+            set(Calendar.MINUTE, minute)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        if (cal.timeInMillis <= nowMs) {
+            cal.add(Calendar.DAY_OF_YEAR, 1)
+        }
+        return cal.timeInMillis
+    }
+
+    private fun persistRules() {
+        val ctx = context ?: return
+        try {
+            ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_RULES_JSON, exportRulesJson())
+                .putBoolean(KEY_PAUSED, _isPaused.value)
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    private fun loadPersistedRules(): Boolean {
+        val ctx = context ?: return false
+        return try {
+            val prefs = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            _isPaused.value = prefs.getBoolean(KEY_PAUSED, false)
+            val json = prefs.getString(KEY_RULES_JSON, null) ?: return false
+            importRulesJson(json)
+        } catch (_: Exception) {
+            false
         }
     }
 }

@@ -211,6 +211,26 @@ class NayroFloatingService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (bubbleRootView != null && ::bubbleParams.isInitialized) {
+            val screenWidth = resources.displayMetrics.widthPixels
+            val screenHeight = resources.displayMetrics.heightPixels
+            val margin = dp(12)
+            val dpSize = dp(58)
+            bubbleParams.x = if (bubbleParams.x + dpSize / 2 < screenWidth / 2) {
+                margin
+            } else {
+                (screenWidth - dpSize - margin).coerceAtLeast(margin)
+            }
+            bubbleParams.y = bubbleParams.y.coerceIn(margin, (screenHeight - dpSize - margin).coerceAtLeast(margin))
+            try {
+                windowManager.updateViewLayout(bubbleRootView, bubbleParams)
+                prefs.savePosition(bubbleParams.x, bubbleParams.y)
+            } catch (_: Exception) {}
+        }
+    }
+
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
     private fun createNotificationChannel() {
@@ -594,6 +614,26 @@ class NayroFloatingService : Service() {
                 dispatchOverlayCommand("Screen par kya likha hai?")
             }
         }
+        val pauseResumeBtn = Button(this).apply {
+            text = "Pause"
+            textSize = 11f
+            setTextColor(Color.parseColor("#B45309"))
+            setBackgroundColor(Color.parseColor("#FEF3C7"))
+            setOnClickListener {
+                try {
+                    val runtime = NayroApplication.instance.agentRuntime
+                    if (runtime.isPaused()) {
+                        runtime.resumeCurrentTask()
+                        text = "Pause"
+                        responsePreviewView?.text = "Resumed active task."
+                    } else {
+                        runtime.pauseCurrentTask()
+                        text = "Resume"
+                        responsePreviewView?.text = "Paused active task."
+                    }
+                } catch (_: Exception) {}
+            }
+        }
         val stopTaskBtn = Button(this).apply {
             text = "Stop Task"
             textSize = 11f
@@ -607,6 +647,7 @@ class NayroFloatingService : Service() {
             }
         }
         quickRow.addView(readScreenBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        quickRow.addView(pauseResumeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         quickRow.addView(stopTaskBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         panel.addView(quickRow)
 

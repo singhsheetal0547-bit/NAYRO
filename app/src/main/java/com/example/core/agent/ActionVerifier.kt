@@ -334,6 +334,9 @@ class ActionVerifier(
             ActionType.SCHEDULE_ALARM,
             ActionType.READ_CALENDAR_EVENTS,
             ActionType.CREATE_CALENDAR_EVENT,
+            ActionType.UPDATE_CALENDAR_EVENT,
+            ActionType.DELETE_CALENDAR_EVENT,
+            ActionType.WHATSAPP_READ_CONVERSATION,
             ActionType.MESSAGE_DRAFT_SEND -> {
                 if (executionResult.status == VerificationStatus.VERIFIED && executionResult.outputMessage.isNotBlank()) {
                     VerificationResult(

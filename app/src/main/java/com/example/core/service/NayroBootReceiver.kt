@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.example.NayroApplication
+import com.example.core.automation.AutomationTriggerType
 import com.example.core.floating.FloatingAssistantPreferences
 import com.example.core.floating.NayroFloatingService
 import kotlinx.coroutines.CoroutineScope
@@ -11,14 +12,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
- * Restores permitted NAYRO state and safely recovers interrupted tasks on Android device boot.
- * Respects Android 12–14+ background service start restrictions.
+ * Restores permitted NAYRO state, re-registers scheduled automations, and safely recovers
+ * interrupted tasks on Android device boot (`BOOT_COMPLETED`, `LOCKED_BOOT_COMPLETED`, `MY_PACKAGE_REPLACED`).
+ * Respects Android 10–15+ background service start restrictions.
  */
 class NayroBootReceiver : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent?) {
         val action = intent?.action ?: return
         if (action != Intent.ACTION_BOOT_COMPLETED &&
+            action != Intent.ACTION_LOCKED_BOOT_COMPLETED &&
             action != Intent.ACTION_MY_PACKAGE_REPLACED
         ) {
             return
@@ -28,9 +31,22 @@ class NayroBootReceiver : BroadcastReceiver() {
         CoroutineScope(Dispatchers.Default).launch {
             try {
                 val app = (context.applicationContext as? NayroApplication) ?: NayroApplication.instance
+                app.operatingStateManager.onBootCompleted()
                 app.permissionManager.refreshAllPermissions()
                 app.capabilityManager.evaluateAll()
                 app.agentRuntime.recoverInterruptedTasksOnBoot()
+
+                // Re-register all enabled time-based automations with AlarmManager after reboot
+                app.automationEngine.rescheduleAllEnabledRules(context)
+
+                // Fire BOOT_COMPLETED automation rules if configured
+                app.automationEngine.onEventTriggered(
+                    triggerType = AutomationTriggerType.BOOT_COMPLETED,
+                    eventValue = action
+                ) { instruction ->
+                    val summary = app.agentRuntime.executeUserInstructionDetailed(instruction)
+                    summary.isSuccess to summary.message
+                }
 
                 // Restore floating overlay if user previously enabled it and overlay permission is still granted
                 val floatingPrefs = FloatingAssistantPreferences(context)

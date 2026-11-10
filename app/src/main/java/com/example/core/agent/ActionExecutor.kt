@@ -32,6 +32,8 @@ import com.example.core.skills.SkillManager
 import com.example.core.subagent.SubAgentManager
 import com.example.core.subagent.SubAgentStatus
 import com.example.core.subagent.SubAgentType
+import com.example.core.calendar.CalendarIntegrationManager
+import com.example.core.communication.WhatsAppAutomationManager
 import com.example.core.telephony.CallIntelligenceManager
 import com.example.core.telephony.ContactResolutionResult
 import com.example.core.workflow.CrossAppWorkflowEngine
@@ -73,7 +75,13 @@ class ActionExecutor(
     private val skillManager: SkillManager = SkillManager(),
     private val subAgentManager: SubAgentManager = SubAgentManager(),
     private val callIntelligenceManager: CallIntelligenceManager = CallIntelligenceManager(context),
-    private val workflowEngine: CrossAppWorkflowEngine = CrossAppWorkflowEngine()
+    private val workflowEngine: CrossAppWorkflowEngine = CrossAppWorkflowEngine(),
+    val calendarManager: CalendarIntegrationManager = CalendarIntegrationManager(context),
+    val whatsAppManager: WhatsAppAutomationManager = WhatsAppAutomationManager(
+        context,
+        callIntelligenceManager,
+        screenIntelligenceManager
+    )
 ) {
 
     companion object {
@@ -906,74 +914,54 @@ class ActionExecutor(
 
             ActionType.CREATE_CALENDAR_EVENT -> {
                 val title = (action.target ?: action.parameters["title"])?.trim().orEmpty()
-                if (title.isEmpty()) {
-                    return ActionExecutionResult(
-                        false,
-                        "Cannot create calendar event: event title is empty.",
-                        VerificationStatus.FAILED
-                    )
-                }
                 val startTimeMs = action.parameters["startTimeMs"]?.toLongOrNull()
                     ?: (System.currentTimeMillis() + 3_600_000L)
                 val endTimeMs = action.parameters["endTimeMs"]?.toLongOrNull()
                     ?: (startTimeMs + 3_600_000L)
-                if (endTimeMs <= startTimeMs) {
-                    return ActionExecutionResult(
+                val description = action.parameters["description"] ?: "Scheduled by NAYRO (Babu)"
+                val location = action.parameters["location"] ?: ""
+                calendarManager.createEvent(
+                    title = title,
+                    startTimeMs = startTimeMs,
+                    endTimeMs = endTimeMs,
+                    description = description,
+                    location = location
+                )
+            }
+
+            ActionType.UPDATE_CALENDAR_EVENT -> {
+                val eventId = (action.target ?: action.parameters["eventId"])?.trim()?.toLongOrNull()
+                    ?: return ActionExecutionResult(
                         false,
-                        "Invalid calendar event time range: endTimeMs ($endTimeMs) must be greater than startTimeMs ($startTimeMs).",
+                        "Cannot update calendar event: valid numeric 'eventId' is required.",
                         VerificationStatus.FAILED
                     )
-                }
+                val newTitle = action.parameters["title"]
+                val newStart = action.parameters["startTimeMs"]?.toLongOrNull()
+                val newEnd = action.parameters["endTimeMs"]?.toLongOrNull()
+                val newLocation = action.parameters["location"]
+                calendarManager.updateEvent(
+                    eventId = eventId,
+                    newTitle = newTitle,
+                    newStartTimeMs = newStart,
+                    newEndTimeMs = newEnd,
+                    newLocation = newLocation
+                )
+            }
 
-                val hasWriteCal = ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.WRITE_CALENDAR
-                ) == PackageManager.PERMISSION_GRANTED
-
-                if (!hasWriteCal) {
-                    return ActionExecutionResult(
+            ActionType.DELETE_CALENDAR_EVENT -> {
+                val eventId = (action.target ?: action.parameters["eventId"])?.trim()?.toLongOrNull()
+                    ?: return ActionExecutionResult(
                         false,
-                        "Permission required: WRITE_CALENDAR is not granted to insert calendar event '$title'.",
-                        VerificationStatus.REQUIRES_PERMISSION
-                    )
-                }
-
-                return try {
-                    val values = ContentValues().apply {
-                        put(CalendarContract.Events.DTSTART, startTimeMs)
-                        put(CalendarContract.Events.DTEND, endTimeMs)
-                        put(CalendarContract.Events.TITLE, title)
-                        put(CalendarContract.Events.DESCRIPTION, action.parameters["description"] ?: "Created by NAYRO")
-                        put(CalendarContract.Events.CALENDAR_ID, 1L)
-                        put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
-                    }
-                    val uri = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
-                    if (uri != null) {
-                        ActionExecutionResult(
-                            true,
-                            "Created calendar event '$title' ($uri).",
-                            VerificationStatus.VERIFIED
-                        )
-                    } else {
-                        ActionExecutionResult(
-                            false,
-                            "Calendar provider returned null URI when creating event '$title'.",
-                            VerificationStatus.FAILED
-                        )
-                    }
-                } catch (e: SecurityException) {
-                    ActionExecutionResult(
-                        false,
-                        "Permission required: WRITE_CALENDAR denied (${e.localizedMessage}).",
-                        VerificationStatus.REQUIRES_PERMISSION
-                    )
-                } catch (e: Exception) {
-                    ActionExecutionResult(
-                        false,
-                        "Failed to create calendar event '$title': ${e.localizedMessage}",
+                        "Cannot delete calendar event: valid numeric 'eventId' is required.",
                         VerificationStatus.FAILED
                     )
-                }
+                calendarManager.deleteEvent(eventId = eventId, isConfirmed = isConfirmed)
+            }
+
+            ActionType.WHATSAPP_READ_CONVERSATION -> {
+                val query = (action.target ?: action.parameters["query"] ?: action.parameters["contact"])?.trim().orEmpty()
+                whatsAppManager.readOrSearchWhatsAppConversation(query)
             }
 
             ActionType.ASK_USER_CONFIRMATION -> {
@@ -1376,53 +1364,14 @@ class ActionExecutor(
             }
 
             ActionType.READ_CALENDAR_EVENTS -> {
-                val hasReadCal = ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.READ_CALENDAR
-                ) == PackageManager.PERMISSION_GRANTED
-                if (!hasReadCal) {
-                    return ActionExecutionResult(
-                        false,
-                        "Permission required: READ_CALENDAR is not granted.",
-                        VerificationStatus.REQUIRES_PERMISSION
-                    )
-                }
-                val limit = (action.parameters["limit"]?.toIntOrNull() ?: 5).coerceIn(1, 20)
-                return try {
-                    val now = System.currentTimeMillis()
-                    val projection = arrayOf(
-                        CalendarContract.Events._ID,
-                        CalendarContract.Events.TITLE,
-                        CalendarContract.Events.DTSTART
-                    )
-                    val selection = "${CalendarContract.Events.DTSTART} >= ?"
-                    val selectionArgs = arrayOf(now.toString())
-                    val events = mutableListOf<String>()
-                    context.contentResolver.query(
-                        CalendarContract.Events.CONTENT_URI,
-                        projection,
-                        selection,
-                        selectionArgs,
-                        "${CalendarContract.Events.DTSTART} ASC"
-                    )?.use { cursor ->
-                        val titleIdx = cursor.getColumnIndex(CalendarContract.Events.TITLE)
-                        val startIdx = cursor.getColumnIndex(CalendarContract.Events.DTSTART)
-                        val sdf = SimpleDateFormat("dd MMM HH:mm", Locale.getDefault())
-                        while (cursor.moveToNext() && events.size < limit) {
-                            val t = if (titleIdx >= 0) cursor.getString(titleIdx) ?: "Untitled" else "Untitled"
-                            val s = if (startIdx >= 0) cursor.getLong(startIdx) else now
-                            events.add("$t (${sdf.format(Date(s))})")
-                        }
-                    }
-                    val msg = if (events.isEmpty()) {
-                        "No upcoming calendar events found."
-                    } else {
-                        "Upcoming Calendar Events (${events.size}): " + events.joinToString("; ")
-                    }
-                    ActionExecutionResult(true, msg, VerificationStatus.VERIFIED)
-                } catch (e: Exception) {
-                    ActionExecutionResult(false, "Failed to read calendar events: ${e.localizedMessage}", VerificationStatus.FAILED)
-                }
+                val dateQuery = action.parameters["date"] ?: action.target
+                val searchKeyword = action.parameters["query"]
+                val limit = (action.parameters["limit"]?.toIntOrNull() ?: 10).coerceIn(1, 30)
+                calendarManager.queryEvents(
+                    dateQuery = dateQuery,
+                    searchKeyword = searchKeyword,
+                    limit = limit
+                )
             }
         }
     }
@@ -1431,137 +1380,17 @@ class ActionExecutor(
         return NotificationIntelligenceRepository.isNotificationAccessEnabled(context)
     }
 
-    /**
-     * Real WhatsApp Workflow Execution (BUG 03 Remediation):
-     * 1. Validates recipient and message text.
-     * 2. Enforces user confirmation (REQUIRES_CONFIRMATION if unconfirmed).
-     * 3. Resolves contact via ContactsContract and rejects unknown or ambiguous contacts.
-     * 4. Opens WhatsApp conversation and, only if Accessibility is connected and verifies the Send button,
-     *    clicks Send and verifies the message appears in the conversation history.
-     * 5. Never claims "Delivered" or "Read" or fake send completion.
-     */
     private suspend fun executeWhatsAppWorkflow(
         action: AgentAction,
         isConfirmed: Boolean
     ): ActionExecutionResult {
         val rawRecipient = (action.target ?: action.parameters["recipient"])?.trim().orEmpty()
         val message = (action.parameters["message"] ?: action.parameters["draft"])?.trim().orEmpty()
-
-        if (rawRecipient.isEmpty() || rawRecipient.equals("Contact", ignoreCase = true) || rawRecipient.equals("Unknown", ignoreCase = true)) {
-            return ActionExecutionResult(
-                false,
-                "Cannot send WhatsApp message: recipient name or phone number is missing.",
-                VerificationStatus.FAILED
-            )
-        }
-        if (message.isEmpty()) {
-            return ActionExecutionResult(
-                false,
-                "Cannot send WhatsApp message to '$rawRecipient': message text is empty.",
-                VerificationStatus.FAILED
-            )
-        }
-        if (!isConfirmed) {
-            return ActionExecutionResult(
-                false,
-                "Confirmation required before sending WhatsApp message to '$rawRecipient': \"$message\"",
-                VerificationStatus.REQUIRES_CONFIRMATION
-            )
-        }
-
-        val isDirectPhone = rawRecipient.any { it.isDigit() } && rawRecipient.none { it.isLetter() }
-        var resolvedDisplayName = rawRecipient
-        var resolvedPhone: String? = if (isDirectPhone) rawRecipient else null
-
-        if (!isDirectPhone) {
-            when (val contactRes = callIntelligenceManager.resolveContactsByName(rawRecipient)) {
-                is ContactResolutionResult.SingleMatch -> {
-                    resolvedDisplayName = contactRes.contact.displayName
-                    resolvedPhone = contactRes.contact.phoneNumber
-                }
-                is ContactResolutionResult.Ambiguous -> {
-                    val candidates = contactRes.candidates.joinToString(", ") { "${it.displayName} (${it.phoneNumber})" }
-                    return ActionExecutionResult(
-                        false,
-                        "Ambiguous WhatsApp recipient '$rawRecipient': multiple contacts matched ($candidates). Please specify the exact contact.",
-                        VerificationStatus.FAILED
-                    )
-                }
-                is ContactResolutionResult.NotFound -> {
-                    return ActionExecutionResult(
-                        false,
-                        "Contact '$rawRecipient' was not found in device contacts; WhatsApp message was not sent.",
-                        VerificationStatus.FAILED
-                    )
-                }
-                is ContactResolutionResult.PermissionRequired -> {
-                    if (!NayroAccessibilityService.isConnected()) {
-                        return ActionExecutionResult(
-                            false,
-                            "Permission required: READ_CONTACTS is needed to resolve '$rawRecipient' (and Accessibility Service is not active).",
-                            VerificationStatus.REQUIRES_PERMISSION
-                        )
-                    }
-                }
-            }
-        }
-
-        val openedDraft = AppNavigationManager.openWhatsAppConversation(context, resolvedPhone ?: "", message)
-        if (!openedDraft) {
-            return ActionExecutionResult(
-                false,
-                "WhatsApp is not installed or could not be opened on this device.",
-                VerificationStatus.FAILED
-            )
-        }
-
-        if (!NayroAccessibilityService.isConnected()) {
-            return ActionExecutionResult(
-                false,
-                "Opened WhatsApp with draft for $resolvedDisplayName, but Accessibility Service is not enabled to press Send or verify screen state. Please tap Send manually in WhatsApp.",
-                VerificationStatus.INCONCLUSIVE
-            )
-        }
-
-        delay(450)
-        if (resolvedPhone == null) {
-            val clickedContact = AccessibilityActionController.performClick(targetText = resolvedDisplayName)
-            if (!clickedContact) {
-                return ActionExecutionResult(
-                    false,
-                    "Could not find contact '$resolvedDisplayName' inside WhatsApp UI.",
-                    VerificationStatus.FAILED
-                )
-            }
-            delay(300)
-            AccessibilityActionController.performSetText(text = message)
-        }
-
-        val clickedSend = AccessibilityActionController.performClick(targetText = "Send")
-        if (!clickedSend) {
-            return ActionExecutionResult(
-                false,
-                "WhatsApp draft prepared for $resolvedDisplayName, but the Send button could not be clicked automatically. Please tap Send in WhatsApp.",
-                VerificationStatus.INCONCLUSIVE
-            )
-        }
-
-        delay(350)
-        val postScreen = screenIntelligenceManager.describeScreenContent()
-        val messageVisibleOnScreen = postScreen.contains(message.take(20), ignoreCase = true)
-        return if (messageVisibleOnScreen) {
-            ActionExecutionResult(
-                true,
-                "WhatsApp Send button clicked and message '$message' verified in conversation view for $resolvedDisplayName (network delivery/read status is not claimed).",
-                VerificationStatus.VERIFIED
-            )
-        } else {
-            ActionExecutionResult(
-                false,
-                "Clicked Send in WhatsApp for $resolvedDisplayName, but post-send message bubble could not be verified on screen.",
-                VerificationStatus.INCONCLUSIVE
-            )
-        }
+        return whatsAppManager.sendOrDraftMessage(
+            rawRecipientSpec = rawRecipient,
+            messageText = message,
+            isConfirmed = isConfirmed
+        )
     }
 
     private fun mapWorkspaceResult(result: WorkspaceResult): ActionExecutionResult {

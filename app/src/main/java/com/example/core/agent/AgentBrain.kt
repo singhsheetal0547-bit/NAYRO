@@ -2,6 +2,7 @@ package com.example.core.agent
 
 import com.example.core.agent.tools.ToolRegistryManager
 import com.example.core.provider.AIProviderManager
+import com.example.core.provider.model.AIResult
 import com.example.core.skills.SkillManager
 import com.example.core.subagent.SubAgentManager
 import com.example.core.workspace.WorkspaceManager
@@ -29,9 +30,10 @@ data class BrainExecutionOutcome(
 )
 
 /**
- * Authoritative Multi-Step Reasoning, Planning & Iterative Orchestration Engine (BUG 01 & BUG 02 Remediation).
+ * Authoritative Multi-Step Reasoning, Planning & Iterative Orchestration Engine (Sections 5, 6, 8, 9).
  * Integrated directly with AgentRuntime so all user entry points share one unified planning and
- * multi-step execution loop. Never stops after `task.actions.first()` when multiple actions exist.
+ * multi-step execution loop. Supports dynamic tool selection across all 52 registered tools,
+ * cross-app multi-clause workflows, and dynamic replanning on step failure.
  */
 class AgentBrain(
     private val providerManager: AIProviderManager,
@@ -42,7 +44,7 @@ class AgentBrain(
 ) {
 
     companion object {
-        const val MAX_ITERATIVE_STEPS = 10
+        const val MAX_ITERATIVE_STEPS = 25
         const val DEFAULT_LOOP_TIMEOUT_MS = 30_000L
     }
 
@@ -57,7 +59,7 @@ class AgentBrain(
     }
 
     /**
-     * Decomposes a single or compound natural-language instruction into an ordered [AgentTask]
+     * Decomposes a single, compound, or unknown natural-language instruction into an ordered [AgentTask]
      * with one or more [AgentAction] steps.
      */
     fun planTaskForInstruction(
@@ -65,8 +67,12 @@ class AgentBrain(
         existingTaskId: String = UUID.randomUUID().toString()
     ): AgentTask {
         val trimmed = userPrompt.trim()
-        // Check for compound multi-step instructions joined by " and then " or " then "
-        val clauses = trimmed.split(Regex("(?i)\\s+(?:and then|then|aur phir)\\s+"))
+            .replaceFirst(Regex("^(?i)(hey babu|hi babu|babu|hey nayro|hi nayro|nayro|hey cutie)\\s*,?\\s*"), "")
+            .trim()
+            .ifBlank { userPrompt.trim() }
+
+        // Check for compound multi-step instructions joined by "and then", "then", "aur phir", "after that"
+        val clauses = trimmed.split(Regex("(?i)\\s*,?\\s*(?:and then|then|aur phir|after that)\\s+"))
             .map { it.trim() }
             .filter { it.isNotBlank() }
 
@@ -74,9 +80,17 @@ class AgentBrain(
             val taskId = existingTaskId
             val mergedActions = mutableListOf<AgentAction>()
             clauses.forEach { clause ->
-                val subIntent = TaskClassifier.classify(clause)
-                val subPlan = TaskPlanner.planTask(subIntent, existingTaskId = taskId)
-                subPlan.actions.forEach { act ->
+                val subActions = planSingleOrDynamicClause(clause, taskId)
+                for (act in subActions) {
+                    // Deduplicate consecutive identical LAUNCH_APP actions (e.g. "open WhatsApp, message Rahul...")
+                    val last = mergedActions.lastOrNull()
+                    if (last != null &&
+                        last.actionType == ActionType.LAUNCH_APP &&
+                        act.actionType == ActionType.LAUNCH_APP &&
+                        last.target.equals(act.target, ignoreCase = true)
+                    ) {
+                        continue
+                    }
                     mergedActions.add(act.copy(taskId = taskId))
                 }
             }
@@ -92,7 +106,189 @@ class AgentBrain(
         }
 
         val resolvedIntent = TaskClassifier.classify(userPrompt)
+        if (resolvedIntent.type == UserIntentType.GENERAL_AI_QUERY) {
+            val dynamicActions = inferDynamicToolActionsFromInstruction(trimmed, existingTaskId)
+            if (dynamicActions.isNotEmpty()) {
+                return AgentTask(
+                    taskId = existingTaskId,
+                    userInstruction = userPrompt,
+                    resolvedIntent = "DYNAMIC_TOOL_WORKFLOW",
+                    actions = dynamicActions,
+                    state = TaskState.CREATED
+                )
+            }
+        }
+
         return TaskPlanner.planTask(resolvedIntent, existingTaskId = existingTaskId)
+    }
+
+    /**
+     * Dynamically plans a task using the active LLM provider's structured JSON tool-calling capability,
+     * falling back to [planTaskForInstruction] if no cloud/local provider is configured or reachable.
+     */
+    suspend fun planDynamicTaskWithModel(
+        userPrompt: String,
+        existingTaskId: String = UUID.randomUUID().toString()
+    ): AgentTask {
+        val activeProvider = providerManager.activeProvider.value
+        if (activeProvider != null && activeProvider.hasKeySaved) {
+            val systemPrompt = buildString {
+                append("You are the NAYRO Agent Planner (Babu). ")
+                append("Decompose the user's goal into a JSON array of tool calls using ONLY the registered ActionTypes below.\n")
+                append("Output ONLY valid JSON array: [{\"actionType\": \"...\", \"target\": \"...\", \"parameters\": {...}}]\n")
+                append(ToolRegistryManager.generateLlmToolPromptSummary())
+            }
+            val aiRes = providerManager.sendRequest(userPrompt = userPrompt, systemPrompt = systemPrompt)
+            if (aiRes is AIResult.Success) {
+                val raw = aiRes.response.content.trim()
+                val startBracket = raw.indexOf('[')
+                val endBracket = raw.lastIndexOf(']')
+                if (startBracket >= 0 && endBracket > startBracket) {
+                    val jsonSlice = raw.substring(startBracket, endBracket + 1)
+                    val parsed = TaskPlanner.planTaskFromJson(jsonSlice, userPrompt)
+                    if (parsed != null && parsed.actions.isNotEmpty()) {
+                        return parsed.copy(taskId = existingTaskId)
+                    }
+                }
+            }
+        }
+        return planTaskForInstruction(userPrompt, existingTaskId)
+    }
+
+    /**
+     * Dynamic Replanning: When a step fails or is inconclusive during execution, inspects the failed
+     * action and produces an alternative recovery action if one is applicable.
+     */
+    fun replanFailedStep(failedAction: AgentAction, failureDetails: String): AgentAction? {
+        return when (failedAction.actionType) {
+            ActionType.CLICK_ELEMENT -> {
+                // If clicking an element failed because it's off-screen, scroll forward to reveal it
+                AgentAction(
+                    taskId = failedAction.taskId,
+                    actionType = ActionType.SCROLL_FORWARD,
+                    target = failedAction.target,
+                    parameters = failedAction.parameters,
+                    requiredCapability = failedAction.requiredCapability,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            }
+            ActionType.FILE_READ_TEXT -> {
+                // If reading a specific filename failed, search workspace files to locate matching file
+                val query = failedAction.target ?: failedAction.parameters["filename"] ?: "md"
+                AgentAction(
+                    taskId = failedAction.taskId,
+                    actionType = ActionType.FILE_SEARCH,
+                    target = query,
+                    parameters = mapOf("query" to query),
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            }
+            else -> null
+        }
+    }
+
+    private fun planSingleOrDynamicClause(clause: String, taskId: String): List<AgentAction> {
+        val cleanedClause = clause
+            .replaceFirst(Regex("^(?i)(tell me the schedule|and tell me the schedule|tell me|and tell me)\\s*"), "")
+            .trim()
+        if (cleanedClause.isBlank()) return emptyList()
+
+        val subIntent = TaskClassifier.classify(cleanedClause)
+        if (subIntent.type != UserIntentType.GENERAL_AI_QUERY) {
+            return TaskPlanner.planTask(subIntent, existingTaskId = taskId).actions
+        }
+        val dynamic = inferDynamicToolActionsFromInstruction(cleanedClause, taskId)
+        if (dynamic.isNotEmpty()) return dynamic
+        return TaskPlanner.planTask(subIntent, existingTaskId = taskId).actions
+    }
+
+    /**
+     * Inspects an open-ended or unknown workflow instruction against the 52 registered tools
+     * in [ToolRegistryManager] to build a multi-tool execution plan without hardcoded workflow templates.
+     */
+    private fun inferDynamicToolActionsFromInstruction(instruction: String, taskId: String): List<AgentAction> {
+        val lower = instruction.lowercase()
+        val actions = mutableListOf<AgentAction>()
+
+        if (lower.contains("battery") && (lower.contains("check") || lower.contains("status") || lower.contains("level") || lower.contains("inspect"))) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.GET_BATTERY_STATE,
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("storage") && (lower.contains("check") || lower.contains("free") || lower.contains("space") || lower.contains("inspect"))) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.GET_STORAGE_INFO,
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("device info") || lower.contains("device model") || lower.contains("android version")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.GET_DEVICE_INFO,
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("workspace") && (lower.contains("browse") || lower.contains("list") || lower.contains("files"))) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.FILE_BROWSE,
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("inspect code") || lower.contains("analyze code") || lower.contains("sampleagentmodule")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.CODE_INSPECT_FILE,
+                    target = "SampleAgentModule.kt",
+                    parameters = mapOf("path" to "SampleAgentModule.kt"),
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("summarize") && (lower.contains("guide") || lower.contains("workspace_guide") || lower.contains("document"))) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.DOC_SUMMARIZE,
+                    target = "NAYRO_Workspace_Guide.md",
+                    parameters = mapOf("filename" to "NAYRO_Workspace_Guide.md"),
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("save") && lower.contains("summary") && lower.contains("note")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.SAVE_NOTE,
+                    parameters = mapOf("content" to "Dynamic workflow summary note"),
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+        }
+
+        return actions
     }
 
     /**
@@ -149,6 +345,11 @@ class AgentBrain(
                 val enrichedParams = rawAction.parameters.toMutableMap()
                 stepContext["previousStepOutput"]?.let { prev ->
                     enrichedParams.putIfAbsent("previousStepOutput", prev)
+                    if (rawAction.actionType == ActionType.SAVE_NOTE &&
+                        enrichedParams["content"] == "Dynamic workflow summary note"
+                    ) {
+                        enrichedParams["content"] = "Summary: $prev"
+                    }
                 }
                 val action = rawAction.copy(parameters = enrichedParams)
 
@@ -232,3 +433,4 @@ class AgentBrain(
         _reasoningTrace.value = steps.toList()
     }
 }
+

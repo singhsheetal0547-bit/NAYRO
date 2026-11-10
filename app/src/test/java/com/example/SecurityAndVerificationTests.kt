@@ -992,6 +992,261 @@ class SecurityAndVerificationTests {
         assertTrue(record!!.isSuccess)
         assertEquals("Executed: Turn on the flashlight", record.outputSummary)
     }
+
+    @Test
+    fun testSection8WhatsAppIntegrationSingleMultiRecipientAndReadConversation() = runBlocking {
+        val callMgr = com.example.core.telephony.CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(
+                    com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"),
+                    com.example.core.telephony.ResolvedContactItem("Amit Verma", "+919811112222"),
+                    com.example.core.telephony.ResolvedContactItem("Priya Nair", "+919833334444"),
+                    com.example.core.telephony.ResolvedContactItem("Rohit A", "+919000000001"),
+                    com.example.core.telephony.ResolvedContactItem("Rohit B", "+919000000002")
+                )
+            }
+        )
+        val waMgr = com.example.core.communication.WhatsAppAutomationManager(
+            context = null,
+            callIntelligenceManager = callMgr,
+            screenIntelligenceManager = null
+        ).apply {
+            testOverrideInstalled = true
+            testOverrideSendVerified = true
+            testOverrideVisibleMessages = listOf("Amit: Tomorrow's meeting is moved to 11 AM", "You: Got it, thanks!")
+        }
+
+        // 1. Unconfirmed send must be blocked with REQUIRES_CONFIRMATION
+        val unconfirmed = waMgr.sendOrDraftMessage("Rahul", "I will arrive tomorrow", isConfirmed = false)
+        assertFalse(unconfirmed.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_CONFIRMATION, unconfirmed.status)
+
+        // 2. Ambiguous contact must be rejected honestly
+        val ambiguous = waMgr.sendOrDraftMessage("Rohit", "Hello", isConfirmed = true)
+        assertFalse(ambiguous.isSuccess)
+        assertEquals(VerificationStatus.FAILED, ambiguous.status)
+        assertTrue(ambiguous.outputMessage.contains("Ambiguous"))
+
+        // 3. Confirmed single-recipient send with verified bubble
+        val verifiedSingle = waMgr.sendOrDraftMessage("Rahul", "I will arrive tomorrow", isConfirmed = true)
+        assertTrue(verifiedSingle.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, verifiedSingle.status)
+        assertTrue(verifiedSingle.outputMessage.contains("Rahul Sharma"))
+
+        // 4. Multi-recipient batch send ("Send the same approved update to these three contacts")
+        val batchRes = waMgr.sendOrDraftMessage("Rahul, Amit, Priya", "Team standup at 10 AM", isConfirmed = true)
+        assertTrue(batchRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, batchRes.status)
+        assertTrue(batchRes.outputMessage.contains("Rahul Sharma"))
+        assertTrue(batchRes.outputMessage.contains("Amit Verma"))
+        assertTrue(batchRes.outputMessage.contains("Priya Nair"))
+
+        // 5. Read / summarize visible WhatsApp conversation
+        val readConv = waMgr.readOrSearchWhatsAppConversation("Amit")
+        assertTrue(readConv.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, readConv.status)
+        assertTrue(readConv.outputMessage.contains("Tomorrow's meeting is moved to 11 AM"))
+    }
+
+    @Test
+    fun testSection9AndScenario3CrossAppWhatsAppAndCalendarWorkflow() {
+        val brain = createHeadlessBrain()
+
+        // Scenario 3A: "Open WhatsApp, send Rahul a message saying I will arrive tomorrow, then check tomorrow's meetings"
+        val promptA = "Open WhatsApp, send Rahul a message saying I will arrive tomorrow, then check tomorrow's meetings"
+        val taskA = brain.planTaskForInstruction(promptA)
+        assertEquals("MULTI_STEP_COMPOUND", taskA.resolvedIntent)
+        assertTrue(taskA.actions.any { it.actionType == ActionType.LAUNCH_APP && it.target.equals("com.whatsapp", ignoreCase = true) })
+        assertTrue(taskA.actions.any { it.actionType == ActionType.SET_TEXT && it.parameters["text"] == "I will arrive tomorrow" })
+        assertTrue(taskA.actions.any { it.actionType == ActionType.ASK_USER_CONFIRMATION && it.target == "Rahul" })
+        assertTrue(taskA.actions.any { it.actionType == ActionType.READ_CALENDAR_EVENTS && it.parameters["date"] == "tomorrow" })
+
+        // Scenario 3B: "BABU, open WhatsApp, message Rahul that I will attend tomorrow's meeting, then check tomorrow's Calendar meetings and tell me the schedule"
+        val promptB = "BABU, open WhatsApp, message Rahul that I will attend tomorrow's meeting, then check tomorrow's Calendar meetings and tell me the schedule"
+        val taskB = brain.planTaskForInstruction(promptB)
+        assertEquals("MULTI_STEP_COMPOUND", taskB.resolvedIntent)
+        assertTrue(taskB.actions.any { it.actionType == ActionType.ASK_USER_CONFIRMATION && it.target == "Rahul" })
+        assertTrue(taskB.actions.any { it.actionType == ActionType.READ_CALENDAR_EVENTS && it.parameters["date"] == "tomorrow" })
+    }
+
+    @Test
+    fun testSection10CalendarIntegrationCrudConflictAndRelativeDateResolution() {
+        val calMgr = com.example.core.calendar.CalendarIntegrationManager(context = null)
+
+        // 1. Dynamic calendar discovery (never hardcodes 1L)
+        val accounts = calMgr.getAvailableCalendars()
+        assertTrue(accounts.isNotEmpty())
+        assertEquals(101L, calMgr.resolveWritableCalendarId())
+
+        // 2. Relative date range resolution ("today", "tomorrow", "2026-11-15")
+        val nowMs = 1_762_776_000_000L
+        val tomorrowRange = calMgr.resolveDateRange("tomorrow", nowMs)
+        assertEquals("Tomorrow", tomorrowRange.label)
+        assertTrue(tomorrowRange.endMs > tomorrowRange.startMs)
+
+        // 3. Create event and verify read-back
+        val start1 = tomorrowRange.startMs + 10 * 3_600_000L // 10:00 AM tomorrow
+        val end1 = start1 + 3_600_000L // 11:00 AM tomorrow
+        val createRes1 = calMgr.createEvent(
+            title = "Architecture Review with Rahul",
+            startTimeMs = start1,
+            endTimeMs = end1,
+            location = "Room 302"
+        )
+        assertTrue(createRes1.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, createRes1.status)
+
+        // 4. Create overlapping event and verify conflict detection
+        val start2 = start1 + 1_800_000L // 10:30 AM tomorrow (overlaps!)
+        val end2 = start2 + 3_600_000L
+        val createRes2 = calMgr.createEvent(
+            title = "Product Sync",
+            startTimeMs = start2,
+            endTimeMs = end2
+        )
+        assertTrue(createRes2.isSuccess)
+        assertTrue(createRes2.outputMessage.contains("overlaps"))
+
+        // 5. Query tomorrow's events and verify both events + conflict note
+        val queryTomorrow = calMgr.queryEvents(dateQuery = "tomorrow", referenceNowMs = nowMs)
+        assertTrue(queryTomorrow.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, queryTomorrow.status)
+        assertTrue(queryTomorrow.outputMessage.contains("Architecture Review with Rahul"))
+        assertTrue(queryTomorrow.outputMessage.contains("Product Sync"))
+        assertTrue(queryTomorrow.outputMessage.contains("Conflicts detected"))
+
+        // 6. Update first event and verify
+        val eventId1 = Regex("#(\\d+)").find(createRes1.outputMessage)!!.groupValues[1].toLong()
+        val updateRes = calMgr.updateEvent(eventId = eventId1, newTitle = "Updated Architecture Review")
+        assertTrue(updateRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, updateRes.status)
+        assertTrue(updateRes.outputMessage.contains("Updated Architecture Review"))
+
+        // 7. Delete without confirmation must return REQUIRES_CONFIRMATION
+        val unconfirmedDel = calMgr.deleteEvent(eventId1, isConfirmed = false)
+        assertFalse(unconfirmedDel.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_CONFIRMATION, unconfirmedDel.status)
+
+        // 8. Confirmed delete and verify removal
+        val confirmedDel = calMgr.deleteEvent(eventId1, isConfirmed = true)
+        assertTrue(confirmedDel.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, confirmedDel.status)
+    }
+
+    @Test
+    fun testSection13LocalWakeWordAcousticModelMfccAndAudioInterruptionRecovery() {
+        val engine = LocalWakeWordEngine(context = null)
+        // Before loading acoustic model in headless null-context mode, starting listening sets MODEL_UNAVAILABLE
+        engine.startListening()
+        assertEquals(WakeEngineState.MODEL_UNAVAILABLE, engine.engineState.value)
+
+        // Load bundled acoustic KWS model templates
+        val loaded = engine.loadAcousticModel(allowEmbeddedFallbackInTests = true)
+        assertTrue(loaded)
+        assertTrue(engine.isOfflineKwsModelAvailable())
+
+        // Start listening transitions to LISTENING_FOR_WAKE
+        engine.startListening()
+        assertEquals(WakeEngineState.LISTENING_FOR_WAKE, engine.engineState.value)
+
+        // Test PCM preprocessing & 13-coefficient MFCC extraction
+        val syntheticFrame = ShortArray(512) { idx ->
+            (Math.sin(2.0 * Math.PI * 440.0 * idx / 16000.0) * 12000).toInt().toShort()
+        }
+        val preprocessed = engine.preprocessPcmFrame(syntheticFrame, 512)
+        assertEquals(512, preprocessed.size)
+        val mfcc = engine.extractMfccFeatures(syntheticFrame, 512)
+        assertEquals(13, mfcc.size)
+
+        // Audio interruption & automatic recovery
+        engine.onAudioInterruptionStarted("Phone call active")
+        assertEquals(WakeEngineState.MICROPHONE_BUSY, engine.engineState.value)
+        engine.recoverFromAudioInterruption()
+        assertEquals(WakeEngineState.LISTENING_FOR_WAKE, engine.engineState.value)
+    }
+
+    @Test
+    fun testScenario4DynamicUnknownMultiToolWorkflow() {
+        val brain = createHeadlessBrain()
+        val prompt = "Check battery status, then check free storage space, then inspect code in SampleAgentModule.kt, then summarize the workspace guide document, and then save the summary as a note"
+        val task = brain.planTaskForInstruction(prompt)
+
+        assertEquals(5, task.actions.size)
+        assertEquals(ActionType.GET_BATTERY_STATE, task.actions[0].actionType)
+        assertEquals(ActionType.GET_STORAGE_INFO, task.actions[1].actionType)
+        assertEquals(ActionType.CODE_INSPECT_FILE, task.actions[2].actionType)
+        assertEquals(ActionType.DOC_SUMMARIZE, task.actions[3].actionType)
+        assertEquals(ActionType.SAVE_NOTE, task.actions[4].actionType)
+    }
+
+    @Test
+    fun testScenario5TaskCheckpointAndDuplicateSideEffectPrevention() {
+        val runtime = UnsafeTestHelper.allocateWithoutInit(com.example.core.agent.AgentRuntime::class.java)
+        val setField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("completedSideEffectSignatures").apply {
+            isAccessible = true
+        }
+        val backingSet = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+        setField.set(runtime, backingSet)
+
+        assertFalse(runtime.hasSideEffectAlreadyExecuted("task-99", "act-1"))
+        runtime.markSideEffectExecuted("task-99", "act-1")
+        assertTrue(runtime.hasSideEffectAlreadyExecuted("task-99", "act-1"))
+    }
+
+    @Test
+    fun testScenario6PersistentAutomationTriggersPauseResumeAndRebootReschedule() = runBlocking {
+        val autoEngine = com.example.core.automation.AutomationEngine(context = null)
+
+        val batteryRule = autoEngine.createRule(
+            name = "Low Battery Saver Note",
+            triggerType = com.example.core.automation.AutomationTriggerType.BATTERY_BELOW_THRESHOLD,
+            triggerConditionValue = "25",
+            actionInstruction = "Save a note: Battery dropped below 25%"
+        )
+        val executedInstructions = mutableListOf<String>()
+        autoEngine.onEventTriggered(
+            triggerType = com.example.core.automation.AutomationTriggerType.BATTERY_BELOW_THRESHOLD,
+            eventValue = "20"
+        ) { instr ->
+            executedInstructions.add(instr)
+            true to "Saved battery note"
+        }
+        assertEquals(1, executedInstructions.size)
+
+        // Pause all automations -> should not trigger while paused
+        autoEngine.pauseAllAutomations()
+        assertTrue(autoEngine.isPaused.value)
+        autoEngine.onEventTriggered(
+            triggerType = com.example.core.automation.AutomationTriggerType.BATTERY_BELOW_THRESHOLD,
+            eventValue = "15"
+        ) { instr ->
+            executedInstructions.add(instr)
+            true to "Should not run"
+        }
+        assertEquals(1, executedInstructions.size)
+
+        // Resume automations and verify JSON persistence export/import
+        autoEngine.resumeAllAutomations()
+        assertFalse(autoEngine.isPaused.value)
+        val exportedJson = autoEngine.exportRulesJson()
+        assertTrue(exportedJson.contains("Low Battery Saver Note"))
+        assertTrue(autoEngine.importRulesJson(exportedJson))
+        assertNotNull(autoEngine.rules.value.find { it.ruleId == batteryRule.ruleId })
+    }
+
+    private fun createHeadlessBrain(): AgentBrain {
+        val dummyExecutor = UnsafeTestHelper.allocateWithoutInit(ActionExecutor::class.java)
+        val dummyProvider = UnsafeTestHelper.allocateWithoutInit(com.example.core.provider.AIProviderManager::class.java)
+        val dummyWorkspace = UnsafeTestHelper.allocateWithoutInit(WorkspaceManager::class.java)
+        return AgentBrain(
+            providerManager = dummyProvider,
+            actionExecutor = dummyExecutor,
+            workspaceManager = dummyWorkspace,
+            skillManager = SkillManager(),
+            subAgentManager = SubAgentManager()
+        )
+    }
 }
 
 private object UnsafeTestHelper {
@@ -1005,3 +1260,4 @@ private object UnsafeTestHelper {
         return allocateInstance.invoke(unsafe, clazz) as T
     }
 }
+

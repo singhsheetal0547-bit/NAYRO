@@ -136,6 +136,78 @@ object TaskPlanner {
                 )
             }
 
+            UserIntentType.WHATSAPP_READ -> {
+                val query = intent.searchQueryOrContent ?: intent.targetAppOrEntity ?: "WhatsApp"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.WHATSAPP_READ_CONVERSATION,
+                        target = query,
+                        parameters = mapOf("query" to query),
+                        requiredCapability = CapabilityId.ACCESSIBILITY,
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.CALENDAR_READ -> {
+                val dateQuery = intent.searchQueryOrContent ?: intent.targetAppOrEntity ?: "upcoming"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.READ_CALENDAR_EVENTS,
+                        target = dateQuery,
+                        parameters = mapOf("date" to dateQuery),
+                        riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.CALENDAR_CREATE -> {
+                val title = intent.searchQueryOrContent ?: "Scheduled Meeting"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.CREATE_CALENDAR_EVENT,
+                        target = title,
+                        parameters = mapOf("title" to title),
+                        riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                        idempotencyClassification = "NON_IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.CALENDAR_UPDATE -> {
+                val eventId = intent.targetAppOrEntity ?: "0"
+                val newTitle = intent.searchQueryOrContent ?: "Updated Meeting"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.UPDATE_CALENDAR_EVENT,
+                        target = eventId,
+                        parameters = mapOf("eventId" to eventId, "title" to newTitle),
+                        riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                        idempotencyClassification = "NON_IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.CALENDAR_DELETE -> {
+                val eventId = intent.targetAppOrEntity ?: "0"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.DELETE_CALENDAR_EVENT,
+                        target = eventId,
+                        parameters = mapOf("eventId" to eventId),
+                        riskLevel = RiskLevel.R4_FINANCIAL_PROHIBITED,
+                        idempotencyClassification = "NON_IDEMPOTENT"
+                    )
+                )
+            }
+
             UserIntentType.PHONE_CALL -> {
                 val targetRecipient = intent.recipient ?: "Contact"
                 actions.add(

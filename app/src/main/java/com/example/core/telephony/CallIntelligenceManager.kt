@@ -32,7 +32,10 @@ sealed class ContactResolutionResult {
  * Never returns fake caller names ("Rahul") or fake incoming call strings.
  * Performs real Android TelephonyManager state checks and ContactsContract resolution.
  */
-class CallIntelligenceManager(private val context: Context?) {
+class CallIntelligenceManager(
+    private val context: Context?,
+    private val contactDirectoryProvider: (() -> List<ResolvedContactItem>)? = null
+) {
 
     fun hasPhoneStatePermission(): Boolean {
         val ctx = context ?: return false
@@ -163,6 +166,16 @@ class CallIntelligenceManager(private val context: Context?) {
         val trimmed = nameQuery.trim()
         if (trimmed.isEmpty()) {
             return ContactResolutionResult.NotFound("")
+        }
+        contactDirectoryProvider?.let { provider ->
+            val matches = provider().filter {
+                it.displayName.contains(trimmed, ignoreCase = true)
+            }
+            return when {
+                matches.isEmpty() -> ContactResolutionResult.NotFound(trimmed)
+                matches.size == 1 -> ContactResolutionResult.SingleMatch(matches.first())
+                else -> ContactResolutionResult.Ambiguous(trimmed, matches)
+            }
         }
         val ctx = context ?: return ContactResolutionResult.PermissionRequired()
         if (!hasContactsPermission()) {

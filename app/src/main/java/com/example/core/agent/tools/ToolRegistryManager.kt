@@ -771,12 +771,60 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
             DynamicToolDefinition(
                 actionType = ActionType.READ_CALENDAR_EVENTS,
                 toolId = "util.read_calendar_events",
-                displayName = "Read Upcoming Calendar Events",
-                description = "Queries upcoming events from the Android Calendar provider when READ_CALENDAR permission is granted.",
+                displayName = "Read / Search Calendar Events",
+                description = "Queries upcoming or date-specific events from the Android Calendar provider, resolves relative dates (today, tomorrow), and detects overlapping schedule conflicts.",
                 category = ToolCategory.PRODUCTIVITY,
-                parametersSchema = mapOf("limit" to "Int - Max events to return"),
+                parametersSchema = mapOf(
+                    "date" to "String - Optional relative or ISO date (today, tomorrow, YYYY-MM-DD)",
+                    "query" to "String - Optional search keyword",
+                    "limit" to "Int - Max events to return"
+                ),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY,
                 requiredPermission = Manifest.permission.READ_CALENDAR
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.UPDATE_CALENDAR_EVENT,
+                toolId = "util.update_calendar_event",
+                displayName = "Update Calendar Event",
+                description = "Updates an existing calendar event's title, time, or location and verifies the change by re-reading the event.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf(
+                    "eventId" to "Long - Target calendar event ID",
+                    "title" to "String - Updated event title",
+                    "startTimeMs" to "Long - Optional new start time",
+                    "endTimeMs" to "Long - Optional new end time",
+                    "location" to "String - Optional new location"
+                ),
+                requiredParams = setOf("eventId"),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                requiredPermission = Manifest.permission.WRITE_CALENDAR
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.DELETE_CALENDAR_EVENT,
+                toolId = "util.delete_calendar_event",
+                displayName = "Delete Calendar Event",
+                description = "Deletes a calendar event by ID after user confirmation and verifies removal from the Calendar provider.",
+                category = ToolCategory.PRODUCTIVITY,
+                parametersSchema = mapOf("eventId" to "Long - Target calendar event ID"),
+                requiredParams = setOf("eventId"),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                requiredPermission = Manifest.permission.WRITE_CALENDAR
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.WHATSAPP_READ_CONVERSATION,
+                toolId = "comm.whatsapp_read_conversation",
+                displayName = "Read / Search WhatsApp Conversation",
+                description = "Opens WhatsApp, locates a contact's chat or searches for a topic, and summarizes visible recent messages.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("query" to "String - Contact name or search topic"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                requiredCapability = CapabilityId.ACCESSIBILITY
             )
         )
     }
