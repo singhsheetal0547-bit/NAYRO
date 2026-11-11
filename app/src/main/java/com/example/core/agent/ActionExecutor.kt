@@ -32,6 +32,7 @@ import com.example.core.skills.SkillManager
 import com.example.core.subagent.SubAgentManager
 import com.example.core.subagent.SubAgentStatus
 import com.example.core.subagent.SubAgentType
+import com.example.core.automation.AutomationEngine
 import com.example.core.calendar.CalendarIntegrationManager
 import com.example.core.communication.WhatsAppAutomationManager
 import com.example.core.telephony.CallIntelligenceManager
@@ -81,7 +82,8 @@ class ActionExecutor(
         context,
         callIntelligenceManager,
         screenIntelligenceManager
-    )
+    ),
+    val automationEngine: AutomationEngine = AutomationEngine(context)
 ) {
 
     companion object {
@@ -500,14 +502,29 @@ class ActionExecutor(
                     }
                 }
 
+                val hasCallPhonePermission = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.CALL_PHONE
+                ) == PackageManager.PERMISSION_GRANTED
+
                 try {
-                    val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phoneToDial)}")).apply {
+                    val callAction = if (hasCallPhonePermission && action.parameters["directCall"] == "true") {
+                        Intent.ACTION_CALL
+                    } else {
+                        Intent.ACTION_DIAL
+                    }
+                    val dialIntent = Intent(callAction, Uri.parse("tel:${Uri.encode(phoneToDial)}")).apply {
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
                     context.startActivity(dialIntent)
+                    val msg = if (callAction == Intent.ACTION_CALL) {
+                        "Placed phone call to $rawTarget ($phoneToDial)."
+                    } else {
+                        "Opened phone dialer for $rawTarget ($phoneToDial). Tap Call in the dialer to place the call."
+                    }
                     ActionExecutionResult(
                         true,
-                        "Opened phone dialer for $rawTarget ($phoneToDial).",
+                        msg,
                         VerificationStatus.VERIFIED
                     )
                 } catch (e: Exception) {
@@ -852,14 +869,28 @@ class ActionExecutor(
                 if (timeMs != null && timeMs < 0L) {
                     return ActionExecutionResult(false, "Invalid reminder timestamp: $timeMs.", VerificationStatus.FAILED)
                 }
+                val rawTimeSpec = action.parameters["time"]?.trim().orEmpty()
+                val scheduledTimeMs = timeMs?.takeIf { it > 0L }
+                    ?: automationEngine.parseReminderTimeMillis("$title $rawTimeSpec")
+                val (_, alarmRegistered) = automationEngine.scheduleReminder(
+                    reminderTitle = title,
+                    rawTimeSpec = rawTimeSpec,
+                    explicitTimeMs = scheduledTimeMs
+                )
+                val formattedWhen = SimpleDateFormat("EEE, MMM d h:mm a", Locale.US).format(Date(scheduledTimeMs))
                 val noteId = notebookManager.createNote(
                     title = "Reminder: $title",
-                    content = if (timeMs != null) "$title (Scheduled at $timeMs)" else title,
+                    content = "$title (Scheduled for $formattedWhen [$scheduledTimeMs])",
                     category = "Reminders"
                 )
+                val alarmSuffix = if (alarmRegistered) {
+                    "and registered with Android AlarmManager for $formattedWhen"
+                } else {
+                    "for $formattedWhen (saved to AutomationEngine schedule)"
+                }
                 ActionExecutionResult(
                     true,
-                    "Reminder '$title' persisted to local database (id #$noteId).",
+                    "Reminder '$title' persisted to local database (id #$noteId) $alarmSuffix.",
                     VerificationStatus.VERIFIED
                 )
             }

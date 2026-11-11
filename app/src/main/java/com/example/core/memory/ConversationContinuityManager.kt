@@ -20,6 +20,8 @@ data class ShortTermSessionContext(
     var lastMentionedFile: String? = null,
     var lastMentionedApp: String? = null,
     var lastStepOutput: String? = null,
+    var lastExecutedInstruction: String? = null,
+    var lastCalendarEventTitle: String? = null,
     var updatedAtMs: Long = System.currentTimeMillis()
 )
 
@@ -31,11 +33,12 @@ sealed class ContinuationResolution {
 }
 
 /**
- * Multi-Layer Conversation Continuity & Reference Resolution Manager (Part 9).
+ * Multi-Layer Conversation Continuity & Reference Resolution Manager (Part 9 & Phase 11).
  * Handles:
  * - Pending slot filling across turns (e.g. "Rahul ko WhatsApp message bhejna" -> "Kya message bhejna hai?" -> "Main busy hoon")
  * - Conversational Yes/No confirmation continuation
  * - Pronoun and reference resolution ("him", "her", "usko", "that file", "it")
+ * - Follow-up task references ("Do the same thing again", "Pichhla task continue karo", "Wahi event kal ke liye bana do", "Remind me after the meeting")
  * - Context expiration so stale conversations are never merged into unrelated requests.
  */
 class ConversationContinuityManager {
@@ -64,7 +67,9 @@ class ConversationContinuityManager {
         contact: String? = null,
         file: String? = null,
         app: String? = null,
-        stepOutput: String? = null
+        stepOutput: String? = null,
+        executedInstruction: String? = null,
+        calendarEventTitle: String? = null
     ) {
         if (!contact.isNullOrBlank() && !contact.equals("Contact", ignoreCase = true)) {
             sessionContext.lastMentionedContact = contact.trim()
@@ -78,15 +83,54 @@ class ConversationContinuityManager {
         if (!stepOutput.isNullOrBlank()) {
             sessionContext.lastStepOutput = stepOutput.trim()
         }
+        if (!executedInstruction.isNullOrBlank()) {
+            sessionContext.lastExecutedInstruction = executedInstruction.trim()
+        }
+        if (!calendarEventTitle.isNullOrBlank()) {
+            sessionContext.lastCalendarEventTitle = calendarEventTitle.trim()
+        }
         sessionContext.updatedAtMs = System.currentTimeMillis()
     }
 
     fun getSessionContext(): ShortTermSessionContext = sessionContext.copy()
 
     /**
-     * Resolves pronouns ("him", "her", "usko", "usse", "that file") in [rawPrompt] using recent session context.
+     * Resolves pronouns ("him", "her", "usko", "usse", "that file") and contextual follow-up
+     * directives ("Do the same thing again", "Wahi event kal ke liye bana do", "Remind me after the meeting")
+     * in [rawPrompt] using recent session context.
      */
     fun resolveReferencesInPrompt(rawPrompt: String): String {
+        val trimmed = rawPrompt.trim()
+        val lower = trimmed.lowercase()
+
+        // 1. Repeat / continue previous task follow-ups
+        if (lower in setOf(
+                "do the same thing again",
+                "do the same thing again.",
+                "repeat that",
+                "wahi phir se karo",
+                "pichhla task continue karo",
+                "continue where you stopped",
+                "continue where you stopped."
+            )
+        ) {
+            sessionContext.lastExecutedInstruction?.takeIf { it.isNotBlank() }?.let { prev ->
+                return prev
+            }
+        }
+
+        // 2. "Wahi event kal ke liye bana do"
+        if (lower.contains("wahi event") && (lower.contains("kal") || lower.contains("tomorrow"))) {
+            val evTitle = sessionContext.lastCalendarEventTitle ?: "Scheduled Meeting"
+            return "Create calendar event: $evTitle"
+        }
+
+        // 3. "Remind me after the meeting"
+        if (lower.startsWith("remind me after the meeting") || lower.contains("meeting ke baad yaad dilana")) {
+            val evTitle = sessionContext.lastCalendarEventTitle ?: "the meeting"
+            return "Remind me in 60 minutes to follow up after $evTitle"
+        }
+
         var resolved = rawPrompt
         val lastContact = sessionContext.lastMentionedContact
         if (!lastContact.isNullOrBlank()) {

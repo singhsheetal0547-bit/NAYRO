@@ -56,6 +56,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.core.agent.AgentState
 import com.example.core.agent.AgentTask
+import com.example.core.agent.toUserFriendlyDescription
+import com.example.core.agent.toUserFriendlyIntentLabel
 import com.example.data.local.entities.ConversationEntity
 import com.example.ui.components.AssistantOrb
 import com.example.ui.components.StatusBadge
@@ -78,6 +80,8 @@ fun HomeScreen(
     onVoiceTap: () -> Unit = {},
     onSendText: (String) -> Unit = {},
     onCancelTask: () -> Unit = {},
+    onPauseTask: () -> Unit = {},
+    onResumeTask: () -> Unit = {},
     onQuickActionClick: (String) -> Unit = {}
 ) {
     var textInput by remember { mutableStateOf("") }
@@ -164,7 +168,7 @@ fun HomeScreen(
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "Autonomous Android Agent • Voice, Screen & 48 Native Tools",
+                            text = "Autonomous Android Agent • Voice, Screen & 52 Native Tools",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -198,11 +202,12 @@ fun HomeScreen(
                     text = when (agentState) {
                         is AgentState.UserListening -> "Listening to you..."
                         is AgentState.Transcribing -> "Transcribing your voice..."
-                        is AgentState.Thinking -> "$assistantName is planning & reasoning..."
+                        is AgentState.Thinking -> "Understanding your request..."
                         is AgentState.Speaking -> "$assistantName is speaking..."
-                        is AgentState.ExecutingTask -> "Executing step ${agentState.step} of ${agentState.totalSteps}: ${agentState.currentAction.actionType}"
-                        is AgentState.ExecutingAction -> "Executing ${agentState.toolName}..."
-                        is AgentState.WaitingForConfirmation -> "Awaiting your confirmation to proceed..."
+                        is AgentState.PlanningTask -> "Planning steps: ${agentState.task.resolvedIntent.toUserFriendlyIntentLabel()}"
+                        is AgentState.ExecutingTask -> "Step ${agentState.step} of ${agentState.totalSteps}: ${agentState.currentAction.actionType.toUserFriendlyDescription(agentState.currentAction.target, agentState.currentAction.parameters)}"
+                        is AgentState.ExecutingAction -> "${agentState.toolName.toUserFriendlyIntentLabel()}..."
+                        is AgentState.WaitingForConfirmation -> "Waiting for your confirmation before proceeding."
                         is AgentState.WaitingForPermission -> "Waiting for required Android permission (${agentState.permission})..."
                         is AgentState.Completed -> agentState.responseText.take(120)
                         is AgentState.Error -> "Alert: ${agentState.message.take(100)}"
@@ -279,7 +284,9 @@ fun HomeScreen(
         currentTask?.let { task ->
             TaskExecutionCard(
                 task = task,
-                onCancelTask = onCancelTask
+                onCancelTask = onCancelTask,
+                onPauseTask = onPauseTask,
+                onResumeTask = onResumeTask
             )
             Spacer(modifier = Modifier.height(16.dp))
         }

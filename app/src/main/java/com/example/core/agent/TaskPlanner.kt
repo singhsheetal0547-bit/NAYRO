@@ -281,6 +281,19 @@ object TaskPlanner {
             }
 
             UserIntentType.NOTE_CREATE -> {
+                val lowerPrompt = intent.rawPrompt.lowercase()
+                if (lowerPrompt.contains("current screen") || lowerPrompt.contains("from screen")) {
+                    actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.READ_SCREEN,
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                            verificationStrategy = "VERIFY_SCREEN_READ",
+                            idempotencyClassification = "IDEMPOTENT"
+                        )
+                    )
+                }
                 actions.add(
                     AgentAction(
                         taskId = taskId,

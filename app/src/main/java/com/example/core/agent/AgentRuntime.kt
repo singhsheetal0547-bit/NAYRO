@@ -89,7 +89,8 @@ class AgentRuntime(
         skillManager = skillManager,
         subAgentManager = subAgentManager,
         callIntelligenceManager = callIntelligenceManager,
-        workflowEngine = workflowEngine
+        workflowEngine = workflowEngine,
+        automationEngine = automationEngine
     )
 
     val agentBrain = AgentBrain(
@@ -338,11 +339,12 @@ class AgentRuntime(
                     }
                     planned
                 } else {
-                    agentBrain.planTaskForInstruction(resolvedPrompt)
+                    agentBrain.planDynamicTaskWithModel(resolvedPrompt)
                 }
             }
         }
 
+        continuityManager.recordEntityContext(executedInstruction = resolvedPrompt)
         _currentTask.value = task
         AgentEventBus.emit(AgentEvent.TaskCreated(task))
 
@@ -607,6 +609,12 @@ class AgentRuntime(
                     completedStepIds.add(action.actionId)
                     if (action.idempotencyClassification == "NON_IDEMPOTENT") {
                         markSideEffectExecuted(task.taskId, action.actionId)
+                    }
+                    if (action.actionType == ActionType.CREATE_CALENDAR_EVENT) {
+                        val eventTitle = (action.target ?: action.parameters["title"])?.trim()
+                        if (!eventTitle.isNullOrBlank()) {
+                            continuityManager.recordEntityContext(calendarEventTitle = eventTitle)
+                        }
                     }
                     stepOutputs.add(verification.details)
                     stepContext["previousStepOutput"] = verification.details

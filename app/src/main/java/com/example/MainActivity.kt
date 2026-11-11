@@ -336,6 +336,12 @@ fun NayroAppContent(
                         onCancelTask = {
                             agentRuntime.cancelCurrentTask()
                         },
+                        onPauseTask = {
+                            agentRuntime.pauseCurrentTask()
+                        },
+                        onResumeTask = {
+                            agentRuntime.resumeCurrentTask()
+                        },
                         onQuickActionClick = { tag ->
                             when (tag) {
                                 "action_dashboard" -> currentScreen = Screen.AgentDashboard

@@ -34,6 +34,8 @@ import com.example.MainActivity
 import com.example.NayroApplication
 import com.example.R
 import com.example.core.agent.AgentState
+import com.example.core.agent.toUserFriendlyDescription
+import com.example.core.agent.toUserFriendlyIntentLabel
 import com.example.core.service.ServiceLifecycleState
 import com.example.core.service.ServiceStateRepository
 import com.example.core.service.ServiceStatus
@@ -812,11 +814,11 @@ class NayroFloatingService : Service() {
                             is AgentState.StandbyListening -> "State: Wake Standby Active"
                             is AgentState.UserListening -> "State: Listening to Microphone..."
                             is AgentState.Transcribing -> "State: Transcribing Speech..."
-                            is AgentState.Thinking -> "State: Planning & Reasoning..."
-                            is AgentState.PlanningTask -> "State: Planning Task (${state.task.resolvedIntent})"
+                            is AgentState.Thinking -> "State: Understanding your request..."
+                            is AgentState.PlanningTask -> "State: Planning (${state.task.resolvedIntent.toUserFriendlyIntentLabel()})"
                             is AgentState.ProposingAction -> "State: Proposing Action"
-                            is AgentState.ExecutingTask -> "State: Step ${state.step}/${state.totalSteps} (${state.currentAction.actionType})"
-                            is AgentState.ExecutingAction -> "State: Running ${state.toolName}..."
+                            is AgentState.ExecutingTask -> "State: Step ${state.step}/${state.totalSteps} • ${state.currentAction.actionType.toUserFriendlyDescription(state.currentAction.target, state.currentAction.parameters)}"
+                            is AgentState.ExecutingAction -> "State: ${state.toolName.toUserFriendlyIntentLabel()}..."
                             is AgentState.WaitingForConfirmation -> "State: Waiting for Confirmation"
                             is AgentState.WaitingForPermission -> "State: Waiting for Permission (${state.permission})"
                             is AgentState.Speaking -> "State: Speaking Response"

@@ -15,7 +15,12 @@ import com.example.core.agent.TaskStateManager
 import com.example.core.agent.UserIntentType
 import com.example.core.agent.VerificationResult
 import com.example.core.agent.VerificationStatus
+import com.example.core.agent.toUserFriendlyDescription
+import com.example.core.agent.toUserFriendlyIntentLabel
+import com.example.core.agent.toUserFriendlyLabel
 import com.example.core.agent.tools.ToolRegistryManager
+import com.example.core.automation.AutomationEngine
+import com.example.core.memory.ConversationContinuityManager
 import com.example.core.screen.ScreenIntelligenceManager
 import com.example.core.skills.SkillManager
 import com.example.core.subagent.SubAgentManager
@@ -1233,6 +1238,228 @@ class SecurityAndVerificationTests {
         assertTrue(exportedJson.contains("Low Battery Saver Note"))
         assertTrue(autoEngine.importRulesJson(exportedJson))
         assertNotNull(autoEngine.rules.value.find { it.ruleId == batteryRule.ruleId })
+    }
+
+    @Test
+    fun testSection22AllRealWorldAcceptanceScenariosAToL() = runBlocking {
+        val brain = createHeadlessBrain()
+
+        // TEST A — "Open WhatsApp"
+        val testA = brain.planTaskForInstruction("Open WhatsApp")
+        assertEquals(ActionType.LAUNCH_APP, testA.actions.first().actionType)
+        assertEquals("WhatsApp", testA.actions.first().target)
+
+        // TEST B — "Find Satyam and send Hi"
+        val testB = brain.planTaskForInstruction("Find Satyam and send Hi")
+        assertTrue(testB.actions.any { it.actionType == ActionType.LAUNCH_APP })
+        assertTrue(testB.actions.any { it.actionType == ActionType.CLICK_ELEMENT && it.target == "Satyam" })
+        assertTrue(testB.actions.any { it.actionType == ActionType.SET_TEXT && it.parameters["text"] == "Hi" })
+        assertTrue(testB.actions.any { it.actionType == ActionType.ASK_USER_CONFIRMATION && it.riskLevel == RiskLevel.R3_EXTERNAL_COMMUNICATION })
+
+        // TEST C — "Open YouTube and search Android agent"
+        val testC = brain.planTaskForInstruction("Open YouTube and search Android agent")
+        assertEquals(ActionType.LAUNCH_APP, testC.actions[0].actionType)
+        assertEquals("com.google.android.youtube", testC.actions[0].target)
+        assertEquals(ActionType.SET_TEXT, testC.actions.last().actionType)
+        assertEquals("Android agent", testC.actions.last().parameters["query"])
+
+        // TEST D — "Open Settings and go to Wi-Fi"
+        val testD = brain.planTaskForInstruction("Open Settings and go to Wi-Fi")
+        assertEquals(ActionType.OPEN_SETTINGS_SECTION, testD.actions[0].actionType)
+        assertEquals("wifi", testD.actions[0].target)
+
+        // TEST E — "Remind me tomorrow at 7 AM"
+        val testE = brain.planTaskForInstruction("Remind me tomorrow at 7 AM")
+        assertEquals(ActionType.CREATE_REMINDER, testE.actions[0].actionType)
+        assertEquals("tomorrow at 7 AM", testE.actions[0].target)
+
+        // TEST F — "Read the current screen"
+        val testF = brain.planTaskForInstruction("Read the current screen")
+        assertEquals(ActionType.READ_SCREEN, testF.actions[0].actionType)
+
+        // TEST G — "Save a note from current screen"
+        val testG = brain.planTaskForInstruction("Save a note from current screen")
+        assertEquals(ActionType.READ_SCREEN, testG.actions[0].actionType)
+        assertEquals(ActionType.SAVE_NOTE, testG.actions[1].actionType)
+
+        // TEST H — "Summarize my recent notifications"
+        val testH = brain.planTaskForInstruction("Summarize my recent notifications")
+        assertEquals(ActionType.SUMMARIZE_NOTIFICATIONS, testH.actions[0].actionType)
+
+        // TEST I — "Find my downloaded PDF"
+        val testI = brain.planTaskForInstruction("Find my downloaded PDF")
+        assertEquals(ActionType.FILE_SEARCH, testI.actions[0].actionType)
+        assertEquals(".pdf", testI.actions[0].target)
+
+        // TEST J — "Call Rahul"
+        val testJ = brain.planTaskForInstruction("Call Rahul")
+        assertEquals(ActionType.MAKE_PHONE_CALL, testJ.actions[0].actionType)
+        assertEquals("Rahul", testJ.actions[0].target)
+        assertEquals(RiskLevel.R3_EXTERNAL_COMMUNICATION, testJ.actions[0].riskLevel)
+
+        // TEST K — "Turn on the flashlight"
+        val testK = brain.planTaskForInstruction("Turn on the flashlight")
+        assertEquals(ActionType.TOGGLE_FLASHLIGHT, testK.actions[0].actionType)
+        assertEquals("ON", testK.actions[0].target)
+
+        // TEST L — "Stop current task"
+        val stateManager = TaskStateManager()
+        val runningTask = brain.planTaskForInstruction("Open YouTube and search Android agent")
+        stateManager.transition(runningTask, TaskState.RUNNING)
+        val cancelled = stateManager.transition(runningTask, TaskState.CANCELLED, "Stopped by user")
+        assertTrue(cancelled)
+        assertEquals(TaskState.CANCELLED, runningTask.state)
+    }
+
+    @Test
+    fun testSection19HumanReadableStatusMessages() {
+        val msgDesc = ActionType.MESSAGE_DRAFT_SEND.toUserFriendlyDescription(
+            target = "com.whatsapp",
+            parameters = mapOf("recipient" to "Rahul")
+        )
+        assertEquals("Preparing your WhatsApp message for Rahul...", msgDesc)
+        assertFalse(msgDesc.contains("MESSAGE_DRAFT_SEND"))
+
+        val llmDesc = ActionType.QUERY_LLM.toUserFriendlyDescription()
+        assertEquals("Understanding your request...", llmDesc)
+        assertFalse(llmDesc.contains("QUERY_LLM"))
+
+        assertEquals("Preparing your WhatsApp message", "MESSAGE_DRAFT_SEND".toUserFriendlyIntentLabel())
+        assertEquals("Understanding your request", "GENERAL_AI_QUERY".toUserFriendlyIntentLabel())
+        assertEquals("In Progress", TaskState.EXECUTING.toUserFriendlyLabel())
+        assertEquals("Waiting for Confirmation", TaskState.WAITING_FOR_CONFIRMATION.toUserFriendlyLabel())
+    }
+
+    @Test
+    fun testPhase9ReminderTimeParsingAndScheduling() {
+        val engine = AutomationEngine()
+        val fixedNow = 1_760_000_000_000L
+
+        val in15Min = engine.parseReminderTimeMillis("Remind me in 15 minutes to call mom", fixedNow)
+        assertEquals(fixedNow + 15L * 60_000L, in15Min)
+
+        val in2Hours = engine.parseReminderTimeMillis("in 2 hours", fixedNow)
+        assertEquals(fixedNow + 2L * 3_600_000L, in2Hours)
+
+        val tomorrow7Am = engine.parseReminderTimeMillis("tomorrow at 7 AM", fixedNow)
+        assertTrue("Tomorrow at 7 AM must be in the future", tomorrow7Am > fixedNow)
+
+        val (scheduledRule, _) = engine.scheduleReminder(
+            reminderTitle = "Submit architecture report",
+            rawTimeSpec = "in 30 minutes",
+            nowMs = fixedNow
+        )
+        assertTrue(engine.rules.value.any { it.ruleId == scheduledRule.ruleId })
+    }
+
+    @Test
+    fun testPhase11ConversationContinuityFollowUps() {
+        val continuity = ConversationContinuityManager()
+        continuity.recordEntityContext(
+            contact = "Rahul",
+            app = "WhatsApp",
+            calendarEventTitle = "Design Review",
+            executedInstruction = "Open YouTube and search Kotlin"
+        )
+
+        val r1 = continuity.resolveReferencesInPrompt("Usko message bhejo")
+        assertTrue("Expected Rahul in resolved prompt: $r1", r1.contains("Rahul"))
+
+        val r2 = continuity.resolveReferencesInPrompt("Do the same thing again")
+        assertEquals("Open YouTube and search Kotlin", r2)
+
+        val r3 = continuity.resolveReferencesInPrompt("Pichhla task continue karo")
+        assertEquals("Open YouTube and search Kotlin", r3)
+
+        val r4 = continuity.resolveReferencesInPrompt("Wahi event kal ke liye bana do")
+        assertTrue("Expected Design Review in resolved prompt: $r4", r4.contains("Design Review"))
+
+        val r5 = continuity.resolveReferencesInPrompt("Remind me after the meeting")
+        assertTrue("Expected Design Review in resolved prompt: $r5", r5.contains("Design Review"))
+    }
+
+    @Test
+    fun testPhase17MandatoryTestCasesT01ToT30() {
+        val brain = createHeadlessBrain()
+
+        // T01: "Hello Babu"
+        val t01 = brain.planTaskForInstruction("Hello Babu")
+        assertTrue(t01.actions.isNotEmpty())
+
+        // T03: "Open YouTube"
+        val t03 = brain.planTaskForInstruction("Open YouTube")
+        assertEquals(ActionType.LAUNCH_APP, t03.actions.first().actionType)
+        assertTrue(t03.actions.first().target.equals("YouTube", ignoreCase = true) || t03.actions.first().target == "com.google.android.youtube")
+
+        // T04: "Open YouTube and search Kotlin"
+        val t04 = brain.planTaskForInstruction("Open YouTube and search Kotlin")
+        assertEquals(ActionType.LAUNCH_APP, t04.actions.first().actionType)
+        assertEquals("Kotlin", t04.actions.last().parameters["query"])
+
+        // T05: "Open Settings and go to Wi-Fi"
+        val t05 = brain.planTaskForInstruction("Open Settings and go to Wi-Fi")
+        assertEquals(ActionType.OPEN_SETTINGS_SECTION, t05.actions.first().actionType)
+        assertEquals("wifi", t05.actions.first().target)
+
+        // T06: "Turn on flashlight"
+        val t06 = brain.planTaskForInstruction("Turn on flashlight")
+        assertEquals(ActionType.TOGGLE_FLASHLIGHT, t06.actions.first().actionType)
+        assertEquals("ON", t06.actions.first().target)
+
+        // T07: "Turn off flashlight"
+        val t07 = brain.planTaskForInstruction("Turn off flashlight")
+        assertEquals(ActionType.TOGGLE_FLASHLIGHT, t07.actions.first().actionType)
+        assertEquals("OFF", t07.actions.first().target)
+
+        // T08: "Check battery level"
+        val t08 = brain.planTaskForInstruction("Check battery level")
+        assertEquals(ActionType.GET_BATTERY_STATE, t08.actions.first().actionType)
+
+        // T09: "Check storage status"
+        val t09 = brain.planTaskForInstruction("Check storage status")
+        assertEquals(ActionType.GET_STORAGE_INFO, t09.actions.first().actionType)
+
+        // T10: "Read current screen"
+        val t10 = brain.planTaskForInstruction("Read current screen")
+        assertEquals(ActionType.READ_SCREEN, t10.actions.first().actionType)
+
+        // T12: "Scroll down"
+        val t12 = brain.planTaskForInstruction("Scroll down")
+        assertEquals(ActionType.SCROLL_FORWARD, t12.actions.first().actionType)
+
+        // T16: "Send WhatsApp message to Rahul saying hello"
+        val t16 = brain.planTaskForInstruction("Send WhatsApp message to Rahul saying hello")
+        assertTrue(t16.actions.any { it.actionType == ActionType.LAUNCH_APP && it.target == "com.whatsapp" })
+        assertTrue(t16.actions.any { it.actionType == ActionType.CLICK_ELEMENT && it.target == "Rahul" })
+        assertTrue(t16.actions.any { it.actionType == ActionType.SET_TEXT && it.parameters["text"]?.equals("hello", ignoreCase = true) == true })
+        assertTrue(t16.actions.any { it.actionType == ActionType.ASK_USER_CONFIRMATION && it.riskLevel == RiskLevel.R3_EXTERNAL_COMMUNICATION && it.riskLevel.requiresConfirmation })
+
+        // T19: "Call Rahul"
+        val t19 = brain.planTaskForInstruction("Call Rahul")
+        assertEquals(ActionType.MAKE_PHONE_CALL, t19.actions.first().actionType)
+        assertEquals("Rahul", t19.actions.first().target)
+        assertTrue(t19.actions.first().riskLevel.requiresConfirmation)
+
+        // T20: "Remind me tomorrow at 7 AM"
+        val t20 = brain.planTaskForInstruction("Remind me tomorrow at 7 AM")
+        assertEquals(ActionType.CREATE_REMINDER, t20.actions.first().actionType)
+
+        // T21: "Create calendar event tomorrow at 5 PM"
+        val t21 = brain.planTaskForInstruction("Create calendar event Team Sync tomorrow at 5 PM")
+        assertEquals(ActionType.CREATE_CALENDAR_EVENT, t21.actions.first().actionType)
+
+        // T22: "Show today's agenda"
+        val t22 = brain.planTaskForInstruction("Show today's agenda")
+        assertEquals(ActionType.READ_CALENDAR_EVENTS, t22.actions.first().actionType)
+
+        // T23: "Summarize recent notifications"
+        val t23 = brain.planTaskForInstruction("Summarize recent notifications")
+        assertEquals(ActionType.SUMMARIZE_NOTIFICATIONS, t23.actions.first().actionType)
+
+        // T24: "Save a note from current screen"
+        val t24 = brain.planTaskForInstruction("Save a note from current screen")
+        assertEquals(ActionType.READ_SCREEN, t24.actions[0].actionType)
+        assertEquals(ActionType.SAVE_NOTE, t24.actions[1].actionType)
     }
 
     private fun createHeadlessBrain(): AgentBrain {

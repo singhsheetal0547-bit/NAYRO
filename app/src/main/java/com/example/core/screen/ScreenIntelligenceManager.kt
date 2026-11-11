@@ -82,4 +82,44 @@ class ScreenIntelligenceManager(private val context: Context) {
         val after = captureCurrentSnapshot()
         return ScreenChangeDetector.detectChange(before, after)
     }
+
+    /**
+     * Phase 4 — Semantic Screen Analysis: detects permission/system dialogs, loading spinners,
+     * and error/offline screens from the current [ScreenSnapshot].
+     */
+    fun analyzeScreenSemantics(snapshot: ScreenSnapshot? = captureCurrentSnapshot()): ScreenSemanticSignals {
+        if (snapshot == null) {
+            return ScreenSemanticSignals(
+                hasDialogOrPopup = false,
+                isLoadingState = false,
+                isErrorScreen = false
+            )
+        }
+        val combinedLower = snapshot.visibleTexts.joinToString(" ").lowercase()
+        val hasDialog = combinedLower.contains("while using the app") ||
+            combinedLower.contains("only this time") ||
+            (combinedLower.contains("allow") && combinedLower.contains("deny")) ||
+            (combinedLower.contains("ok") && combinedLower.contains("cancel"))
+        val isLoading = combinedLower.contains("loading...") ||
+            combinedLower.contains("please wait") ||
+            combinedLower.contains("buffering") ||
+            combinedLower.contains("connecting...")
+        val isError = combinedLower.contains("something went wrong") ||
+            combinedLower.contains("no internet") ||
+            combinedLower.contains("connection failed") ||
+            combinedLower.contains("try again")
+
+        return ScreenSemanticSignals(
+            hasDialogOrPopup = hasDialog,
+            isLoadingState = isLoading,
+            isErrorScreen = isError
+        )
+    }
 }
+
+data class ScreenSemanticSignals(
+    val hasDialogOrPopup: Boolean,
+    val isLoadingState: Boolean,
+    val isErrorScreen: Boolean
+)
+

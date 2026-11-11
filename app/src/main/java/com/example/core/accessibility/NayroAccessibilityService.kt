@@ -178,6 +178,60 @@ class NayroAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Dispatches a real double-tap gesture at (x, y) using two 60ms strokes separated by 120ms.
+     */
+    suspend fun dispatchDoubleTapGesture(x: Float, y: Float): Pair<Boolean, String> {
+        val displayMetrics = resources.displayMetrics
+        val maxW = displayMetrics.widthPixels.toFloat().coerceAtLeast(1080f)
+        val maxH = displayMetrics.heightPixels.toFloat().coerceAtLeast(2400f)
+
+        if (x < 0f || y < 0f || x > maxW || y > maxH) {
+            return false to "Invalid double-tap coordinates ($x, $y): outside screen bounds (0..$maxW, 0..$maxH)."
+        }
+
+        val outcome = withTimeoutOrNull(3000L) {
+            suspendCancellableCoroutine<Pair<Boolean, String>> { cont ->
+                try {
+                    val path1 = Path().apply { moveTo(x, y) }
+                    val path2 = Path().apply { moveTo(x, y) }
+                    val stroke1 = GestureDescription.StrokeDescription(path1, 0L, 60L)
+                    val stroke2 = GestureDescription.StrokeDescription(path2, 180L, 60L)
+                    val gesture = GestureDescription.Builder()
+                        .addStroke(stroke1)
+                        .addStroke(stroke2)
+                        .build()
+                    val dispatched = dispatchGesture(
+                        gesture,
+                        object : GestureResultCallback() {
+                            override fun onCompleted(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) {
+                                    cont.resume(true to "Dispatched double-tap gesture at ($x, $y).")
+                                }
+                            }
+
+                            override fun onCancelled(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) {
+                                    cont.resume(false to "Double-tap gesture at ($x, $y) was cancelled by the system.")
+                                }
+                            }
+                        },
+                        null
+                    )
+                    if (!dispatched && cont.isActive) {
+                        cont.resume(false to "System rejected double-tap gesture dispatch at ($x, $y).")
+                    }
+                } catch (e: Exception) {
+                    if (cont.isActive) {
+                        cont.resume(false to "Failed to dispatch double-tap gesture: ${e.localizedMessage}")
+                    }
+                }
+            }
+        }
+
+        return outcome ?: (false to "Double-tap gesture at ($x, $y) timed out.")
+    }
+
+    /**
      * Dispatches a real directional or coordinate swipe gesture via AccessibilityService.dispatchGesture.
      */
     suspend fun dispatchSwipeGesture(

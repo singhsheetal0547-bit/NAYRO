@@ -34,6 +34,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.core.agent.AgentTask
 import com.example.core.agent.TaskState
+import com.example.core.agent.toUserFriendlyDescription
+import com.example.core.agent.toUserFriendlyIntentLabel
+import com.example.core.agent.toUserFriendlyLabel
 import com.example.ui.theme.Coral
 import com.example.ui.theme.ErrorRed
 import com.example.ui.theme.ForestGreen
@@ -43,6 +46,8 @@ import com.example.ui.theme.SuccessGreen
 fun TaskExecutionCard(
     task: AgentTask,
     onCancelTask: () -> Unit,
+    onPauseTask: () -> Unit = {},
+    onResumeTask: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -80,7 +85,7 @@ fun TaskExecutionCard(
                     Icon(imageVector = stateIcon, contentDescription = null, tint = iconColor)
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = task.resolvedIntent,
+                        text = task.resolvedIntent.toUserFriendlyIntentLabel(),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onSurface
@@ -90,12 +95,12 @@ fun TaskExecutionCard(
                 val badgeColor = when (task.state) {
                     TaskState.COMPLETED -> SuccessGreen
                     TaskState.FAILED, TaskState.BLOCKED_BY_ANDROID -> ErrorRed
-                    TaskState.WAITING_FOR_CONFIRMATION, TaskState.WAITING_FOR_USER_INPUT -> Coral
+                    TaskState.WAITING_FOR_CONFIRMATION, TaskState.AWAITING_CONFIRMATION, TaskState.WAITING_FOR_USER_INPUT -> Coral
                     else -> ForestGreen
                 }
 
                 Text(
-                    text = task.state.name,
+                    text = task.state.toUserFriendlyLabel(),
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.SemiBold,
                     color = badgeColor,
@@ -130,7 +135,7 @@ fun TaskExecutionCard(
                 )
                 task.currentAction?.let { action ->
                     Text(
-                        text = "${action.actionType} • ${action.riskLevel.code}",
+                        text = "${action.actionType.toUserFriendlyDescription(action.target, action.parameters)} (${action.riskLevel.code})",
                         style = MaterialTheme.typography.labelSmall,
                         color = Coral
                     )
@@ -157,9 +162,28 @@ fun TaskExecutionCard(
             ) {
                 Spacer(modifier = Modifier.height(12.dp))
                 Row(
-                    horizontalArrangement = Arrangement.End,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
                     modifier = Modifier.fillMaxWidth()
                 ) {
+                    if (task.state == TaskState.PAUSED) {
+                        OutlinedButton(
+                            onClick = onResumeTask,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = ForestGreen),
+                            modifier = Modifier.testTag("btn_resume_task")
+                        ) {
+                            Icon(imageVector = Icons.Default.PlayArrow, contentDescription = null)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Resume")
+                        }
+                    } else {
+                        OutlinedButton(
+                            onClick = onPauseTask,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Coral),
+                            modifier = Modifier.testTag("btn_pause_task")
+                        ) {
+                            Text("Pause")
+                        }
+                    }
                     OutlinedButton(
                         onClick = onCancelTask,
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed),
@@ -174,3 +198,4 @@ fun TaskExecutionCard(
         }
     }
 }
+

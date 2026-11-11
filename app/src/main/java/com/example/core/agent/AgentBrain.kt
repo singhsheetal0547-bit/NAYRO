@@ -123,18 +123,28 @@ class AgentBrain(
     }
 
     /**
-     * Dynamically plans a task using the active LLM provider's structured JSON tool-calling capability,
-     * falling back to [planTaskForInstruction] if no cloud/local provider is configured or reachable.
+     * Dynamically plans a task using deterministic/inferred tool decomposition first, and invokes
+     * the active LLM provider's structured JSON tool-calling capability when novel requests require
+     * model-driven decomposition, falling back to [planTaskForInstruction].
      */
     suspend fun planDynamicTaskWithModel(
         userPrompt: String,
         existingTaskId: String = UUID.randomUUID().toString()
     ): AgentTask {
-        val activeProvider = providerManager.activeProvider.value
+        val initialPlan = planTaskForInstruction(userPrompt, existingTaskId)
+        val isGenericLlmFallback = initialPlan.actions.size == 1 &&
+            initialPlan.actions.first().actionType == ActionType.QUERY_LLM
+
+        if (!isGenericLlmFallback) {
+            return initialPlan
+        }
+
+        val activeProvider = try { providerManager.activeProvider.value } catch (_: Exception) { null }
         if (activeProvider != null && activeProvider.hasKeySaved) {
             val systemPrompt = buildString {
                 append("You are the NAYRO Agent Planner (Babu). ")
-                append("Decompose the user's goal into a JSON array of tool calls using ONLY the registered ActionTypes below.\n")
+                append("If the user is asking to perform device/app actions, decompose the goal into a JSON array of tool calls using ONLY the registered ActionTypes below. ")
+                append("If it is a general knowledge question, output a single QUERY_LLM action.\n")
                 append("Output ONLY valid JSON array: [{\"actionType\": \"...\", \"target\": \"...\", \"parameters\": {...}}]\n")
                 append(ToolRegistryManager.generateLlmToolPromptSummary())
             }
@@ -152,7 +162,7 @@ class AgentBrain(
                 }
             }
         }
-        return planTaskForInstruction(userPrompt, existingTaskId)
+        return initialPlan
     }
 
     /**
@@ -238,6 +248,50 @@ class AgentBrain(
                     taskId = taskId,
                     actionType = ActionType.GET_DEVICE_INFO,
                     riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("scroll down") || lower.contains("scroll forward") || lower.contains("neeche scroll")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.SCROLL_FORWARD,
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("scroll up") || lower.contains("scroll backward") || lower.contains("upar scroll")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.SCROLL_BACKWARD,
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("navigate back") || lower.contains("go back") || lower == "back") {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.NAVIGATE_BACK,
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("take screenshot") || lower.contains("take a screenshot") || lower.contains("capture screen")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.TAKE_SCREENSHOT,
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
                     idempotencyClassification = "IDEMPOTENT"
                 )
             )

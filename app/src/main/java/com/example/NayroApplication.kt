@@ -113,7 +113,7 @@ class NayroApplication : Application() {
         continuityManager = ConversationContinuityManager()
         workflowEngine = CrossAppWorkflowEngine()
         proactiveEngine = ProactiveIntelligenceEngine()
-        automationEngine = AutomationEngine()
+        automationEngine = AutomationEngine(this)
         operatingStateManager = DeviceOperatingStateManager(this)
 
         agentRuntime = AgentRuntime(

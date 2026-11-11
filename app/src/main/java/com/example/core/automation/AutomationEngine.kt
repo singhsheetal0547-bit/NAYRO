@@ -425,6 +425,144 @@ class AutomationEngine(private val context: Context? = null) {
         return cal.timeInMillis
     }
 
+    /**
+     * Phase 9 — Parses natural language reminder specifications ("tomorrow at 7 AM",
+     * "today at 6:30 PM", "in 15 minutes", "in 2 hours", "kal subah 7 baje") in the device timezone.
+     */
+    fun parseReminderTimeMillis(rawSpec: String, nowMs: Long = System.currentTimeMillis()): Long {
+        val lower = rawSpec.trim().lowercase()
+
+        // 1. Relative minutes/hours: "in 15 minutes", "in 2 hours", "+15m"
+        val inMinsMatch = Regex("\\bin\\s+(\\d+)\\s*(?:minute|minutes|min|mins)\\b").find(lower)
+        if (inMinsMatch != null) {
+            val mins = inMinsMatch.groupValues[1].toLongOrNull() ?: 15L
+            return nowMs + mins * 60_000L
+        }
+        val inHoursMatch = Regex("\\bin\\s+(\\d+)\\s*(?:hour|hours|hr|hrs)\\b").find(lower)
+        if (inHoursMatch != null) {
+            val hours = inHoursMatch.groupValues[1].toLongOrNull() ?: 1L
+            return nowMs + hours * 3_600_000L
+        }
+
+        val isTomorrow = lower.contains("tomorrow") || lower.contains("kal")
+        val isDayAfter = lower.contains("day after tomorrow") || lower.contains("parso")
+
+        // 2. Time of day: "7 AM", "7:30 PM", "19:00", "7 baje"
+        val amPmMatch = Regex("\\b(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)\\b").find(lower)
+        val twentyFourMatch = Regex("\\b(\\d{1,2}):(\\d{2})\\b").find(lower)
+        val bajeMatch = Regex("\\b(\\d{1,2})\\s*baje\\b").find(lower)
+
+        var hourOfDay = 9
+        var minute = 0
+        var hasExplicitTime = false
+
+        if (amPmMatch != null) {
+            hasExplicitTime = true
+            val rawHour = amPmMatch.groupValues[1].toIntOrNull() ?: 9
+            minute = amPmMatch.groupValues[2].toIntOrNull() ?: 0
+            val mer = amPmMatch.groupValues[3]
+            hourOfDay = when {
+                mer == "pm" && rawHour in 1..11 -> rawHour + 12
+                mer == "am" && rawHour == 12 -> 0
+                else -> rawHour.coerceIn(0, 23)
+            }
+        } else if (twentyFourMatch != null) {
+            hasExplicitTime = true
+            hourOfDay = (twentyFourMatch.groupValues[1].toIntOrNull() ?: 9).coerceIn(0, 23)
+            minute = (twentyFourMatch.groupValues[2].toIntOrNull() ?: 0).coerceIn(0, 59)
+        } else if (bajeMatch != null) {
+            hasExplicitTime = true
+            val rawHour = (bajeMatch.groupValues[1].toIntOrNull() ?: 9).coerceIn(0, 23)
+            hourOfDay = if ((lower.contains("shaam") || lower.contains("raat")) && rawHour in 1..11) {
+                rawHour + 12
+            } else {
+                rawHour
+            }
+        }
+
+        val cal = Calendar.getInstance().apply {
+            timeInMillis = nowMs
+            if (isDayAfter) {
+                add(Calendar.DAY_OF_YEAR, 2)
+            } else if (isTomorrow) {
+                add(Calendar.DAY_OF_YEAR, 1)
+            }
+            if (hasExplicitTime || isTomorrow || isDayAfter) {
+                set(Calendar.HOUR_OF_DAY, hourOfDay)
+                set(Calendar.MINUTE, minute)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            } else {
+                // Default to 1 hour from now if neither day nor time was specified
+                add(Calendar.HOUR_OF_DAY, 1)
+            }
+        }
+
+        if (cal.timeInMillis <= nowMs) {
+            cal.add(Calendar.DAY_OF_YEAR, 1)
+        }
+        return cal.timeInMillis
+    }
+
+    /**
+     * Phase 9 — Persists a reminder rule and schedules its trigger via AlarmManager.
+     * Returns Pair(AutomationRule, Boolean indicating whether AlarmManager registered the hardware alarm).
+     */
+    fun scheduleReminder(
+        reminderTitle: String,
+        rawTimeSpec: String,
+        explicitTimeMs: Long? = null,
+        nowMs: Long = System.currentTimeMillis()
+    ): Pair<AutomationRule, Boolean> {
+        val targetMs = explicitTimeMs?.takeIf { it > nowMs }
+            ?: parseReminderTimeMillis("$reminderTitle $rawTimeSpec", nowMs)
+        val cal = Calendar.getInstance().apply { timeInMillis = targetMs }
+        val hhmm = "%02d:%02d".format(cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))
+
+        val rule = AutomationRule(
+            name = "Reminder: $reminderTitle",
+            triggerType = AutomationTriggerType.TIME_SCHEDULE,
+            triggerConditionValue = hhmm,
+            actionInstruction = "Create note: Reminder triggered — $reminderTitle",
+            isEnabled = true,
+            cooldownMs = 60_000L,
+            retryCountOnFailure = 1
+        )
+        _rules.value = _rules.value + rule
+        persistRules()
+        val alarmScheduled = scheduleExactTimestampAlarm(rule, targetMs)
+        return rule to alarmScheduled
+    }
+
+    private fun scheduleExactTimestampAlarm(
+        rule: AutomationRule,
+        triggerAtMs: Long,
+        targetContext: Context? = context
+    ): Boolean {
+        val ctx = targetContext ?: return false
+        return try {
+            val alarmManager = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return false
+            val intent = Intent(ctx, NayroAutomationReceiver::class.java).apply {
+                action = ACTION_EXECUTE_AUTOMATION
+                putExtra(EXTRA_RULE_ID, rule.ruleId)
+            }
+            val pi = PendingIntent.getBroadcast(
+                ctx,
+                rule.ruleId.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !alarmManager.canScheduleExactAlarms()) {
+                alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pi)
+            } else {
+                alarmManager.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pi)
+            }
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     private fun persistRules() {
         val ctx = context ?: return
         try {

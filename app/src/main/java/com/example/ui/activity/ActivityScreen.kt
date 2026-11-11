@@ -21,6 +21,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import com.example.core.agent.toUserFriendlyIntentLabel
 import com.example.data.local.entities.AuditLogEntity
 import com.example.ui.components.StatusBadge
 import com.example.ui.theme.Coral
@@ -80,7 +81,7 @@ fun ActivityScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = log.actionType,
+                                    text = log.actionType.toUserFriendlyIntentLabel(),
                                     style = MaterialTheme.typography.titleLarge,
                                     color = MaterialTheme.colorScheme.onSurface,
                                     modifier = Modifier.weight(1f)

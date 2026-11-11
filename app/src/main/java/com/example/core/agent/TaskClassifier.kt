@@ -117,7 +117,7 @@ object TaskClassifier {
         // 2b. Reminder Create Intent (e.g. "create a reminder for tomorrow", "remind me to call mom", "reminder lagao")
         if (lower.contains("reminder") || lower.startsWith("remind me") || lower.contains("yaad dilana")) {
             val reminderText = trimmed
-                .replaceFirst(Regex("^(?i)(create a reminder|create reminder|set a reminder|set reminder|remind me to|remind me|reminder lagao)\\s*(for|to|:)?\\s*"), "")
+                .replaceFirst(Regex("^(?i)(create a reminder|create reminder|set a reminder|set reminder|remind me to|remind me|reminder lagao)\\b\\s*(?:(?:for|to)\\b|:)?\\s*"), "")
                 .trim()
                 .removeSuffix(".")
             return ResolvedIntent(
@@ -167,7 +167,7 @@ object TaskClassifier {
         }
 
         // 3. Screen Read Intent
-        if (lower.contains("screen par kya") || lower.contains("screen padho") || lower.contains("what is on screen") || lower.contains("what's on screen") || lower.contains("read screen")) {
+        if (lower.contains("screen par kya") || lower.contains("screen padho") || lower.contains("what is on screen") || lower.contains("what's on screen") || lower.contains("read screen") || (lower.contains("read") && lower.contains("screen") && !lower.contains("save"))) {
             return ResolvedIntent(
                 type = UserIntentType.SCREEN_READ,
                 rawPrompt = prompt
@@ -216,7 +216,7 @@ object TaskClassifier {
         }
 
         // 5. Message Draft Intent (supports single-turn, multi-clause "Open WhatsApp, find Rahul, send him a message that...",
-        // "message Rahul that I will attend tomorrow's meeting", "send Rahul a message saying I will arrive tomorrow", and short "Message Rahul")
+        // "Find Satyam and send Hi", "message Rahul that I will attend tomorrow's meeting", "send Rahul a message saying I will arrive tomorrow", and short "Message Rahul")
         val isShortMessageCmd = Regex("^(?i)(message|msg|text)\\s+([a-zA-Z0-9_]+)\\.?$").find(trimmed)
         if (isShortMessageCmd != null) {
             val shortRecipient = isShortMessageCmd.groupValues[2]
@@ -225,6 +225,19 @@ object TaskClassifier {
                 targetAppOrEntity = "com.whatsapp",
                 recipient = shortRecipient,
                 searchQueryOrContent = "",
+                rawPrompt = prompt
+            )
+        }
+
+        val findAndSendShort = Regex("(?i)(?:open\\s+whatsapp\\s*,?\\s*)?(?:and\\s+)?find\\s+([a-zA-Z0-9_]+)\\s*(?:,|\\s+and)\\s*send\\s+(?:him\\s+|her\\s+)?(?!him\\b|her\\b|a\\s+message|a\\s+whatsapp|message|msg)(.+)$").find(trimmed)
+        if (findAndSendShort != null) {
+            val rec = findAndSendShort.groupValues[1].trim()
+            val body = findAndSendShort.groupValues[2].trim().removeSuffix(".")
+            return ResolvedIntent(
+                type = UserIntentType.MESSAGE_DRAFT,
+                targetAppOrEntity = "com.whatsapp",
+                recipient = rec,
+                searchQueryOrContent = body,
                 rawPrompt = prompt
             )
         }
@@ -332,11 +345,12 @@ object TaskClassifier {
         if (lower.contains("youtube") && (lower.contains("search") || lower.contains("dhundo"))) {
             val query = trimmed
                 .replaceFirst(Regex("^(?i)(babu|nayro)\\s*,?\\s*"), "")
-                .replaceFirst(Regex("^(?i)youtube\\s*(kholo|par)?\\s*(aur)?\\s*"), "")
+                .replaceFirst(Regex("^(?i)(open\\s+|launch\\s+)?youtube\\s*(kholo|par)?\\s*(,|and|aur)?\\s*"), "")
                 .replaceFirst(Regex("(?i)\\s*(search karo|search|dhundo)\\s*$"), "")
                 .replaceFirst(Regex("^(?i)(search for|search|dhundo)\\s*"), "")
                 .replaceFirst(Regex("(?i)\\s*(on youtube|in youtube)\\s*$"), "")
                 .trim()
+                .removeSuffix(".")
             return ResolvedIntent(
                 type = UserIntentType.YOUTUBE_SEARCH,
                 targetAppOrEntity = "com.google.android.youtube",
