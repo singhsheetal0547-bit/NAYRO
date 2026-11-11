@@ -129,13 +129,22 @@ class NayroForegroundService : Service() {
     private fun setupBackgroundVoicePipeline() {
         try {
             val app = NayroApplication.instance
+            app.agentRuntime.recordHeartbeat()
+            app.voiceManager.onVoiceExitCommand = {
+                app.agentRuntime.cancelCurrentTask()
+            }
             if (app.permissionManager.isMicrophoneGranted()) {
                 val config = app.voiceManager.configuration.value.copy(isWakeWordEnabled = true)
                 app.voiceManager.updateConfiguration(config)
 
                 app.voiceManager.attachServiceListener { text ->
                     if (text.isNotBlank()) {
+                        if (app.voiceManager.wakeWordEngine.isVoiceExitCommand(text)) {
+                            app.agentRuntime.cancelCurrentTask()
+                            return@attachServiceListener
+                        }
                         serviceScope.launch {
+                            app.agentRuntime.recordHeartbeat()
                             app.repository.addConversationMessage(
                                 ConversationEntity(sender = "user", content = text)
                             )

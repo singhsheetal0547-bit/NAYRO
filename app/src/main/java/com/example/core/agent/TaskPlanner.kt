@@ -377,7 +377,9 @@ object TaskPlanner {
                 val obj = jsonArray.getJSONObject(i)
                 val typeStr = obj.optString("actionType", "")
                 val actionType = try { ActionType.valueOf(typeStr) } catch (e: Exception) { continue }
-                val target = obj.optString("target", null)?.takeIf { it.isNotBlank() }
+                val target = if (obj.has("target") && !obj.isNull("target")) {
+                    obj.optString("target", "").takeIf { it.isNotBlank() }
+                } else null
 
                 val paramsMap = mutableMapOf<String, String>()
                 val paramsObj = obj.optJSONObject("parameters")

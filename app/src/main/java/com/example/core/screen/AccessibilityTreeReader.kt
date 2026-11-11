@@ -39,6 +39,10 @@ object AccessibilityTreeReader {
         val isClickable = node.isClickable
         val isEditable = node.isEditable
         val isScrollable = node.isScrollable
+        val rect = android.graphics.Rect()
+        try {
+            node.getBoundsInScreen(rect)
+        } catch (_: Exception) {}
 
         val childrenList = mutableListOf<ScreenNodeInfo>()
         for (i in 0 until node.childCount) {
@@ -61,6 +65,10 @@ object AccessibilityTreeReader {
             isEditable = isEditable,
             isScrollable = isScrollable,
             isPassword = isPassword,
+            boundsLeft = rect.left,
+            boundsTop = rect.top,
+            boundsRight = rect.right,
+            boundsBottom = rect.bottom,
             children = childrenList
         )
     }

@@ -1462,6 +1462,109 @@ class SecurityAndVerificationTests {
         assertEquals(ActionType.SAVE_NOTE, t24.actions[1].actionType)
     }
 
+    @Test
+    fun testSection5WakeWordAssetFormatInspectionAndDtwEnrollment() {
+        val engine = LocalWakeWordEngine(null)
+        assertTrue(engine.loadAcousticModel(allowEmbeddedFallbackInTests = true))
+        assertEquals(
+            com.example.core.voice.engine.WakeAssetFormat.JSON_ACOUSTIC_TEMPLATES,
+            engine.inspectBundledAssetFormat(allowEmbeddedFallbackInTests = true)
+        )
+
+        // Generate a realistic 16kHz speech-like PCM waveform (1200 samples = 75ms)
+        val enrollPcm = ShortArray(1200) { i ->
+            val carrier = kotlin.math.sin(2.0 * Math.PI * 240.0 * i / 16000.0)
+            val harmonic = 0.5 * kotlin.math.sin(2.0 * Math.PI * 520.0 * i / 16000.0)
+            ((carrier + harmonic) * 2400.0).toInt().coerceIn(-32767, 32767).toShort()
+        }
+
+        // Enroll two voice samples for "Hi Babu"
+        assertTrue(engine.enrollWakePhraseSample("Hi Babu", enrollPcm))
+        assertTrue(engine.enrollWakePhraseSample("Hi Babu", enrollPcm))
+        assertEquals(2, engine.getEnrolledSampleCount("Hi Babu"))
+
+        // Verify DTW self-alignment distance is near zero and matches "Hi Babu"
+        val seq = engine.extractMfccSequence(enrollPcm)
+        assertTrue(seq.size >= 3)
+        val selfDist = engine.computeDtwDistance(seq, seq)
+        assertEquals(0.0f, selfDist, 0.001f)
+
+        val dtwMatch = engine.matchUtteranceByDtw(enrollPcm)
+        assertNotNull(dtwMatch)
+        assertEquals("Hi Babu", dtwMatch?.first)
+        assertTrue((dtwMatch?.second ?: 0f) >= engine.getConfidenceThreshold())
+
+        // Verify silence never triggers DTW
+        val silencePcm = ShortArray(1200) { 0 }
+        assertNull(engine.matchUtteranceByDtw(silencePcm))
+
+        // Verify voice exit commands
+        assertTrue(engine.isVoiceExitCommand("Stop Babu"))
+        assertTrue(engine.isVoiceExitCommand("Band karo"))
+        assertFalse(engine.isVoiceExitCommand("Open WhatsApp"))
+    }
+
+    @Test
+    fun testSection7CentralCommandDispatcherAndRecovery() = runBlocking {
+        val brain = createHeadlessBrain()
+        val dummyExecutor = UnsafeTestHelper.allocateWithoutInit(ActionExecutor::class.java)
+
+        // Invalid INTERACT_COORDINATES missing x/y must be rejected by CommandDispatcher before execution
+        val invalidCoordAction = AgentAction(
+            taskId = "task-cmd-1",
+            actionType = ActionType.INTERACT_COORDINATES,
+            parameters = emptyMap()
+        )
+        val dispatchRes = com.example.core.agent.tools.CommandDispatcher.dispatch(invalidCoordAction, dummyExecutor)
+        assertFalse(dispatchRes.isSuccess)
+        assertEquals(VerificationStatus.FAILED, dispatchRes.status)
+        assertTrue(dispatchRes.outputMessage.contains("CommandDispatcher schema validation failed"))
+
+        // Verify ARTEMIS-inspired replanFailedStep recovery for CLICK_ELEMENT -> SCROLL_FORWARD
+        val failedClick = AgentAction(
+            taskId = "task-rec-1",
+            actionType = ActionType.CLICK_ELEMENT,
+            target = "Submit"
+        )
+        val recovery = brain.replanFailedStep(failedClick, "Target not visible")
+        assertNotNull(recovery)
+        assertEquals(ActionType.SCROLL_FORWARD, recovery?.actionType)
+    }
+
+    @Test
+    fun testVisualTargetIdentificationFromScreenSnapshot() {
+        val sendNode = com.example.core.screen.ScreenNodeInfo(
+            text = null,
+            contentDescription = "Send Message",
+            viewId = "com.whatsapp:id/send",
+            className = "android.widget.ImageButton",
+            isClickable = true,
+            isEditable = false,
+            isScrollable = false,
+            boundsLeft = 900,
+            boundsTop = 1800,
+            boundsRight = 1040,
+            boundsBottom = 1940
+        )
+        val snapshot = com.example.core.screen.ScreenSnapshot(
+            packageName = "com.whatsapp",
+            visibleTexts = listOf("Rahul", "Send Message"),
+            interactiveElements = listOf(sendNode),
+            totalNodeCount = 2
+        )
+
+        val exactMatch = com.example.core.screen.ScreenIntelligenceManager.locateTargetInSnapshot("Send Message", snapshot)
+        assertNotNull(exactMatch)
+        assertEquals(970, exactMatch?.centerX)
+        assertEquals(1870, exactMatch?.centerY)
+        assertEquals("SEMANTIC_EXACT_NODE", exactMatch?.strategy)
+
+        val idMatch = com.example.core.screen.ScreenIntelligenceManager.locateTargetInSnapshot("send", snapshot)
+        assertNotNull(idMatch)
+        assertEquals(970, idMatch?.centerX)
+        assertEquals(1870, idMatch?.centerY)
+    }
+
     private fun createHeadlessBrain(): AgentBrain {
         val dummyExecutor = UnsafeTestHelper.allocateWithoutInit(ActionExecutor::class.java)
         val dummyProvider = UnsafeTestHelper.allocateWithoutInit(com.example.core.provider.AIProviderManager::class.java)

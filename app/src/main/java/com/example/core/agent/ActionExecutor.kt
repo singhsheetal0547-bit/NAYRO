@@ -299,14 +299,18 @@ class ActionExecutor(
 
             ActionType.CLICK_ELEMENT -> {
                 val targetText = action.target ?: action.parameters["target"] ?: ""
-                if (targetText.isBlank()) {
+                val viewId = action.parameters["viewId"]
+                if (targetText.isBlank() && viewId.isNullOrBlank()) {
                     return ActionExecutionResult(false, "Missing target UI element to click.", VerificationStatus.FAILED)
                 }
-                val clicked = AccessibilityActionController.performClick(targetText = targetText)
+                val clicked = AccessibilityActionController.performClickWithCoordinateFallback(
+                    targetText = targetText.ifBlank { null },
+                    viewId = viewId
+                )
                 if (clicked) {
-                    ActionExecutionResult(true, "Clicked on element matching '$targetText'.", VerificationStatus.VERIFIED)
+                    ActionExecutionResult(true, "Clicked on element matching '${targetText.ifBlank { viewId }}'.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Could not find clickable element matching '$targetText' on screen.", VerificationStatus.FAILED)
+                    ActionExecutionResult(false, "Could not find clickable element matching '${targetText.ifBlank { viewId }}' on screen.", VerificationStatus.FAILED)
                 }
             }
 
@@ -328,8 +332,15 @@ class ActionExecutor(
                 if (text.isBlank()) {
                     return ActionExecutionResult(false, "Cannot set empty text into field.", VerificationStatus.FAILED)
                 }
-                val typed = AccessibilityActionController.performSetText(text = text)
+                val typed = AccessibilityActionController.performSetText(
+                    text = text,
+                    viewId = action.parameters["viewId"],
+                    targetText = action.target
+                )
                 if (typed) {
+                    if (action.parameters["submit"] == "true") {
+                        AccessibilityActionController.performSubmitAction()
+                    }
                     ActionExecutionResult(true, "Entered text '$text' into input field.", VerificationStatus.VERIFIED)
                 } else {
                     ActionExecutionResult(false, "Could not find an editable text field on the current screen.", VerificationStatus.FAILED)
@@ -397,7 +408,12 @@ class ActionExecutor(
                         "Cannot tap coordinates ($x, $y): NAYRO Accessibility Service is not connected.",
                         VerificationStatus.REQUIRES_PERMISSION
                     )
-                val (ok, msg) = service.dispatchTapGesture(x, y)
+                val gestureType = (action.parameters["gesture"] ?: action.target ?: "tap").lowercase()
+                val (ok, msg) = if (gestureType == "double_tap" || gestureType == "doubletap") {
+                    service.dispatchDoubleTapGesture(x, y)
+                } else {
+                    service.dispatchTapGesture(x, y)
+                }
                 ActionExecutionResult(
                     ok,
                     msg,

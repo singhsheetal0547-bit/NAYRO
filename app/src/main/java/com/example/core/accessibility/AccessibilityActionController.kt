@@ -104,6 +104,66 @@ object AccessibilityActionController {
         return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
     }
 
+    /**
+     * Section 6 — Semantic-first click with coordinate-tap fallback when `ACTION_CLICK` returns false
+     * or when a matching visible label is rendered inside a custom non-clickable container.
+     */
+    suspend fun performClickWithCoordinateFallback(targetText: String? = null, viewId: String? = null): Boolean {
+        if (performClick(targetText, viewId)) {
+            return true
+        }
+        val service = NayroAccessibilityService.instance ?: return false
+        val bounds = findTargetBoundsInScreen(targetText, viewId) ?: return false
+        if (bounds.width() <= 0 || bounds.height() <= 0) return false
+        val (ok, _) = service.dispatchTapGesture(bounds.exactCenterX(), bounds.exactCenterY())
+        return ok
+    }
+
+    /**
+     * Locates the screen bounding box [android.graphics.Rect] for a UI element matching [targetText] or [viewId].
+     */
+    fun findTargetBoundsInScreen(targetText: String? = null, viewId: String? = null): android.graphics.Rect? {
+        val service = NayroAccessibilityService.instance ?: return null
+        val root = service.getSafeRootInActiveWindow() ?: return null
+        try {
+            val node = findClickableTarget(root, targetText, viewId)
+                ?: if (!targetText.isNullOrBlank()) {
+                    root.findAccessibilityNodeInfosByText(targetText).firstOrNull()
+                } else null
+            if (node != null) {
+                val rect = android.graphics.Rect()
+                node.getBoundsInScreen(rect)
+                if (!rect.isEmpty) return rect
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "findTargetBoundsInScreen error: ${e.message}")
+        }
+        return null
+    }
+
+    /**
+     * Performs an IME Submit / Enter action on the focused editable field (API 30+)
+     * or clicks a visible Submit/Search/Send/Go control.
+     */
+    fun performSubmitAction(): Boolean {
+        val service = NayroAccessibilityService.instance ?: return false
+        val root = service.getSafeRootInActiveWindow() ?: return false
+        try {
+            val editable = findEditableTarget(root, null, null)
+            if (editable != null && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                if (editable.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)) {
+                    return true
+                }
+            }
+            for (label in listOf("Send", "Search", "Submit", "Go", "Done")) {
+                if (performClick(targetText = label)) return true
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "performSubmitAction error: ${e.message}")
+        }
+        return false
+    }
+
     private fun findClickableTarget(
         root: AccessibilityNodeInfo,
         targetText: String?,

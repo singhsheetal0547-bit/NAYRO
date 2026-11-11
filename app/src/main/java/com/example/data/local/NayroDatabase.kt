@@ -52,7 +52,7 @@ abstract class NayroDatabase : RoomDatabase() {
                     context.applicationContext,
                     NayroDatabase::class.java,
                     "nayro_local_db"
-                ).fallbackToDestructiveMigration().build()
+                ).fallbackToDestructiveMigration(true).build()
                 INSTANCE = instance
                 instance
             }

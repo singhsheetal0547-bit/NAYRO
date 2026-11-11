@@ -93,6 +93,9 @@ class VoiceManager(private val context: Context?) : TextToSpeech.OnInitListener 
         serviceSpeechListener = null
     }
 
+    @Volatile
+    var onVoiceExitCommand: ((String) -> Unit)? = null
+
     fun hasActiveUiListener(): Boolean = uiSpeechListener != null
 
     fun hasActiveServiceListener(): Boolean = serviceSpeechListener != null
@@ -100,20 +103,26 @@ class VoiceManager(private val context: Context?) : TextToSpeech.OnInitListener 
     /**
      * Dispatches recognized speech to exactly one active consumer:
      * foreground UI if attached, otherwise background service listener.
+     * If the recognized speech is a voice exit command ("Stop Babu", "Cancel", "Band karo"),
+     * immediately stops TTS/ASR and invokes [onVoiceExitCommand].
      */
     fun dispatchRecognizedSpeech(text: String) {
         val clean = text.trim()
         if (clean.isEmpty()) return
         _transcribedText.value = clean
+        if (wakeWordEngine.isVoiceExitCommand(clean)) {
+            stopSpeaking()
+            onVoiceExitCommand?.invoke(clean)
+        }
         val target = uiSpeechListener ?: serviceSpeechListener
         target?.invoke(clean)
     }
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            val result = textToSpeech?.setLanguage(Locale("hi", "IN"))
+            val result = textToSpeech?.setLanguage(Locale.forLanguageTag("hi-IN"))
             if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                textToSpeech?.setLanguage(Locale("en", "IN"))
+                textToSpeech?.setLanguage(Locale.forLanguageTag("en-IN"))
             }
         }
     }

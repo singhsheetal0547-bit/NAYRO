@@ -60,7 +60,10 @@ fun SettingsScreen(
     onSaveApiKey: (String, String) -> Unit = { _, _ -> },
     onSaveCustomProvider: (String, String, String, String) -> Unit = { _, _, _, _ -> },
     onToggleWake: (Boolean) -> Unit = {},
-    onTestProvider: (String) -> Unit = {}
+    onTestProvider: (String) -> Unit = {},
+    wakeSensitivity: Float = 0.72f,
+    onWakeSensitivityChange: (Float) -> Unit = {},
+    onEnrollWakePhrase: (String) -> Unit = {}
 ) {
     val scrollState = rememberScrollState()
 
@@ -71,6 +74,8 @@ fun SettingsScreen(
     var customBaseUrl by remember { mutableStateOf("") }
     var customModelId by remember { mutableStateOf("") }
     var customApiKey by remember { mutableStateOf("") }
+    var selectedSensitivity by remember(wakeSensitivity) { mutableStateOf(wakeSensitivity) }
+    var enrolledSamplesStatus by remember { mutableStateOf("") }
 
     Column(
         modifier = Modifier
@@ -118,7 +123,7 @@ fun SettingsScreen(
                     Column(modifier = Modifier.weight(1f)) {
                         Text("On-Device Wake-Word Detection", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            "Listens for 'Hey Babu' locally on-device. Audio is never continuously recorded or uploaded to cloud servers.",
+                            "Listens for 'Hey Babu' locally on-device using 13-MFCC + Sakoe-Chiba DTW. Standby audio is never uploaded to cloud servers.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -128,6 +133,54 @@ fun SettingsScreen(
                         onCheckedChange = onToggleWake,
                         colors = SwitchDefaults.colors(checkedThumbColor = Coral, checkedTrackColor = ForestGreen),
                         modifier = Modifier.testTag("toggle_wake_switch")
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "Wake Detection Sensitivity: ${(selectedSensitivity * 100).toInt()}%",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Strict (80%)" to 0.80f, "Balanced (72%)" to 0.72f, "High (65%)" to 0.65f).forEach { (label, threshold) ->
+                        OutlinedButton(
+                            onClick = {
+                                selectedSensitivity = threshold
+                                onWakeSensitivityChange(threshold)
+                            },
+                            modifier = Modifier.testTag("wake_sensitivity_${(threshold * 100).toInt()}")
+                        ) {
+                            Text(label, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "Voice Sample Enrollment (Multi-Frame DTW)",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Hi Babu", "Hey Babu", "Hi Nayro").forEach { phrase ->
+                        OutlinedButton(
+                            onClick = {
+                                onEnrollWakePhrase(phrase)
+                                enrolledSamplesStatus = "Enrolled voice template for '$phrase'"
+                            },
+                            modifier = Modifier.testTag("enroll_wake_${phrase.lowercase().replace(" ", "_")}")
+                        ) {
+                            Text(phrase, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                if (enrolledSamplesStatus.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = enrolledSamplesStatus,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SuccessGreen
                     )
                 }
             }

@@ -30,6 +30,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withTimeoutOrNull
 
 data class AgentExecutionSummary(
@@ -110,6 +111,24 @@ class AgentRuntime(
 
     @Volatile
     private var isTaskPaused = false
+
+    @Volatile
+    var lastHeartbeatTimestampMs: Long = System.currentTimeMillis()
+        private set
+
+    @Volatile
+    private var lastDispatchedInstruction: String = ""
+
+    @Volatile
+    private var lastDispatchedAtMs: Long = 0L
+
+    fun recordHeartbeat() {
+        lastHeartbeatTimestampMs = System.currentTimeMillis()
+    }
+
+    fun isHeartbeatHealthy(maxStaleMs: Long = 60_000L): Boolean {
+        return (System.currentTimeMillis() - lastHeartbeatTimestampMs) <= maxStaleMs
+    }
 
     fun setState(newState: AgentState) {
         _currentState.value = newState
@@ -210,11 +229,35 @@ class AgentRuntime(
      * exact [TaskState], `isSuccess`, and [VerificationStatus].
      */
     suspend fun executeUserInstructionDetailed(userPrompt: String): AgentExecutionSummary {
+        recordHeartbeat()
+        val nowMs = System.currentTimeMillis()
+        val trimmedPrompt = userPrompt.trim()
+        val activeTask = _currentTask.value
+        // Duplicate task dispatch prevention (Section 3B & Section 10)
+        if (trimmedPrompt.isNotEmpty() &&
+            trimmedPrompt.equals(lastDispatchedInstruction, ignoreCase = true) &&
+            (nowMs - lastDispatchedAtMs) < 1_500L &&
+            activeTask != null &&
+            activeTask.state == TaskState.EXECUTING
+        ) {
+            return AgentExecutionSummary(
+                task = activeTask,
+                isSuccess = false,
+                message = "Duplicate task dispatch prevented: '${activeTask.userInstruction}' is already executing.",
+                verificationStatus = VerificationStatus.INCONCLUSIVE
+            )
+        }
+        lastDispatchedInstruction = trimmedPrompt
+        lastDispatchedAtMs = nowMs
+
         isTaskCancelled = false
         _currentState.value = AgentState.Thinking
 
         // 0. Resolve pronouns ("him", "usko", "that file") and check multi-turn continuation (Part 9)
         val resolvedPrompt = continuityManager.resolveReferencesInPrompt(userPrompt)
+        try {
+            memoryManager.processPromptForMemory(resolvedPrompt)
+        } catch (_: Exception) {}
         val hasPendingConf = confirmationManager.pendingConfirmation.value != null
         val contResolution = continuityManager.evaluateIncomingTurn(
             userTurn = resolvedPrompt,
@@ -393,12 +436,26 @@ class AgentRuntime(
             }
         }
 
-        // 3. Multi-Step Execution Loop with Context Carryover, Lock-Screen Policy, Autonomy Policy, Risk Guard, Timeout & Strict Verification
+        // 3. Multi-Step Execution Loop with Context Carryover, Memory Injection, Lock-Screen Policy, Autonomy Policy, Risk Guard, Timeout & Strict Verification
         val stepOutputs = mutableListOf<String>()
         val brainTraceSteps = mutableListOf<BrainReasoningStep>()
         val stepContext = mutableMapOf<String, String>()
         val completedStepIds = mutableListOf<String>()
         var verifiedStepCount = 0
+
+        // Retrieve relevant long-term memory and inject into reasoning context (Section 4 & Section 9)
+        try {
+            val memories = repository.memories.firstOrNull().orEmpty()
+            val memorySnippet = memoryManager.buildRelevantContext(resolvedPrompt, memories)
+            if (memorySnippet.isNotBlank()) {
+                stepContext["memoryContext"] = memorySnippet
+            }
+            val recentTurns = repository.conversations.firstOrNull().orEmpty().takeLast(6)
+            if (recentTurns.isNotEmpty()) {
+                val compressedHistory = recentTurns.joinToString(" | ") { "${it.sender}: ${it.content.take(80)}" }
+                stepContext["conversationHistory"] = compressedHistory
+            }
+        } catch (_: Exception) {}
 
         for ((index, rawAction) in task.actions.withIndex()) {
             while (isTaskPaused && !isTaskCancelled) {
@@ -554,8 +611,8 @@ class AgentRuntime(
 
             val isConfirmedFlag = activeConfirmation?.status == ConfirmationStatus.CONFIRMED
 
-            val execResult = withTimeoutOrNull(action.timeoutMs) {
-                actionExecutor.execute(action, isConfirmed = isConfirmedFlag)
+            var execResult = withTimeoutOrNull(action.timeoutMs) {
+                com.example.core.agent.tools.CommandDispatcher.dispatch(action, actionExecutor, isConfirmed = isConfirmedFlag)
             } ?: ActionExecutionResult(
                 isSuccess = false,
                 outputMessage = "Step ${index + 1} (${action.actionType.name}) timed out after ${action.timeoutMs}ms.",
@@ -568,12 +625,52 @@ class AgentRuntime(
                 delay(350)
             }
 
-            val verification = actionVerifier.verifyAction(
+            var verification = actionVerifier.verifyAction(
                 action = action,
                 executionResult = execResult,
                 preStateSummary = preState,
                 resolvedTargetPackage = resolvedPkg
             )
+
+            // ARTEMIS-Inspired Observe -> Plan -> Act -> Verify -> Recover (Section 3A, 4, 13):
+            // If a step fails (e.g., off-screen CLICK_ELEMENT or missing filename), attempt bounded recovery replanning once.
+            if (verification.status == VerificationStatus.FAILED) {
+                val recoveryAction = agentBrain.replanFailedStep(action, verification.details)
+                if (recoveryAction != null && !isTaskCancelled) {
+                    stateManager.transition(
+                        task,
+                        TaskState.REPLANNING,
+                        "Replanning after step ${index + 1} failure using ${recoveryAction.actionType.name}"
+                    )
+                    val recoveryExec = withTimeoutOrNull(recoveryAction.timeoutMs) {
+                        com.example.core.agent.tools.CommandDispatcher.dispatch(
+                            recoveryAction,
+                            actionExecutor,
+                            isConfirmed = isConfirmedFlag
+                        )
+                    }
+                    if (recoveryExec?.isSuccess == true) {
+                        stateManager.transition(task, TaskState.EXECUTING, "Retrying step ${index + 1} after recovery")
+                        val retryExec = withTimeoutOrNull(action.timeoutMs) {
+                            com.example.core.agent.tools.CommandDispatcher.dispatch(
+                                action,
+                                actionExecutor,
+                                isConfirmed = isConfirmedFlag
+                            )
+                        }
+                        if (retryExec != null) {
+                            execResult = retryExec
+                            stateManager.transition(task, TaskState.VERIFYING)
+                            verification = actionVerifier.verifyAction(
+                                action = action,
+                                executionResult = execResult,
+                                preStateSummary = preState,
+                                resolvedTargetPackage = resolvedPkg
+                            )
+                        }
+                    }
+                }
+            }
 
             if (verification.status == VerificationStatus.VERIFIED) {
                 AgentEventBus.emit(AgentEvent.ActionCompleted(task.taskId, action.actionId, verification.details))

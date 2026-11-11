@@ -908,3 +908,33 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
         }
     }
 }
+
+/**
+ * Central CommandDispatcher (Section 3E & Section 7).
+ * Enforces tool allowlist registration and schema parameter validation before invoking [ActionExecutor].
+ */
+object CommandDispatcher {
+    suspend fun dispatch(
+        action: AgentAction,
+        executor: com.example.core.agent.ActionExecutor,
+        isConfirmed: Boolean = false
+    ): com.example.core.agent.ActionExecutionResult {
+        if (!ToolRegistryManager.isToolAvailable(action.actionType)) {
+            return com.example.core.agent.ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "CommandDispatcher blocked unregistered tool: ${action.actionType.name}",
+                status = com.example.core.agent.VerificationStatus.NOT_SUPPORTED
+            )
+        }
+        val (valid, validationMsg) = ToolRegistryManager.validateParameters(action)
+        if (!valid) {
+            return com.example.core.agent.ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "CommandDispatcher schema validation failed: $validationMsg",
+                status = com.example.core.agent.VerificationStatus.FAILED
+            )
+        }
+        return executor.execute(action, isConfirmed = isConfirmed)
+    }
+}
+

@@ -115,6 +115,65 @@ class ScreenIntelligenceManager(private val context: Context) {
             isErrorScreen = isError
         )
     }
+
+    /**
+     * Section 6 — Visual & Semantic Target Identification:
+     * Resolves a user query (label, contentDescription, or viewId) against the captured [ScreenSnapshot]
+     * and returns its screen coordinates `(centerX, centerY)`, confidence score, and targeting strategy.
+     */
+    fun locateVisualTarget(query: String, snapshot: ScreenSnapshot? = captureCurrentSnapshot()): VisualTargetMatch? {
+        return locateTargetInSnapshot(query, snapshot)
+    }
+
+    companion object {
+        fun locateTargetInSnapshot(query: String, snapshot: ScreenSnapshot?): VisualTargetMatch? {
+            val cleanQuery = query.trim()
+            if (cleanQuery.isEmpty() || snapshot == null) return null
+
+            // 1. Exact text or contentDescription match
+            snapshot.interactiveElements.firstOrNull { node ->
+                node.text.equals(cleanQuery, ignoreCase = true) ||
+                    node.contentDescription.equals(cleanQuery, ignoreCase = true)
+            }?.let { matched ->
+                return VisualTargetMatch(
+                    label = matched.displayLabel,
+                    centerX = matched.centerX,
+                    centerY = matched.centerY,
+                    confidence = 0.96f,
+                    strategy = if (matched.isClickable) "SEMANTIC_EXACT_NODE" else "COORDINATE_BOUNDS_EXACT"
+                )
+            }
+
+            // 2. Partial text or contentDescription match
+            snapshot.interactiveElements.firstOrNull { node ->
+                node.text?.contains(cleanQuery, ignoreCase = true) == true ||
+                    node.contentDescription?.contains(cleanQuery, ignoreCase = true) == true
+            }?.let { matched ->
+                return VisualTargetMatch(
+                    label = matched.displayLabel,
+                    centerX = matched.centerX,
+                    centerY = matched.centerY,
+                    confidence = 0.82f,
+                    strategy = if (matched.isClickable) "SEMANTIC_PARTIAL_NODE" else "COORDINATE_BOUNDS_PARTIAL"
+                )
+            }
+
+            // 3. View ID resource name match
+            snapshot.interactiveElements.firstOrNull { node ->
+                node.viewId?.contains(cleanQuery, ignoreCase = true) == true
+            }?.let { matched ->
+                return VisualTargetMatch(
+                    label = matched.displayLabel,
+                    centerX = matched.centerX,
+                    centerY = matched.centerY,
+                    confidence = 0.74f,
+                    strategy = "VIEW_ID_MATCH"
+                )
+            }
+
+            return null
+        }
+    }
 }
 
 data class ScreenSemanticSignals(
@@ -122,4 +181,5 @@ data class ScreenSemanticSignals(
     val isLoadingState: Boolean,
     val isErrorScreen: Boolean
 )
+
 
