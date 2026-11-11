@@ -1565,6 +1565,73 @@ class SecurityAndVerificationTests {
         assertEquals(1870, idMatch?.centerY)
     }
 
+    @OptIn(com.google.accompanist.permissions.ExperimentalPermissionsApi::class)
+    @Test
+    fun testAccompanistPermissionUtilityForMicrophoneAndAccessibility() {
+        val util = com.example.permission.AccompanistPermissionUtility(context = null)
+        assertEquals(
+            android.Manifest.permission.RECORD_AUDIO,
+            com.example.core.permission.AccompanistPermissionUtility.MICROPHONE_PERMISSION
+        )
+        assertEquals(
+            android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS,
+            com.example.core.permission.AccompanistPermissionUtility.ACCESSIBILITY_SETTINGS_ACTION
+        )
+
+        // Evaluate Accompanist status combinations
+        assertEquals(
+            com.example.core.permission.PermissionStatus.GRANTED,
+            com.example.core.permission.AccompanistPermissionUtility.evaluateMicrophoneAccompanistStatus(
+                isGranted = true,
+                shouldShowRationale = false,
+                requestedBefore = true
+            )
+        )
+        assertEquals(
+            com.example.core.permission.PermissionStatus.DENIED,
+            com.example.core.permission.AccompanistPermissionUtility.evaluateMicrophoneAccompanistStatus(
+                isGranted = false,
+                shouldShowRationale = true,
+                requestedBefore = true
+            )
+        )
+        assertEquals(
+            com.example.core.permission.PermissionStatus.PERMANENTLY_DENIED,
+            com.example.core.permission.AccompanistPermissionUtility.evaluateMicrophoneAccompanistStatus(
+                isGranted = false,
+                shouldShowRationale = false,
+                requestedBefore = true
+            )
+        )
+
+        // Test Accompanist PermissionState request dispatch
+        var launchCount = 0
+        var markedRequested = false
+        val fakePermissionState = object : com.google.accompanist.permissions.PermissionState {
+            override val permission: String = android.Manifest.permission.RECORD_AUDIO
+            override val status: com.google.accompanist.permissions.PermissionStatus =
+                com.google.accompanist.permissions.PermissionStatus.Denied(shouldShowRationale = false)
+            override fun launchPermissionRequest() {
+                launchCount++
+            }
+        }
+        com.example.core.permission.AccompanistPermissionUtility.requestMicrophoneWithAccompanist(
+            permissionState = fakePermissionState,
+            context = null,
+            requestedBefore = false,
+            onMarkRequested = { markedRequested = true }
+        )
+        assertTrue(markedRequested)
+        assertEquals(1, launchCount)
+
+        // Test Accessibility Settings & App Details Intent creation and headless safety
+        assertNotNull(util.getAccessibilitySettingsIntent())
+        assertNotNull(util.getAppDetailsSettingsIntent("com.aistudio.nayro.app"))
+        assertFalse(util.isMicrophoneGranted())
+        assertFalse(util.isAccessibilityEnabled())
+        assertFalse(util.openAccessibilitySettings(activity = null))
+    }
+
     private fun createHeadlessBrain(): AgentBrain {
         val dummyExecutor = UnsafeTestHelper.allocateWithoutInit(ActionExecutor::class.java)
         val dummyProvider = UnsafeTestHelper.allocateWithoutInit(com.example.core.provider.AIProviderManager::class.java)

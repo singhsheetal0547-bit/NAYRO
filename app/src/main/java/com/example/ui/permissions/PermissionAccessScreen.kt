@@ -71,6 +71,11 @@ fun PermissionAccessScreen(
 ) {
     var selectedFilter by remember { mutableStateOf("ALL") }
 
+    val accompanistHandler = com.example.core.permission.rememberNayroPermissionsHandler(
+        onMicrophonePermissionResult = { onRefreshPermissions() },
+        onPermissionsRefreshed = { _, _ -> onRefreshPermissions() }
+    )
+
     val allEvaluations = evaluations.values.toList()
     val filteredEvaluations = when (selectedFilter) {
         "CORE" -> allEvaluations.filter { it.item.requirementLevel == PermissionRequirementLevel.CORE_AGENT }
@@ -116,7 +121,10 @@ fun PermissionAccessScreen(
                 )
             }
             OutlinedButton(
-                onClick = onRefreshPermissions,
+                onClick = {
+                    accompanistHandler.refresh()
+                    onRefreshPermissions()
+                },
                 modifier = Modifier.testTag("btn_refresh_permissions")
             ) {
                 Icon(
@@ -208,8 +216,20 @@ fun PermissionAccessScreen(
             items(filteredEvaluations, key = { it.item.type.name }) { eval ->
                 PermissionCard(
                     eval = eval,
-                    onRequestRuntime = { onRequestRuntimePermission(eval.item.type) },
-                    onOpenSettings = { onOpenSystemSettings(eval.item.type) }
+                    onRequestRuntime = {
+                        if (eval.item.type == PermissionType.MICROPHONE) {
+                            accompanistHandler.requestMicrophonePermission()
+                        } else {
+                            onRequestRuntimePermission(eval.item.type)
+                        }
+                    },
+                    onOpenSettings = {
+                        if (eval.item.type == PermissionType.ACCESSIBILITY) {
+                            accompanistHandler.requestAccessibilityService()
+                        } else {
+                            onOpenSystemSettings(eval.item.type)
+                        }
+                    }
                 )
             }
         }
