@@ -7,6 +7,7 @@ enum class ServiceLifecycleState {
     STOPPED,
     STARTING,
     RUNNING,
+    PAUSED,
     STOPPING,
     FAILED,
     PERMISSION_DENIED

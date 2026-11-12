@@ -534,6 +534,43 @@ class AutomationEngine(private val context: Context? = null) {
         return rule to alarmScheduled
     }
 
+    /**
+     * Section 10 — Parses notification watch requests such as:
+     * "When Rahul replies, tell me" / "Notify me when Priya messages" / "Jab Rahul reply kare to batana".
+     */
+    fun parseNotificationWatchSender(instruction: String): String? {
+        val trimmed = instruction.trim()
+        val engMatch = Regex("(?i)\\bwhen\\s+([A-Za-z][A-Za-z0-9_\\s]{1,24}?)\\s+(?:replies|messages|texts|writes|sends a message)\\b").find(trimmed)
+        if (engMatch != null) {
+            return engMatch.groupValues[1].trim()
+        }
+        val hindiMatch = Regex("(?i)\\bjab\\s+([A-Za-z][A-Za-z0-9_\\s]{1,24}?)\\s+(?:reply|message)\\s+kare\\b").find(trimmed)
+        if (hindiMatch != null) {
+            return hindiMatch.groupValues[1].trim()
+        }
+        return null
+    }
+
+    /**
+     * Section 10 — Registers an event-triggered notification watch rule in AutomationEngine
+     * that fires when an authorized notification matching [senderOrKeyword] arrives.
+     */
+    fun registerNotificationWatchRule(
+        senderOrKeyword: String,
+        followUpInstruction: String = "Create note: Notification reply received from ${senderOrKeyword.trim()}"
+    ): AutomationRule {
+        val cleanSender = senderOrKeyword.trim()
+        return createRule(
+            name = "Watch Reply: $cleanSender",
+            triggerType = AutomationTriggerType.NOTIFICATION_ARRIVED,
+            triggerConditionValue = cleanSender,
+            actionInstruction = followUpInstruction.trim(),
+            isEnabled = true,
+            cooldownMs = 30_000L,
+            retryCountOnFailure = 1
+        )
+    }
+
     private fun scheduleExactTimestampAlarm(
         rule: AutomationRule,
         triggerAtMs: Long,

@@ -83,7 +83,11 @@ class ActionExecutor(
         callIntelligenceManager,
         screenIntelligenceManager
     ),
-    val automationEngine: AutomationEngine = AutomationEngine(context)
+    val automationEngine: AutomationEngine = AutomationEngine(context),
+    val smsManager: com.example.core.telephony.SmsIntelligenceManager = com.example.core.telephony.SmsIntelligenceManager(
+        context,
+        callIntelligenceManager
+    )
 ) {
 
     companion object {
@@ -518,10 +522,29 @@ class ActionExecutor(
                     }
                 }
 
-                val hasCallPhonePermission = ContextCompat.checkSelfPermission(
-                    context,
-                    Manifest.permission.CALL_PHONE
-                ) == PackageManager.PERMISSION_GRANTED
+                CallIntelligenceManager.lastDialedRecipient = rawTarget
+                callIntelligenceManager.testOverrideLastOutgoingCallAnswered?.let { answeredOverride ->
+                    CallIntelligenceManager.lastOutgoingCallAnswered = answeredOverride
+                    val stateNote = if (answeredOverride) {
+                        "Call to $rawTarget ($phoneToDial) was answered [CALL_ANSWERED=true]."
+                    } else {
+                        "Call to $rawTarget ($phoneToDial) was not answered [CALL_ANSWERED=false]."
+                    }
+                    return ActionExecutionResult(
+                        true,
+                        stateNote,
+                        VerificationStatus.VERIFIED
+                    )
+                }
+
+                val hasCallPhonePermission = try {
+                    ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.CALL_PHONE
+                    ) == PackageManager.PERMISSION_GRANTED
+                } catch (_: Exception) {
+                    false
+                }
 
                 try {
                     val callAction = if (hasCallPhonePermission && action.parameters["directCall"] == "true") {
@@ -533,10 +556,21 @@ class ActionExecutor(
                         addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     }
                     context.startActivity(dialIntent)
-                    val msg = if (callAction == Intent.ACTION_CALL) {
-                        "Placed phone call to $rawTarget ($phoneToDial)."
+                    val observeState = action.parameters["observeCallState"] == "true"
+                    val observedAnswered = if (observeState) {
+                        val snapshot = callIntelligenceManager.queryActiveCallState(phoneToDial)
+                        snapshot.isOffhook
                     } else {
-                        "Opened phone dialer for $rawTarget ($phoneToDial). Tap Call in the dialer to place the call."
+                        false
+                    }
+                    CallIntelligenceManager.lastOutgoingCallAnswered = observedAnswered
+                    val obsSuffix = if (observeState) {
+                        if (observedAnswered) " [CALL_ANSWERED=true]" else " [CALL_ANSWERED=false]"
+                    } else ""
+                    val msg = if (callAction == Intent.ACTION_CALL) {
+                        "Placed phone call to $rawTarget ($phoneToDial).$obsSuffix"
+                    } else {
+                        "Opened phone dialer for $rawTarget ($phoneToDial). Tap Call in the dialer to place the call.$obsSuffix"
                     }
                     ActionExecutionResult(
                         true,
@@ -877,6 +911,21 @@ class ActionExecutor(
             }
 
             ActionType.CREATE_REMINDER -> {
+                val watchSender = action.parameters["notificationWatchSender"]?.trim()
+                if (!watchSender.isNullOrBlank()) {
+                    val rule = automationEngine.registerNotificationWatchRule(watchSender)
+                    val listenerReady = isNotificationListenerAvailable()
+                    val permNote = if (listenerReady) {
+                        "Notification Listener access is active; NAYRO will trigger '${rule.name}' when a notification from '$watchSender' arrives."
+                    } else {
+                        "Rule '${rule.name}' saved, but Notification Access is currently disabled. Please enable NAYRO in Settings > Notification Access so incoming replies can be detected."
+                    }
+                    return ActionExecutionResult(
+                        true,
+                        permNote,
+                        VerificationStatus.VERIFIED
+                    )
+                }
                 val title = (action.target ?: action.parameters["title"])?.trim().orEmpty()
                 if (title.isEmpty()) {
                     return ActionExecutionResult(false, "Cannot create reminder: title is empty.", VerificationStatus.FAILED)
@@ -1007,8 +1056,25 @@ class ActionExecutor(
             }
 
             ActionType.WHATSAPP_READ_CONVERSATION -> {
-                val query = (action.target ?: action.parameters["query"] ?: action.parameters["contact"])?.trim().orEmpty()
-                whatsAppManager.readOrSearchWhatsAppConversation(query)
+                val query = (action.target ?: action.parameters["query"] ?: action.parameters["contact"] ?: "WhatsApp").trim()
+                val baseRes = whatsAppManager.readOrSearchWhatsAppConversation(query)
+                if (action.parameters["analyzeReplyPriority"] == "true" && baseRes.isSuccess) {
+                    val text = baseRes.outputMessage
+                    val needsReply = text.contains("?") ||
+                        text.contains("urgent", ignoreCase = true) ||
+                        text.contains("reply", ignoreCase = true) ||
+                        text.contains("call", ignoreCase = true) ||
+                        text.contains("when", ignoreCase = true) ||
+                        text.contains("kab", ignoreCase = true)
+                    val replyAnalysis = if (needsReply) {
+                        "\n[Reply Intelligence]: Actionable question/request detected. Suggested Draft Reply: \"I saw your message and will get back to you shortly.\" (Awaiting your confirmation before sending.)"
+                    } else {
+                        "\n[Reply Intelligence]: Informational messages inspected; no immediate reply required."
+                    }
+                    baseRes.copy(outputMessage = baseRes.outputMessage + replyAnalysis)
+                } else {
+                    baseRes
+                }
             }
 
             ActionType.ASK_USER_CONFIRMATION -> {
@@ -1420,6 +1486,57 @@ class ActionExecutor(
                     limit = limit
                 )
             }
+
+            ActionType.READ_SMS -> {
+                val filter = (action.parameters["filter"] ?: action.target ?: "latest").trim()
+                val query = action.parameters["query"]?.trim()
+                val limit = (action.parameters["limit"]?.toIntOrNull() ?: 10).coerceIn(1, 50)
+                val summary = smsManager.readAndAnalyzeSms(filter = filter, query = query, limit = limit)
+                if (summary.permissionRequired) {
+                    ActionExecutionResult(false, summary.formattedReport, VerificationStatus.REQUIRES_PERMISSION)
+                } else {
+                    ActionExecutionResult(true, summary.formattedReport, VerificationStatus.VERIFIED)
+                }
+            }
+
+            ActionType.MANAGE_CALL -> {
+                val operation = (action.parameters["operation"] ?: action.target ?: "IDENTIFY").trim().uppercase()
+                callIntelligenceManager.manageIncomingOrActiveCall(
+                    operation = operation,
+                    isConfirmed = isConfirmed
+                )
+            }
+
+            ActionType.READ_CALL_HISTORY -> {
+                val filter = (action.parameters["filter"] ?: action.target ?: "all").trim()
+                val query = action.parameters["query"]?.trim()
+                val limit = (action.parameters["limit"]?.toIntOrNull() ?: 10).coerceIn(1, 50)
+                callIntelligenceManager.queryCallHistory(
+                    filterType = filter,
+                    contactOrNumberQuery = query,
+                    limit = limit
+                )
+            }
+
+            ActionType.SAVE_CONTACT -> {
+                val fromPrevSms = action.parameters["fromPreviousStep"] == "true" ||
+                    action.parameters["condition"] == "IF_NEW_NUMBER"
+                val lastSms = com.example.core.telephony.SmsIntelligenceManager.lastInspectedSms
+                val name = (action.parameters["name"] ?: action.target)?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: lastSms?.resolvedContactName
+                    ?: lastSms?.address?.let { "SMS Sender ($it)" }
+                    ?: ""
+                val phone = (action.parameters["phone"] ?: action.parameters["number"])?.trim()?.takeIf { it.isNotEmpty() }
+                    ?: lastSms?.address
+                    ?: ""
+                val onlyIfNew = action.parameters["condition"] == "IF_NEW_NUMBER" || fromPrevSms
+                callIntelligenceManager.saveOrUpdateContact(
+                    displayName = name,
+                    phoneNumber = phone,
+                    isConfirmed = isConfirmed,
+                    onlyIfNewNumber = onlyIfNew
+                )
+            }
         }
     }
 
@@ -1432,7 +1549,29 @@ class ActionExecutor(
         isConfirmed: Boolean
     ): ActionExecutionResult {
         val rawRecipient = (action.target ?: action.parameters["recipient"])?.trim().orEmpty()
-        val message = (action.parameters["message"] ?: action.parameters["draft"])?.trim().orEmpty()
+        if (action.parameters["condition"] == "IF_CALL_UNANSWERED") {
+            val prevOut = action.parameters["previousStepOutput"].orEmpty()
+            val wasAnswered = prevOut.contains("[CALL_ANSWERED=true]") ||
+                (prevOut.isEmpty() && CallIntelligenceManager.lastOutgoingCallAnswered)
+            if (wasAnswered) {
+                return ActionExecutionResult(
+                    true,
+                    "Call to $rawRecipient was answered; fallback WhatsApp message was not needed.",
+                    VerificationStatus.VERIFIED
+                )
+            }
+        }
+        val explicitMessage = (action.parameters["message"] ?: action.parameters["draft"])?.trim().orEmpty()
+        val message = if (explicitMessage.isNotEmpty() && explicitMessage != "{{PREVIOUS_STEP_OUTPUT}}") {
+            explicitMessage
+        } else if (action.parameters["usePreviousStepOutput"] == "true" || explicitMessage == "{{PREVIOUS_STEP_OUTPUT}}") {
+            val prev = action.parameters["previousStepOutput"].orEmpty().trim()
+            val addrMatch = Regex("(?i)(?:address|location|venue)\\s*[:\\-]\\s*([^\\n]+)").find(prev)
+            addrMatch?.groupValues?.getOrNull(1)?.trim()
+                ?: prev.take(240).ifBlank { "Shared details from email" }
+        } else {
+            explicitMessage
+        }
         return whatsAppManager.sendOrDraftMessage(
             rawRecipientSpec = rawRecipient,
             messageText = message,

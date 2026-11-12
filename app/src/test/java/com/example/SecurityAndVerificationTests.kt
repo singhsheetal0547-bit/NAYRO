@@ -1632,6 +1632,321 @@ class SecurityAndVerificationTests {
         assertFalse(util.openAccessibilitySettings(activity = null))
     }
 
+    @Test
+    fun testSection4BackgroundAgentPauseAndResumeLifecycle() {
+        val nowMs = 1_700_000_000_000L
+        com.example.core.service.ServiceStateRepository.pauseBackgroundAgent(
+            durationMinutes = 15,
+            reason = "User paused for 15 minutes",
+            nowMs = nowMs
+        )
+        assertTrue(com.example.core.service.ServiceStateRepository.isBackgroundAgentPaused.value)
+        assertEquals(
+            com.example.core.service.ServiceLifecycleState.PAUSED,
+            com.example.core.service.ServiceStateRepository.foregroundServiceStatus.value.state
+        )
+        assertEquals(
+            nowMs + 15L * 60_000L,
+            com.example.core.service.ServiceStateRepository.pausedUntilTimestampMs.value
+        )
+        assertEquals(
+            "User paused for 15 minutes",
+            com.example.core.service.ServiceStateRepository.pauseReason.value
+        )
+        assertTrue(com.example.core.service.ServiceStateRepository.backgroundActivityLog.value.isNotEmpty())
+
+        com.example.core.service.ServiceStateRepository.resumeBackgroundAgent()
+        assertFalse(com.example.core.service.ServiceStateRepository.isBackgroundAgentPaused.value)
+        assertEquals(
+            com.example.core.service.ServiceLifecycleState.RUNNING,
+            com.example.core.service.ServiceStateRepository.foregroundServiceStatus.value.state
+        )
+        assertNull(com.example.core.service.ServiceStateRepository.pausedUntilTimestampMs.value)
+    }
+
+    @Test
+    fun testSection5PersistentEnrollmentQualityAndNoiseDiagnostics() {
+        val engine = LocalWakeWordEngine(null)
+        assertTrue(engine.loadAcousticModel(allowEmbeddedFallbackInTests = true))
+
+        // Record/enroll 3 samples via UI helper
+        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu").first)
+        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu").first)
+        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu").first)
+        assertEquals(3, engine.getEnrolledSampleCount("Hi Babu"))
+
+        // Validate enrollment quality
+        val quality = engine.validateEnrollmentQuality("Hi Babu")
+        assertTrue(quality.isQualityAcceptable)
+        assertEquals(3, quality.sampleCount)
+        assertTrue(quality.estimatedSnrDb >= 10.0f)
+
+        // Export & import persistent enrollment JSON across engine instances
+        val exportedJson = engine.exportEnrollmentsJson()
+        assertTrue(exportedJson.contains("Hi Babu"))
+
+        val secondEngine = LocalWakeWordEngine(null)
+        assertEquals(0, secondEngine.getEnrolledSampleCount("Hi Babu"))
+        assertTrue(secondEngine.importEnrollmentsJson(exportedJson) >= 1)
+        assertEquals(3, secondEngine.getEnrolledSampleCount("Hi Babu"))
+
+        // Run ambient noise floor test
+        val noiseReport = secondEngine.runAmbientNoiseTest()
+        assertTrue(noiseReport.estimatedSnrDb > 10.0f)
+        assertTrue(noiseReport.statusMessage.isNotBlank())
+    }
+
+    @Test
+    fun testSection6PixelVisualScreenAnalysisAndModalDetection() {
+        val gridW = 16
+        val gridH = 16
+        // Construct a screen with dark periphery and bright centered dialog box (modal overlay)
+        val pixels = IntArray(gridW * gridH) { idx ->
+            val x = idx % gridW
+            val y = idx / gridW
+            val inCenterDialog = x in 4..11 && y in 4..11
+            if (inCenterDialog) {
+                (0xFF shl 24) or (235 shl 16) or (235 shl 8) or 235
+            } else {
+                (0xFF shl 24) or (18 shl 16) or (18 shl 8) or (18)
+            }
+        }
+        val okNode = com.example.core.screen.ScreenNodeInfo(
+            text = "Confirm",
+            contentDescription = "Confirm Action",
+            viewId = "android:id/button1",
+            className = "android.widget.Button",
+            isClickable = true,
+            isEditable = false,
+            isScrollable = false,
+            boundsLeft = 400,
+            boundsTop = 900,
+            boundsRight = 680,
+            boundsBottom = 1040
+        )
+        val snapshot = com.example.core.screen.ScreenSnapshot(
+            packageName = "com.whatsapp",
+            visibleTexts = listOf("Send message to Rahul?", "Confirm"),
+            interactiveElements = listOf(okNode),
+            totalNodeCount = 2
+        )
+
+        val observation = com.example.core.screen.ScreenIntelligenceManager.analyzePixelGrid(
+            argbPixels = pixels,
+            width = gridW,
+            height = gridH,
+            snapshot = snapshot
+        )
+        assertEquals(gridW, observation.width)
+        assertEquals(gridH, observation.height)
+        assertTrue(observation.hasModalDimOverlay)
+        assertTrue(observation.contrastScore > 20f)
+        assertTrue(observation.groundedTextElements.isNotEmpty())
+        assertTrue(observation.groundedTextElements.first().contains("Confirm @(540,970)"))
+    }
+
+    @Test
+    fun testSection10NotificationWatchContinuationWorkflow() = runBlocking {
+        val brain = createHeadlessBrain()
+        val task = brain.planTaskForInstruction("When Rahul replies, tell me")
+        assertTrue(task.actions.isNotEmpty())
+        val firstAction = task.actions.first()
+        assertEquals(ActionType.CREATE_REMINDER, firstAction.actionType)
+        assertEquals("Rahul", firstAction.parameters["notificationWatchSender"])
+
+        // Also test Hindi/Hinglish variant
+        val hindiTask = brain.planTaskForInstruction("Jab Priya message kare to mujhe batana")
+        assertEquals("Priya", hindiTask.actions.first().parameters["notificationWatchSender"])
+    }
+
+    @Test
+    fun testScenarioAConditionalCallAndWhatsAppFallback() = runBlocking {
+        val brain = createHeadlessBrain()
+        val prompt = "Hi Babu, Rahul ko call karo. Agar woh call nahi uthata, toh use WhatsApp par message bhej dena ki main baad mein call karunga."
+        val task = brain.planTaskForInstruction(prompt)
+        assertEquals(3, task.actions.size)
+        assertEquals(ActionType.RESOLVE_CONTACT, task.actions[0].actionType)
+        assertEquals("Rahul", task.actions[0].target)
+        assertEquals(ActionType.MAKE_PHONE_CALL, task.actions[1].actionType)
+        assertEquals("true", task.actions[1].parameters["observeCallState"])
+        assertEquals(ActionType.MESSAGE_DRAFT_SEND, task.actions[2].actionType)
+        assertEquals("IF_CALL_UNANSWERED", task.actions[2].parameters["condition"])
+        assertEquals("main baad mein call karunga", task.actions[2].parameters["message"])
+
+        // Verify execution when call is NOT answered -> WhatsApp fallback executes
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = { listOf(com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210")) }
+        ).apply {
+            testOverrideLastOutgoingCallAnswered = false
+        }
+        val waMgr = com.example.core.communication.WhatsAppAutomationManager(
+            context = null,
+            callIntelligenceManager = callMgr,
+            screenIntelligenceManager = null
+        ).apply {
+            testOverrideInstalled = true
+            testOverrideSendVerified = true
+        }
+        val outcomeUnanswered = brain.executeTaskIterative(task) { action, ctx ->
+            val res = when (action.actionType) {
+                ActionType.RESOLVE_CONTACT -> ActionExecutionResult(
+                    true,
+                    "Resolved contact: Rahul Sharma (+919876543210)",
+                    VerificationStatus.VERIFIED
+                )
+                ActionType.MAKE_PHONE_CALL -> ActionExecutionResult(
+                    true,
+                    "Call to Rahul (+919876543210) was not answered [CALL_ANSWERED=false].",
+                    VerificationStatus.VERIFIED
+                )
+                ActionType.MESSAGE_DRAFT_SEND -> {
+                    val prev = ctx["previousStepOutput"].orEmpty()
+                    if (prev.contains("[CALL_ANSWERED=true]")) {
+                        ActionExecutionResult(true, "Skipped fallback.", VerificationStatus.VERIFIED)
+                    } else {
+                        waMgr.sendOrDraftMessage("Rahul", action.parameters["message"] ?: "", isConfirmed = true)
+                    }
+                }
+                else -> ActionExecutionResult(false, "Unexpected", VerificationStatus.FAILED)
+            }
+            res to (res.status ?: VerificationStatus.VERIFIED)
+        }
+        assertTrue(outcomeUnanswered.isFullyVerified)
+        assertTrue(outcomeUnanswered.finalResponse.contains("main baad mein call karunga"))
+    }
+
+    @Test
+    fun testScenarioBSmsIntelligenceAndNewContactSave() {
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = { listOf(com.example.core.telephony.ResolvedContactItem("Rahul", "+919876543210")) }
+        )
+        val smsMgr = com.example.core.telephony.SmsIntelligenceManager(
+            context = null,
+            callIntelligenceManager = callMgr
+        )
+        smsMgr.testOverrideSmsInbox = listOf(
+            com.example.core.telephony.SmsMessageRecord(
+                id = "101",
+                address = "+919988776655",
+                resolvedContactName = null,
+                body = "Your verification code is 482910. Rs. 2,500.00 debited from A/C. Ref: UTR99887766",
+                timestampMs = 1_700_000_000_000L,
+                isUnread = true
+            )
+        )
+
+        val summary = smsMgr.readAndAnalyzeSms(filter = "latest")
+        assertFalse(summary.permissionRequired)
+        assertEquals("+919988776655", summary.latestSenderAddress)
+        assertTrue(summary.isLatestSenderNewContact)
+        assertEquals("482910", summary.messages.first().extractedOtp)
+        assertTrue(summary.messages.first().isBankAlert)
+        assertEquals("Rs. 2,500.00", summary.messages.first().extractedAmount)
+        assertEquals("UTR99887766", summary.messages.first().extractedReference)
+
+        // Verify brain plans READ_SMS -> SAVE_CONTACT for Scenario B
+        val brain = createHeadlessBrain()
+        val task = brain.planTaskForInstruction("Read my latest SMS and save the sender if the number is new.")
+        assertEquals(2, task.actions.size)
+        assertEquals(ActionType.READ_SMS, task.actions[0].actionType)
+        assertEquals(ActionType.SAVE_CONTACT, task.actions[1].actionType)
+        assertEquals("IF_NEW_NUMBER", task.actions[1].parameters["condition"])
+
+        // Save new sender contact after confirmation
+        val saveRes = callMgr.saveOrUpdateContact(
+            displayName = "SMS Sender (+919988776655)",
+            phoneNumber = "+919988776655",
+            isConfirmed = true,
+            onlyIfNewNumber = true
+        )
+        assertTrue(saveRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, saveRes.status)
+        assertTrue(callMgr.isPhoneNumberInContacts("+919988776655"))
+
+        // Second attempt with onlyIfNewNumber = true skips duplicate creation
+        val skipRes = callMgr.saveOrUpdateContact(
+            displayName = "SMS Sender (+919988776655)",
+            phoneNumber = "+919988776655",
+            isConfirmed = true,
+            onlyIfNewNumber = true
+        )
+        assertTrue(skipRes.isSuccess)
+        assertTrue(skipRes.outputMessage.contains("already saved"))
+    }
+
+    @Test
+    fun testScenarioCIncomingCallControlAndCallHistory() {
+        val callMgr = CallIntelligenceManager(context = null)
+        callMgr.testOverrideCallState = com.example.core.telephony.CallStateSnapshot(
+            isRinging = true,
+            isOffhook = false,
+            callerDisplayName = "Rahul (+919876543210)",
+            statusSummary = "Incoming call detected. Rahul (+919876543210)"
+        )
+        val answerRes = callMgr.manageIncomingOrActiveCall("ANSWER", isConfirmed = true)
+        assertTrue(answerRes.isSuccess)
+        assertTrue(answerRes.outputMessage.contains("Answered incoming call"))
+
+        val endRes = callMgr.manageIncomingOrActiveCall("END", isConfirmed = true)
+        assertTrue(endRes.isSuccess)
+        assertTrue(endRes.outputMessage.contains("ended"))
+
+        // Test Call History lookup
+        callMgr.testOverrideCallHistory = listOf(
+            com.example.core.telephony.CallHistoryEntry(
+                callerNameOrNumber = "Rahul",
+                phoneNumber = "+919876543210",
+                callType = "MISSED",
+                timestampMs = 1_700_000_000_000L,
+                durationSeconds = 0L
+            )
+        )
+        val historyRes = callMgr.queryCallHistory(filterType = "missed")
+        assertTrue(historyRes.isSuccess)
+        assertTrue(historyRes.outputMessage.contains("[MISSED] Rahul"))
+
+        // Test Voice Call Management planning
+        val brain = createHeadlessBrain()
+        assertEquals(ActionType.MANAGE_CALL, brain.planTaskForInstruction("Babu, call answer karo").actions.first().actionType)
+        assertEquals(ActionType.MANAGE_CALL, brain.planTaskForInstruction("Babu, call reject karo").actions.first().actionType)
+        assertEquals(ActionType.MANAGE_CALL, brain.planTaskForInstruction("Babu, phone kaat do").actions.first().actionType)
+        assertEquals(ActionType.CHECK_INCOMING_CALL, brain.planTaskForInstruction("Babu, kaun phone kar raha hai?").actions.first().actionType)
+    }
+
+    @Test
+    fun testScenariosDToGPlanningAndExecution() {
+        val brain = createHeadlessBrain()
+
+        // Scenario D: "Read my latest WhatsApp messages and tell me which ones need a reply."
+        val scD = brain.planTaskForInstruction("Read my latest WhatsApp messages and tell me which ones need a reply.")
+        assertEquals(ActionType.WHATSAPP_READ_CONVERSATION, scD.actions.first().actionType)
+        assertEquals("true", scD.actions.first().parameters["analyzeReplyPriority"])
+
+        // Scenario E: "Remind me tomorrow to call Rahul, and after I call him, mark the task complete."
+        val scE = brain.planTaskForInstruction("Remind me tomorrow to call Rahul, and after I call him, mark the task complete.")
+        assertEquals(2, scE.actions.size)
+        assertEquals(ActionType.CREATE_REMINDER, scE.actions[0].actionType)
+        assertEquals(ActionType.SAVE_NOTE, scE.actions[1].actionType)
+
+        // Scenario F: "Turn on Bluetooth, open my music application, and play my last playlist."
+        val scF = brain.planTaskForInstruction("Turn on Bluetooth, open my music application, and play my last playlist.")
+        assertEquals(3, scF.actions.size)
+        assertEquals(ActionType.OPEN_SETTINGS_SECTION, scF.actions[0].actionType)
+        assertEquals("bluetooth", scF.actions[0].target)
+        assertEquals(ActionType.LAUNCH_APP, scF.actions[1].actionType)
+        assertEquals(ActionType.CLICK_ELEMENT, scF.actions[2].actionType)
+
+        // Scenario G: "Find the address in my latest email and send it to Rahul on WhatsApp."
+        val scG = brain.planTaskForInstruction("Find the address in my latest email and send it to Rahul on WhatsApp.")
+        assertEquals(2, scG.actions.size)
+        assertEquals(ActionType.READ_NOTIFICATIONS, scG.actions[0].actionType)
+        assertEquals(ActionType.MESSAGE_DRAFT_SEND, scG.actions[1].actionType)
+        assertEquals("Rahul", scG.actions[1].target)
+        assertEquals("true", scG.actions[1].parameters["usePreviousStepOutput"])
+    }
+
     private fun createHeadlessBrain(): AgentBrain {
         val dummyExecutor = UnsafeTestHelper.allocateWithoutInit(ActionExecutor::class.java)
         val dummyProvider = UnsafeTestHelper.allocateWithoutInit(com.example.core.provider.AIProviderManager::class.java)

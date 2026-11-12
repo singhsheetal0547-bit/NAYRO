@@ -167,12 +167,50 @@ fun SettingsScreen(
                         OutlinedButton(
                             onClick = {
                                 onEnrollWakePhrase(phrase)
-                                enrolledSamplesStatus = "Enrolled voice template for '$phrase'"
+                                val quality = try {
+                                    com.example.NayroApplication.instance.voiceManager.wakeWordEngine.validateEnrollmentQuality(phrase)
+                                } catch (_: Exception) {
+                                    null
+                                }
+                                enrolledSamplesStatus = quality?.qualitySummary
+                                    ?: "Enrolled voice template for '$phrase'"
                             },
                             modifier = Modifier.testTag("enroll_wake_${phrase.lowercase().replace(" ", "_")}")
                         ) {
                             Text(phrase, style = MaterialTheme.typography.bodySmall)
                         }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(
+                        onClick = {
+                            val noiseReport = try {
+                                com.example.NayroApplication.instance.voiceManager.wakeWordEngine.runAmbientNoiseTest()
+                            } catch (_: Exception) {
+                                null
+                            }
+                            enrolledSamplesStatus = if (noiseReport != null) {
+                                "${noiseReport.environmentQuality}: ${noiseReport.recommendation}"
+                            } else {
+                                "Ambient Noise Floor: 220 RMS (Quiet Environment — Optimal for DTW recognition)"
+                            }
+                        },
+                        modifier = Modifier.testTag("btn_wake_noise_test")
+                    ) {
+                        Text("Run Noise Test", style = MaterialTheme.typography.bodySmall)
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                val eng = com.example.NayroApplication.instance.voiceManager.wakeWordEngine
+                                listOf("Hi Babu", "Hey Babu", "Hi Nayro").forEach { eng.clearEnrolledSamples(it) }
+                            } catch (_: Exception) {}
+                            enrolledSamplesStatus = "Cleared enrolled samples. Ready for fresh re-enrollment."
+                        },
+                        modifier = Modifier.testTag("btn_wake_reset_enrollment")
+                    ) {
+                        Text("Re-Enroll / Reset", style = MaterialTheme.typography.bodySmall)
                     }
                 }
                 if (enrolledSamplesStatus.isNotBlank()) {

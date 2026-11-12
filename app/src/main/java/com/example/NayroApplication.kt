@@ -142,6 +142,25 @@ class NayroApplication : Application() {
         voiceManager = VoiceManager(this)
         healthManager = BackgroundAgentHealthManager(this, permissionManager, capabilityManager, voiceManager)
 
+        // Section 10 — Connect real incoming notifications to AutomationEngine notification watch rules
+        com.example.core.notification.NotificationIntelligenceRepository.onNotificationCapturedTrigger = { item ->
+            if (!com.example.core.service.ServiceStateRepository.isBackgroundAgentPaused.value) {
+                applicationScope.launch {
+                    val eventPayload = "${item.packageName} ${item.title} ${item.text}"
+                    automationEngine.onEventTriggered(
+                        triggerType = com.example.core.automation.AutomationTriggerType.NOTIFICATION_ARRIVED,
+                        eventValue = eventPayload
+                    ) { instruction ->
+                        val out = agentRuntime.executeUserInstruction(instruction)
+                        val failed = out.startsWith("Failed", ignoreCase = true) ||
+                            out.startsWith("Cannot", ignoreCase = true) ||
+                            out.contains("error", ignoreCase = true)
+                        !failed to out
+                    }
+                }
+            }
+        }
+
         // Attempt Task Continuity recovery on application boot
         applicationScope.launch {
             agentRuntime.recoverInterruptedTasksOnBoot()

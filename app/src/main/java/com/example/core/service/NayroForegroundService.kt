@@ -17,13 +17,17 @@ import com.example.R
 import com.example.data.local.entities.ConversationEntity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
- * System C — Android Foreground Service for NAYRO Background Agent Engine.
+ * System C — Android Foreground Service for NAYRO Background Resident Agent Engine (Section 4).
  * Operates as a legitimate Android Foreground Service (type: MICROPHONE).
- * Connects background local wake-word listening directly to AgentRuntime & VoiceManager.
+ * Connects background local wake-word listening, authorized notification triggers,
+ * and temporary Pause / Resume controls directly to AgentRuntime & VoiceManager.
  */
 class NayroForegroundService : Service() {
 
@@ -33,6 +37,11 @@ class NayroForegroundService : Service() {
 
         const val ACTION_START = "com.example.nayro.action.START"
         const val ACTION_STOP = "com.example.nayro.action.STOP"
+        const val ACTION_PAUSE = "com.example.nayro.action.PAUSE"
+        const val ACTION_RESUME = "com.example.nayro.action.RESUME"
+
+        const val EXTRA_PAUSE_DURATION_MINUTES = "com.example.nayro.extra.PAUSE_DURATION_MINUTES"
+        const val EXTRA_PAUSE_REASON = "com.example.nayro.extra.PAUSE_REASON"
 
         val status: StateFlow<ServiceStatus> = ServiceStateRepository.foregroundServiceStatus
 
@@ -65,6 +74,44 @@ class NayroForegroundService : Service() {
             }
         }
 
+        fun pauseService(
+            context: Context?,
+            durationMinutes: Int? = null,
+            reason: String = "Paused by user"
+        ) {
+            ServiceStateRepository.pauseBackgroundAgent(durationMinutes, reason)
+            if (context == null) return
+            val intent = Intent(context, NayroForegroundService::class.java).apply {
+                action = ACTION_PAUSE
+                if (durationMinutes != null && durationMinutes > 0) {
+                    putExtra(EXTRA_PAUSE_DURATION_MINUTES, durationMinutes)
+                }
+                putExtra(EXTRA_PAUSE_REASON, reason)
+            }
+            try {
+                context.startService(intent)
+            } catch (_: Exception) {
+                // In headless tests or when service is not yet started, state repository already reflects PAUSED
+            }
+        }
+
+        fun resumeService(context: Context?) {
+            ServiceStateRepository.resumeBackgroundAgent()
+            if (context == null) return
+            val intent = Intent(context, NayroForegroundService::class.java).apply {
+                action = ACTION_RESUME
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (_: Exception) {
+                // State repository already updated
+            }
+        }
+
         fun stopService(context: Context) {
             ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
             val intent = Intent(context, NayroForegroundService::class.java).apply {
@@ -78,7 +125,8 @@ class NayroForegroundService : Service() {
         }
     }
 
-    private val serviceScope = CoroutineScope(Dispatchers.Default)
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var pauseTimerJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -86,17 +134,35 @@ class NayroForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
-            stopWakeWordEngine()
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                pauseTimerJob?.cancel()
+                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
+                stopWakeWordEngine()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
+                return START_NOT_STICKY
+            }
+            ACTION_PAUSE -> {
+                val durationMins = intent.getIntExtra(EXTRA_PAUSE_DURATION_MINUTES, -1).takeIf { it > 0 }
+                val reason = intent.getStringExtra(EXTRA_PAUSE_REASON) ?: "Paused by user"
+                handlePauseCommand(durationMins, reason)
+                return START_STICKY
+            }
+            ACTION_RESUME -> {
+                handleResumeCommand()
+                return START_STICKY
+            }
         }
 
         try {
-            val notification = createNotification("NAYRO Agent Active", "Babu background agent engine is ready. Tap to open.")
+            pauseTimerJob?.cancel()
+            val notification = createNotification(
+                title = "NAYRO Agent Active",
+                content = "Babu background agent engine is ready. Tap to open.",
+                isPaused = false
+            )
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -126,6 +192,68 @@ class NayroForegroundService : Service() {
         return START_STICKY
     }
 
+    private fun handlePauseCommand(durationMinutes: Int?, reason: String) {
+        pauseTimerJob?.cancel()
+        stopWakeWordEngine()
+        try {
+            val app = NayroApplication.instance
+            app.agentRuntime.pauseCurrentTask()
+            app.automationEngine.pauseAllAutomations()
+        } catch (_: Exception) {}
+
+        ServiceStateRepository.pauseBackgroundAgent(durationMinutes, reason)
+
+        val pauseSubtitle = if (durationMinutes != null && durationMinutes > 0) {
+            "Paused for ${durationMinutes}m ($reason). Tap Resume to reactivate."
+        } else {
+            "Paused until manually resumed ($reason)."
+        }
+
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.notify(
+                NOTIFICATION_ID,
+                createNotification(
+                    title = "NAYRO Background Agent Paused",
+                    content = pauseSubtitle,
+                    isPaused = true
+                )
+            )
+        } catch (_: Exception) {}
+
+        if (durationMinutes != null && durationMinutes > 0) {
+            pauseTimerJob = serviceScope.launch {
+                delay(durationMinutes * 60_000L)
+                handleResumeCommand()
+            }
+        }
+    }
+
+    private fun handleResumeCommand() {
+        pauseTimerJob?.cancel()
+        ServiceStateRepository.resumeBackgroundAgent()
+        try {
+            val app = NayroApplication.instance
+            app.automationEngine.resumeAllAutomations()
+            app.agentRuntime.resumeCurrentTask()
+            app.agentRuntime.recordHeartbeat()
+        } catch (_: Exception) {}
+
+        setupBackgroundVoicePipeline()
+
+        try {
+            val nm = getSystemService(NotificationManager::class.java)
+            nm?.notify(
+                NOTIFICATION_ID,
+                createNotification(
+                    title = "NAYRO Agent Active",
+                    content = "Babu background agent resumed and listening locally.",
+                    isPaused = false
+                )
+            )
+        } catch (_: Exception) {}
+    }
+
     private fun setupBackgroundVoicePipeline() {
         try {
             val app = NayroApplication.instance
@@ -133,18 +261,19 @@ class NayroForegroundService : Service() {
             app.voiceManager.onVoiceExitCommand = {
                 app.agentRuntime.cancelCurrentTask()
             }
-            if (app.permissionManager.isMicrophoneGranted()) {
+            if (app.permissionManager.isMicrophoneGranted() && !ServiceStateRepository.isBackgroundAgentPaused.value) {
                 val config = app.voiceManager.configuration.value.copy(isWakeWordEnabled = true)
                 app.voiceManager.updateConfiguration(config)
 
                 app.voiceManager.attachServiceListener { text ->
-                    if (text.isNotBlank()) {
+                    if (text.isNotBlank() && !ServiceStateRepository.isBackgroundAgentPaused.value) {
                         if (app.voiceManager.wakeWordEngine.isVoiceExitCommand(text)) {
                             app.agentRuntime.cancelCurrentTask()
                             return@attachServiceListener
                         }
                         serviceScope.launch {
                             app.agentRuntime.recordHeartbeat()
+                            ServiceStateRepository.appendActivityLog("Voice command received: \"$text\"")
                             app.repository.addConversationMessage(
                                 ConversationEntity(sender = "user", content = text)
                             )
@@ -175,13 +304,13 @@ class NayroForegroundService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        pauseTimerJob?.cancel()
         stopWakeWordEngine()
         ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         super.onTaskRemoved(rootIntent)
-        // Ensure service status is accurately updated if process task is removed from Recents
         ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
     }
 
@@ -202,7 +331,7 @@ class NayroForegroundService : Service() {
         }
     }
 
-    private fun createNotification(title: String, content: String): Notification {
+    private fun createNotification(title: String, content: String, isPaused: Boolean): Notification {
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -223,6 +352,16 @@ class NayroForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val togglePauseIntent = Intent(this, NayroForegroundService::class.java).apply {
+            action = if (isPaused) ACTION_RESUME else ACTION_PAUSE
+        }
+        val togglePausePendingIntent = PendingIntent.getService(
+            this,
+            2,
+            togglePauseIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(content)
@@ -230,6 +369,11 @@ class NayroForegroundService : Service() {
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(
+                if (isPaused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
+                if (isPaused) "Resume Agent" else "Pause Agent",
+                togglePausePendingIntent
+            )
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop Agent", stopPendingIntent)
             .build()
     }

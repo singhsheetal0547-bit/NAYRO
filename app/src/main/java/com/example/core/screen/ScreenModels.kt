@@ -55,3 +55,21 @@ data class ScreenContext(
     val isAccessibilityAvailable: Boolean
 )
 
+/**
+ * Section 6 — Real Computer-Use Visual Screen Observation produced by pixel-level
+ * screenshot analysis fused with Accessibility node bounding boxes.
+ */
+data class VisualScreenObservation(
+    val width: Int,
+    val height: Int,
+    val meanLuminance: Float,
+    val contrastScore: Float,
+    val isDarkThemeDetected: Boolean,
+    val hasModalDimOverlay: Boolean,
+    val visualPerceptualHash: Long,
+    val detectedRegionsSummary: String,
+    val groundedTextElements: List<String>,
+    val timestampMs: Long = System.currentTimeMillis()
+)
+
+

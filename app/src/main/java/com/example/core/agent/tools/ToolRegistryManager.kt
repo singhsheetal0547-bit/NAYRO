@@ -827,6 +827,60 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 requiredCapability = CapabilityId.ACCESSIBILITY
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.READ_SMS,
+                toolId = "comm.read_sms",
+                displayName = "Read & Analyze SMS Messages",
+                description = "Reads recent, unread, OTP, or bank SMS messages from Telephony.Sms or authorized Notification Listener buffer.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf(
+                    "filter" to "String - latest, unread, otp, bank, or all",
+                    "query" to "String - Optional sender name, phone number, or keyword"
+                ),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.MANAGE_CALL,
+                toolId = "comm.manage_call",
+                displayName = "Manage Incoming / Active Phone Call",
+                description = "Answers, rejects, ends, or identifies an active or incoming phone call via TelecomManager or Accessibility In-Call UI.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("operation" to "String - ANSWER, REJECT, END, or IDENTIFY"),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.READ_CALL_HISTORY,
+                toolId = "comm.read_call_history",
+                displayName = "Read Call History & Missed Calls",
+                description = "Queries recent incoming, outgoing, or missed calls from CallLog or authorized Notification Listener buffer.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf(
+                    "filter" to "String - all, missed, incoming, or outgoing",
+                    "query" to "String - Optional contact name or phone number"
+                ),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SAVE_CONTACT,
+                toolId = "comm.save_contact",
+                displayName = "Save or Update Contact",
+                description = "Creates or updates a contact in Android Contacts after user confirmation, optionally checking if the phone number is new.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf(
+                    "name" to "String - Contact display name",
+                    "phone" to "String - Phone number",
+                    "condition" to "String - Optional IF_NEW_NUMBER condition"
+                ),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+            )
+        )
     }
 
     /**

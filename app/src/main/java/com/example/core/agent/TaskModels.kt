@@ -67,8 +67,12 @@ enum class ActionType {
     MESSAGE_DRAFT_SEND,
     WHATSAPP_READ_CONVERSATION,
     SEND_SMS,
+    READ_SMS,
     CHECK_INCOMING_CALL,
+    MANAGE_CALL,
+    READ_CALL_HISTORY,
     RESOLVE_CONTACT,
+    SAVE_CONTACT,
     MAKE_PHONE_CALL,
     READ_NOTIFICATIONS,
     SUMMARIZE_NOTIFICATIONS,
@@ -239,8 +243,12 @@ fun ActionType.toUserFriendlyDescription(
         }
         ActionType.WHATSAPP_READ_CONVERSATION -> "Reading WhatsApp conversation..."
         ActionType.SEND_SMS -> "Preparing SMS message${if (recipient != null) " for $recipient" else ""}..."
+        ActionType.READ_SMS -> "Reading recent SMS messages..."
         ActionType.CHECK_INCOMING_CALL -> "Checking incoming call state..."
+        ActionType.MANAGE_CALL -> "Managing active/incoming phone call (${parameters["operation"] ?: target ?: "status"})..."
+        ActionType.READ_CALL_HISTORY -> "Reading recent call history..."
         ActionType.RESOLVE_CONTACT -> "Looking up contact ${query ?: target ?: ""}...".trim()
+        ActionType.SAVE_CONTACT -> "Saving contact ${parameters["name"] ?: target ?: ""}...".trim()
         ActionType.MAKE_PHONE_CALL -> "Preparing phone call${if (recipient != null) " to $recipient" else ""}..."
         ActionType.READ_NOTIFICATIONS -> "Reading active notifications..."
         ActionType.SUMMARIZE_NOTIFICATIONS -> "Summarizing your recent notifications..."

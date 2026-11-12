@@ -96,11 +96,40 @@ class NayroAccessibilityService : AccessibilityService() {
                                 val width = buffer.width
                                 val height = buffer.height
                                 val timestamp = screenshot.timestamp
-                                buffer.close()
+                                var visualSummary = ""
+                                try {
+                                    val hwBitmap = android.graphics.Bitmap.wrapHardwareBuffer(
+                                        buffer,
+                                        screenshot.colorSpace
+                                    )
+                                    val swBitmap = hwBitmap?.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+                                    hwBitmap?.recycle()
+                                    if (swBitmap != null) {
+                                        val rootNode = getSafeRootInActiveWindow()
+                                        val snapshot = if (rootNode != null) {
+                                            val tree = com.example.core.screen.AccessibilityTreeReader.readTree(rootNode)
+                                            val texts = com.example.core.screen.AccessibilityTreeReader.flattenAllTexts(tree)
+                                            val interactive = com.example.core.screen.AccessibilityTreeReader.extractInteractiveElements(tree)
+                                            com.example.core.screen.ScreenSnapshot(
+                                                packageName = rootNode.packageName?.toString(),
+                                                visibleTexts = texts,
+                                                interactiveElements = interactive,
+                                                totalNodeCount = texts.size + interactive.size
+                                            )
+                                        } else null
+                                        val obs = com.example.core.screen.ScreenIntelligenceManager.analyzeBitmap(swBitmap, snapshot)
+                                        visualSummary = " Visual Analysis: ${obs.detectedRegionsSummary}"
+                                        swBitmap.recycle()
+                                    }
+                                } catch (_: Exception) {
+                                    // HardwareBuffer wrapping may not be supported on all GPU drivers
+                                } finally {
+                                    buffer.close()
+                                }
                                 if (width > 0 && height > 0) {
                                     if (cont.isActive) {
                                         cont.resume(
-                                            true to "Verified screenshot captured (${width}x${height} px, timestamp=$timestamp)."
+                                            true to "Verified screenshot captured (${width}x${height} px, timestamp=$timestamp).$visualSummary"
                                         )
                                     }
                                 } else {

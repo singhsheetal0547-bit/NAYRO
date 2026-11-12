@@ -366,7 +366,20 @@ fun NayroAppContent(
                         onStopFloatingService = onStopFloatingService,
                         onRequestOverlayPermission = {
                             onOpenPermissionSettings(PermissionType.OVERLAY)
-                        }
+                        },
+                        isWakeWordEnabled = voiceConfig.isWakeWordEnabled,
+                        onToggleWakeWord = { enabled ->
+                            voiceManager.updateConfiguration(voiceConfig.copy(isWakeWordEnabled = enabled))
+                            capabilityManager.evaluateAll()
+                        },
+                        currentAgentStateLabel = agentState.javaClass.simpleName,
+                        onPauseBackgroundAgent = { _ ->
+                            agentRuntime.pauseCurrentTask()
+                        },
+                        onResumeBackgroundAgent = {
+                            agentRuntime.resumeCurrentTask()
+                        },
+                        onOpenPermissionSettings = onOpenPermissionSettings
                     )
 
                     Screen.PermissionAccess -> PermissionAccessScreen(
@@ -501,6 +514,13 @@ fun NayroAppContent(
                                     }
                                 }
                             }
+                        },
+                        wakeSensitivity = voiceManager.wakeWordEngine.getConfidenceThreshold(),
+                        onWakeSensitivityChange = { threshold ->
+                            voiceManager.wakeWordEngine.setSensitivity(1.0f - (threshold - 0.50f))
+                        },
+                        onEnrollWakePhrase = { phrase ->
+                            voiceManager.wakeWordEngine.recordOrEnrollPhraseFromUi(phrase)
                         }
                     )
 
