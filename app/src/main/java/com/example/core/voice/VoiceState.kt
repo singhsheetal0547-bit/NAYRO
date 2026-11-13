@@ -1,23 +1,44 @@
 package com.example.core.voice
 
+/**
+ * Authoritative Voice Assistant & Continuous Conversation Lifecycle States (Phase 1B & 1C).
+ */
 enum class VoiceState {
+    IDLE,
     STANDBY,
     WAKE_DETECTED,
     LISTENING,
     TRANSCRIBING,
     THINKING,
+    EXECUTING,
     SPEAKING,
+    FOLLOW_UP_LISTENING,
+    PAUSED,
+    STOPPED,
     DISABLED,
     ERROR
 }
 
+/**
+ * Tracks which subsystem currently owns the microphone or active audio session (Phase 1B).
+ * Prevents AudioRecord (wake-word), SpeechRecognizer (ASR), and TextToSpeech (TTS) from conflicting.
+ */
+enum class AudioSessionOwner {
+    NONE,
+    WAKE_WORD_ENGINE,
+    SPEECH_RECOGNIZER,
+    TTS_PLAYBACK,
+    PHONE_CALL_INTERRUPTION
+}
+
 data class VoiceConfiguration(
-    val assistantName: String = "Babu",
-    val wakePhrases: List<String> = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie"),
     val isWakeWordEnabled: Boolean = false,
+    val wakePhrase: String = "Hey Babu",
+    val sensitivity: Float = 0.5f,
     val isTtsEnabled: Boolean = true,
-    val sensitivity: Float = 0.7f,
-    val isScreenOffWakeEnabled: Boolean = false,
-    val language: String = "en-IN", // Hindi/English/Hinglish
-    val speechRate: Float = 1.0f
+    val speechRate: Float = 1.0f,
+    val languageTag: String = "en-IN",
+    val isContinuousConversationEnabled: Boolean = true,
+    val followUpTimeoutMs: Long = 8_000L,
+    val preferOfflineSpeechRecognition: Boolean = false
 )

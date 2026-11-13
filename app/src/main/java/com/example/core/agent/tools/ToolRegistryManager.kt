@@ -306,13 +306,25 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
         )
         register(
             DynamicToolDefinition(
-                actionType = ActionType.MAKE_PHONE_CALL,
-                toolId = "comm.make_phone_call",
+                actionType = ActionType.OPEN_PHONE_DIALER,
+                toolId = "comm.open_phone_dialer",
                 displayName = "Open Phone Dialer",
-                description = "Opens the Android dialer with a resolved contact number or phone number for user confirmation.",
+                description = "Opens the Android phone dialer (ACTION_DIAL) with a resolved contact or phone number pre-filled without placing an active call.",
                 category = ToolCategory.COMMUNICATION,
                 parametersSchema = mapOf("target" to "String - Phone number or contact name"),
-                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.MAKE_PHONE_CALL,
+                toolId = "comm.make_phone_call",
+                displayName = "Place Outgoing Phone Call",
+                description = "Resolves contact, validates phone number, checks CALL_PHONE permission, obtains user confirmation, initiates actual outgoing phone call (ACTION_CALL / TelecomManager), and observes call state.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("target" to "String - Phone number or contact name"),
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                requiredPermission = Manifest.permission.CALL_PHONE
             )
         )
         register(
@@ -679,11 +691,12 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
             DynamicToolDefinition(
                 actionType = ActionType.SEND_SMS,
                 toolId = "comm.send_sms",
-                displayName = "Compose & Send SMS",
-                description = "Resolves recipient contact, enforces confirmation, and opens the Android SMS composer with pre-filled text via ACTION_SENDTO.",
+                displayName = "Send SMS Message",
+                description = "Resolves recipient contact, validates phone number, checks SEND_SMS permission, obtains user confirmation, transmits SMS via SmsManager with PendingIntent sent verification, or offers user-mediated SMS composer fallback.",
                 category = ToolCategory.COMMUNICATION,
                 parametersSchema = mapOf("recipient" to "String - Contact name or phone number", "message" to "String - SMS body text"),
-                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+                riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                requiredPermission = Manifest.permission.SEND_SMS
             )
         )
         register(
@@ -881,6 +894,34 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CONTROL_MEDIA,
+                toolId = "media.control_media",
+                displayName = "Control Media & Music Playback",
+                description = "Plays songs, artists, genres, or favourite music on YouTube/Spotify/preferred media app, or controls active playback (play, pause, resume, next, previous).",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = mapOf(
+                    "operation" to "String - PLAY_QUERY, PLAY_FAVOURITE_SONG, PLAY_BY_ARTIST, PLAY_BY_GENRE_OR_MOOD, PAUSE, RESUME, NEXT_TRACK, PREVIOUS_TRACK, STOP, or STATUS",
+                    "query" to "String - Optional song title, artist, or genre query",
+                    "artist" to "String - Optional artist name",
+                    "genre" to "String - Optional genre or mood",
+                    "app" to "String - Optional media app (YouTube, YouTube Music, Spotify)"
+                ),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.NAVIGATE_HOME,
+                toolId = "screen.navigate_home",
+                displayName = "Navigate Home",
+                description = "Performs global Android Home navigation via AccessibilityService or HOME intent.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
     }
 
     /**
@@ -910,6 +951,13 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 val y = action.parameters["y"]?.toFloatOrNull()
                 if (x == null || y == null) {
                     return false to "Numeric coordinates 'x' and 'y' are required for INTERACT_COORDINATES."
+                }
+            }
+            ActionType.OPEN_PHONE_DIALER,
+            ActionType.MAKE_PHONE_CALL -> {
+                val target = action.target ?: action.parameters["target"] ?: action.parameters["number"]
+                if (target.isNullOrBlank()) {
+                    return false to "Missing 'target' contact name or phone number for ${action.actionType.name}."
                 }
             }
             ActionType.SEND_SMS -> {

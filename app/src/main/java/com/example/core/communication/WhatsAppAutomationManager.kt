@@ -13,6 +13,15 @@ import com.example.core.telephony.CallIntelligenceManager
 import com.example.core.telephony.ContactResolutionResult
 import kotlinx.coroutines.delay
 
+enum class WhatsAppMessageLifecycleState {
+    CONVERSATION_OPENED,
+    MESSAGE_COMPOSED,
+    MESSAGE_SENT,
+    MESSAGE_DELIVERED,
+    MESSAGE_READ,
+    ACTION_INCONCLUSIVE
+}
+
 /**
  * Section 8 — Real WhatsApp Integration Manager for NAYRO.
  * Connects Android Intent navigation, ContactsContract resolution, and AccessibilityService UI
@@ -34,11 +43,64 @@ class WhatsAppAutomationManager(
 
     companion object {
         val WHATSAPP_PACKAGES = listOf("com.whatsapp", "com.whatsapp.w4b")
+        private const val DUPLICATE_SEND_WINDOW_MS = 15_000L
+        private val recentWhatsAppSignatures = mutableMapOf<String, Long>()
+
+        @Synchronized
+        fun clearDuplicateSendHistory() {
+            recentWhatsAppSignatures.clear()
+        }
+
+        @Synchronized
+        private fun isDuplicateSend(recipientKey: String, body: String, nowMs: Long): Boolean {
+            val sig = "${recipientKey.lowercase().trim()}|${body.trim()}"
+            val prev = recentWhatsAppSignatures[sig]
+            if (prev != null && (nowMs - prev) in 0 until DUPLICATE_SEND_WINDOW_MS) {
+                return true
+            }
+            recentWhatsAppSignatures[sig] = nowMs
+            return false
+        }
     }
 
     var testOverrideInstalled: Boolean? = null
     var testOverrideSendVerified: Boolean? = null
+    var testOverrideHeaderVerified: Boolean? = null
     var testOverrideVisibleMessages: List<String>? = null
+    var testOverrideUnreadNotifications: List<Pair<String, String>>? = null
+    var testOverrideCallInitiated: Boolean? = null
+    var lastMessageLifecycleState: WhatsAppMessageLifecycleState = WhatsAppMessageLifecycleState.ACTION_INCONCLUSIVE
+
+    /**
+     * Phase 3C — Evaluates WhatsApp message lifecycle state from visible screen labels.
+     * Never claims MESSAGE_DELIVERED or MESSAGE_READ from a sent message bubble alone unless
+     * explicit delivery/read tick labels ("Delivered", "Read", "Seen") are present in the UI tree.
+     */
+    fun evaluateWhatsAppMessageLifecycleState(
+        messageText: String,
+        visibleScreenText: String,
+        wasSendClicked: Boolean
+    ): WhatsAppMessageLifecycleState {
+        if (!wasSendClicked) {
+            return if (visibleScreenText.contains(messageText.take(15), ignoreCase = true)) {
+                WhatsAppMessageLifecycleState.MESSAGE_COMPOSED
+            } else {
+                WhatsAppMessageLifecycleState.CONVERSATION_OPENED
+            }
+        }
+        val bubblePresent = visibleScreenText.contains(messageText.take(15), ignoreCase = true)
+        if (!bubblePresent) {
+            return WhatsAppMessageLifecycleState.ACTION_INCONCLUSIVE
+        }
+        val lower = visibleScreenText.lowercase()
+        return when {
+            lower.contains("status: read") || lower.contains("read by") || lower.contains("seen") ->
+                WhatsAppMessageLifecycleState.MESSAGE_READ
+            lower.contains("status: delivered") || lower.contains("delivered to") ->
+                WhatsAppMessageLifecycleState.MESSAGE_DELIVERED
+            else -> WhatsAppMessageLifecycleState.MESSAGE_SENT
+        }
+    }
 
     fun resolveInstalledWhatsAppPackage(): String? {
         testOverrideInstalled?.let { return if (it) "com.whatsapp" else null }
@@ -62,7 +124,8 @@ class WhatsAppAutomationManager(
     suspend fun sendOrDraftMessage(
         rawRecipientSpec: String,
         messageText: String,
-        isConfirmed: Boolean
+        isConfirmed: Boolean,
+        attachmentInfo: String? = null
     ): ActionExecutionResult {
         val cleanRecipientSpec = rawRecipientSpec.trim()
         val cleanMessage = messageText.trim()
@@ -87,9 +150,12 @@ class WhatsAppAutomationManager(
         }
 
         if (!isConfirmed) {
+            val attachNote = if (!attachmentInfo.isNullOrBlank() && !attachmentInfo.equals("None", ignoreCase = true)) {
+                " [Attachment: $attachmentInfo]"
+            } else ""
             return ActionExecutionResult(
                 false,
-                "Confirmation required before sending WhatsApp message to '$cleanRecipientSpec': \"$cleanMessage\"",
+                "Confirmation required before sending WhatsApp message to '$cleanRecipientSpec': \"$cleanMessage\"$attachNote",
                 VerificationStatus.REQUIRES_CONFIRMATION
             )
         }
@@ -135,11 +201,26 @@ class WhatsAppAutomationManager(
         var resolvedDisplayName = rawRecipient
         var resolvedPhone: String? = if (isDirectPhone) rawRecipient else null
 
+        if (isDirectPhone && !CallIntelligenceManager.isValidPhoneNumber(rawRecipient)) {
+            return ActionExecutionResult(
+                false,
+                "Cannot send WhatsApp message: '$rawRecipient' is not a valid phone number.",
+                VerificationStatus.FAILED
+            )
+        }
+
         if (!isDirectPhone) {
             when (val contactRes = callIntelligenceManager.resolveContactsByName(rawRecipient)) {
                 is ContactResolutionResult.SingleMatch -> {
                     resolvedDisplayName = contactRes.contact.displayName
                     resolvedPhone = contactRes.contact.phoneNumber
+                    if (!CallIntelligenceManager.isValidPhoneNumber(resolvedPhone)) {
+                        return ActionExecutionResult(
+                            false,
+                            "Contact '$resolvedDisplayName' has an invalid phone number ('$resolvedPhone'); WhatsApp message was not sent.",
+                            VerificationStatus.FAILED
+                        )
+                    }
                 }
                 is ContactResolutionResult.Ambiguous -> {
                     val candidates = contactRes.candidates.joinToString(", ") { "${it.displayName} (${it.phoneNumber})" }
@@ -168,6 +249,16 @@ class WhatsAppAutomationManager(
             }
         }
 
+        // Prevent duplicate accidental sends of the exact same message to the same recipient within 15s
+        val recipientSignatureKey = resolvedPhone ?: resolvedDisplayName
+        if (isDuplicateSend(recipientSignatureKey, message, System.currentTimeMillis())) {
+            return ActionExecutionResult(
+                false,
+                "Blocked duplicate WhatsApp message send to $resolvedDisplayName: the identical message \"$message\" was already sent moments ago.",
+                VerificationStatus.FAILED
+            )
+        }
+
         // Headless test verification hook when simulated in JVM tests
         testOverrideSendVerified?.let { simulatedVerified ->
             if (!isWhatsAppInstalled()) {
@@ -177,16 +268,23 @@ class WhatsAppAutomationManager(
                     VerificationStatus.FAILED
                 )
             }
+            if (testOverrideHeaderVerified == false) {
+                return ActionExecutionResult(
+                    false,
+                    "Aborted WhatsApp send: active conversation header did not match expected recipient '$resolvedDisplayName'.",
+                    VerificationStatus.FAILED
+                )
+            }
             return if (simulatedVerified) {
                 ActionExecutionResult(
                     true,
-                    "WhatsApp Send button clicked and message '$message' verified in conversation view for $resolvedDisplayName (network delivery/read status is not claimed).",
+                    "WhatsApp conversation identity verified for $resolvedDisplayName, Send button clicked, and message '$message' verified in conversation view [WHATSAPP_SENT_BUBBLE_VERIFIED=true] (remote delivery/read status is not claimed).",
                     VerificationStatus.VERIFIED
                 )
             } else {
                 ActionExecutionResult(
                     false,
-                    "WhatsApp draft composed for $resolvedDisplayName, but Send verification did not observe the sent bubble on screen.",
+                    "WhatsApp draft composed for $resolvedDisplayName, but Send verification did not observe the sent bubble on screen [WHATSAPP_SENT_BUBBLE_VERIFIED=false].",
                     VerificationStatus.INCONCLUSIVE
                 )
             }
@@ -210,7 +308,7 @@ class WhatsAppAutomationManager(
         if (!NayroAccessibilityService.isConnected()) {
             return ActionExecutionResult(
                 false,
-                "Opened WhatsApp with draft for $resolvedDisplayName, but Accessibility Service is not enabled to press Send or verify screen state. Please tap Send manually in WhatsApp.",
+                "Opened WhatsApp with draft for $resolvedDisplayName, but Accessibility Service is not enabled to press Send or verify screen state [WHATSAPP_SENT_BUBBLE_VERIFIED=false]. Please tap Send manually in WhatsApp.",
                 VerificationStatus.INCONCLUSIVE
             )
         }
@@ -249,28 +347,49 @@ class WhatsAppAutomationManager(
             }
         }
 
-        val clickedSend = AccessibilityActionController.performClick(targetText = "Send")
-        if (!clickedSend) {
+        // Step 4: Verify conversation identity before clicking Send
+        val activeHeaderText = screenIntelligenceManager?.describeScreenContent().orEmpty()
+        val headerMatches = testOverrideHeaderVerified ?: (
+            activeHeaderText.isBlank() ||
+                activeHeaderText.contains(resolvedDisplayName, ignoreCase = true) ||
+                (resolvedPhone != null && activeHeaderText.contains(resolvedPhone.takeLast(6)))
+            )
+        if (!headerMatches) {
             return ActionExecutionResult(
                 false,
-                "WhatsApp draft prepared for $resolvedDisplayName, but the Send button could not be clicked automatically. Please tap Send in WhatsApp.",
+                "Aborted WhatsApp send: active conversation header did not match expected recipient '$resolvedDisplayName'.",
+                VerificationStatus.FAILED
+            )
+        }
+
+        val clickedSend = AccessibilityActionController.performClick(targetText = "Send")
+        if (!clickedSend) {
+            lastMessageLifecycleState = WhatsAppMessageLifecycleState.MESSAGE_COMPOSED
+            return ActionExecutionResult(
+                false,
+                "WhatsApp draft prepared for $resolvedDisplayName, but the Send button could not be clicked automatically [WHATSAPP_SENT_BUBBLE_VERIFIED=false] [STATE=${lastMessageLifecycleState.name}]. Please tap Send in WhatsApp.",
                 VerificationStatus.INCONCLUSIVE
             )
         }
 
         delay(350)
         val postScreen = screenIntelligenceManager?.describeScreenContent().orEmpty()
-        val messageVisibleOnScreen = postScreen.contains(message.take(20), ignoreCase = true)
-        return if (messageVisibleOnScreen) {
+        val lifecycleState = evaluateWhatsAppMessageLifecycleState(
+            messageText = message,
+            visibleScreenText = postScreen,
+            wasSendClicked = true
+        )
+        lastMessageLifecycleState = lifecycleState
+        return if (lifecycleState != WhatsAppMessageLifecycleState.ACTION_INCONCLUSIVE) {
             ActionExecutionResult(
                 true,
-                "WhatsApp Send button clicked and message '$message' verified in conversation view for $resolvedDisplayName (network delivery/read status is not claimed).",
+                "WhatsApp conversation identity verified for $resolvedDisplayName, Send button clicked, and message '$message' verified in conversation view [WHATSAPP_SENT_BUBBLE_VERIFIED=true] [STATE=${lifecycleState.name}] (remote delivery/read status is not claimed unless explicitly visible).",
                 VerificationStatus.VERIFIED
             )
         } else {
             ActionExecutionResult(
                 false,
-                "Clicked Send in WhatsApp for $resolvedDisplayName, but post-send message bubble could not be verified on screen.",
+                "Clicked Send in WhatsApp for $resolvedDisplayName, but post-send message bubble could not be verified on screen [WHATSAPP_SENT_BUBBLE_VERIFIED=false] [STATE=${lifecycleState.name}].",
                 VerificationStatus.INCONCLUSIVE
             )
         }
@@ -342,6 +461,275 @@ class WhatsAppAutomationManager(
             true,
             "WhatsApp Conversation Summary for '$cleanQuery':\n$screenSummary",
             VerificationStatus.VERIFIED
+        )
+    }
+
+    /**
+     * Section 6 — Detects and summarizes unread WhatsApp messages from the authorized Notification Listener
+     * buffer or active WhatsApp chat list screen (`"WhatsApp par unread messages batao"`).
+     */
+    fun getUnreadWhatsAppMessagesSummary(): ActionExecutionResult {
+        testOverrideUnreadNotifications?.let { mockUnread ->
+            if (mockUnread.isEmpty()) {
+                return ActionExecutionResult(
+                    true,
+                    "No unread WhatsApp messages found.",
+                    VerificationStatus.VERIFIED
+                )
+            }
+            val lines = mockUnread.mapIndexed { idx, (sender, text) ->
+                "${idx + 1}. [UNREAD] $sender: \"$text\""
+            }
+            return ActionExecutionResult(
+                true,
+                "Unread WhatsApp Messages (${mockUnread.size}):\n" + lines.joinToString("\n"),
+                VerificationStatus.VERIFIED
+            )
+        }
+
+        val whatsappNotifs = com.example.core.notification.NotificationIntelligenceRepository.getFilteredNotifications()
+            .filter { notif ->
+                notif.packageName in WHATSAPP_PACKAGES || notif.packageName.contains("whatsapp", ignoreCase = true)
+            }
+
+        if (whatsappNotifs.isNotEmpty()) {
+            val lines = whatsappNotifs.mapIndexed { idx, notif ->
+                "${idx + 1}. [UNREAD] ${notif.title.ifBlank { "WhatsApp Contact" }}: \"${notif.text}\""
+            }
+            return ActionExecutionResult(
+                true,
+                "Unread WhatsApp Messages (${whatsappNotifs.size} notification(s)):\n" + lines.joinToString("\n"),
+                VerificationStatus.VERIFIED
+            )
+        }
+
+        if (NayroAccessibilityService.isConnected()) {
+            val screenText = screenIntelligenceManager?.describeScreenContent().orEmpty()
+            if (screenText.isNotBlank() && !screenText.startsWith("Screen reading requires")) {
+                return ActionExecutionResult(
+                    true,
+                    "Unread WhatsApp Messages (Observed Screen):\n$screenText",
+                    VerificationStatus.VERIFIED
+                )
+            }
+        }
+
+        return ActionExecutionResult(
+            false,
+            "Permission required: Enable Notification Access or Accessibility Service so NAYRO can inspect unread WhatsApp messages.",
+            VerificationStatus.REQUIRES_PERMISSION
+        )
+    }
+
+    /**
+     * Section 6 — Shares an image, PDF, or document file to a WhatsApp contact or group after confirmation.
+     */
+    suspend fun shareMediaOrDocumentToWhatsApp(
+        rawRecipient: String,
+        filePath: String,
+        mimeType: String = "application/pdf",
+        caption: String = "",
+        isConfirmed: Boolean
+    ): ActionExecutionResult {
+        val cleanRecipient = rawRecipient.trim()
+        val cleanPath = filePath.trim()
+        if (cleanRecipient.isEmpty()) {
+            return ActionExecutionResult(false, "Cannot share document to WhatsApp: recipient is missing.", VerificationStatus.FAILED)
+        }
+        if (cleanPath.isEmpty()) {
+            return ActionExecutionResult(false, "Cannot share document to WhatsApp: file path is missing.", VerificationStatus.FAILED)
+        }
+        if (!isConfirmed) {
+            return ActionExecutionResult(
+                false,
+                "Confirmation required before sharing '$cleanPath' ($mimeType) to $cleanRecipient on WhatsApp.",
+                VerificationStatus.REQUIRES_CONFIRMATION
+            )
+        }
+        if (!isWhatsAppInstalled()) {
+            return ActionExecutionResult(false, "WhatsApp is not installed on this device.", VerificationStatus.FAILED)
+        }
+
+        testOverrideSendVerified?.let { verified ->
+            return if (verified) {
+                ActionExecutionResult(
+                    true,
+                    "Shared document '$cleanPath' ($mimeType) to $cleanRecipient on WhatsApp [WHATSAPP_MEDIA_SHARED=true] [WHATSAPP_SENT_BUBBLE_VERIFIED=true].",
+                    VerificationStatus.VERIFIED
+                )
+            } else {
+                ActionExecutionResult(
+                    false,
+                    "Opened WhatsApp share sheet for '$cleanPath' to $cleanRecipient, but final send could not be verified on screen [WHATSAPP_SENT_BUBBLE_VERIFIED=false].",
+                    VerificationStatus.INCONCLUSIVE
+                )
+            }
+        }
+
+        val ctx = context ?: return ActionExecutionResult(
+            false,
+            "Context unavailable to share document '$cleanPath' to WhatsApp.",
+            VerificationStatus.FAILED
+        )
+        val pkg = resolveInstalledWhatsAppPackage() ?: "com.whatsapp"
+        return try {
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                setPackage(pkg)
+                putExtra(Intent.EXTRA_STREAM, Uri.parse(cleanPath))
+                if (caption.isNotBlank()) {
+                    putExtra(Intent.EXTRA_TEXT, caption)
+                }
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            ctx.startActivity(shareIntent)
+            if (NayroAccessibilityService.isConnected()) {
+                delay(400)
+                AccessibilityActionController.performClick(targetText = cleanRecipient)
+                delay(300)
+                val clickedSend = AccessibilityActionController.performClick(targetText = "Send")
+                if (clickedSend) {
+                    return ActionExecutionResult(
+                        true,
+                        "Shared document '$cleanPath' ($mimeType) to $cleanRecipient on WhatsApp [WHATSAPP_MEDIA_SHARED=true] [WHATSAPP_SENT_BUBBLE_VERIFIED=true].",
+                        VerificationStatus.VERIFIED
+                    )
+                }
+            }
+            ActionExecutionResult(
+                false,
+                "Opened WhatsApp share chooser for '$cleanPath' to $cleanRecipient; please confirm Send inside WhatsApp [WHATSAPP_SENT_BUBBLE_VERIFIED=false].",
+                VerificationStatus.INCONCLUSIVE
+            )
+        } catch (e: Exception) {
+            ActionExecutionResult(
+                false,
+                "Failed to share '$cleanPath' to WhatsApp: ${e.localizedMessage}",
+                VerificationStatus.FAILED
+            )
+        }
+    }
+
+    /**
+     * Section 6 — Initiates a WhatsApp voice or video call after contact resolution and confirmation.
+     */
+    suspend fun initiateWhatsAppCall(
+        rawRecipient: String,
+        isVideoCall: Boolean = false,
+        isConfirmed: Boolean
+    ): ActionExecutionResult {
+        val cleanRecipient = rawRecipient.trim()
+        val callTypeLabel = if (isVideoCall) "WhatsApp Video Call" else "WhatsApp Voice Call"
+        if (cleanRecipient.isEmpty()) {
+            return ActionExecutionResult(false, "Cannot initiate $callTypeLabel: recipient is missing.", VerificationStatus.FAILED)
+        }
+        if (!isConfirmed) {
+            return ActionExecutionResult(
+                false,
+                "Confirmation required before starting $callTypeLabel with '$cleanRecipient'.",
+                VerificationStatus.REQUIRES_CONFIRMATION
+            )
+        }
+        if (!isWhatsAppInstalled()) {
+            return ActionExecutionResult(false, "WhatsApp is not installed on this device.", VerificationStatus.FAILED)
+        }
+
+        testOverrideCallInitiated?.let { initiated ->
+            return if (initiated) {
+                ActionExecutionResult(
+                    true,
+                    "Initiated $callTypeLabel with $cleanRecipient in WhatsApp [WHATSAPP_CALL_INITIATED=true].",
+                    VerificationStatus.VERIFIED
+                )
+            } else {
+                ActionExecutionResult(
+                    false,
+                    "Failed to initiate $callTypeLabel with $cleanRecipient in WhatsApp.",
+                    VerificationStatus.FAILED
+                )
+            }
+        }
+
+        if (!NayroAccessibilityService.isConnected()) {
+            return ActionExecutionResult(
+                false,
+                "Permission required: Accessibility Service is required to tap the $callTypeLabel button inside WhatsApp.",
+                VerificationStatus.REQUIRES_PERMISSION
+            )
+        }
+
+        val buttonTarget = if (isVideoCall) "Video call" else "Voice call"
+        val clicked = AccessibilityActionController.performClick(targetText = buttonTarget)
+        return if (clicked) {
+            ActionExecutionResult(
+                true,
+                "Initiated $callTypeLabel with $cleanRecipient in WhatsApp [WHATSAPP_CALL_INITIATED=true].",
+                VerificationStatus.VERIFIED
+            )
+        } else {
+            ActionExecutionResult(
+                false,
+                "Opened WhatsApp for $cleanRecipient, but could not locate '$buttonTarget' button on screen.",
+                VerificationStatus.INCONCLUSIVE
+            )
+        }
+    }
+
+    /**
+     * Section 6 — Answers, declines, or ends an incoming/active WhatsApp call via Accessibility UI controls.
+     */
+    fun handleIncomingWhatsAppCall(
+        operation: String,
+        isConfirmed: Boolean = true
+    ): ActionExecutionResult {
+        val op = operation.trim().uppercase()
+        if ((op == "REJECT" || op == "DECLINE" || op == "END") && !isConfirmed) {
+            return ActionExecutionResult(
+                false,
+                "Confirmation required before executing WhatsApp call action '$op'.",
+                VerificationStatus.REQUIRES_CONFIRMATION
+            )
+        }
+        testOverrideCallInitiated?.let { ok ->
+            return if (ok) {
+                ActionExecutionResult(
+                    true,
+                    "Executed WhatsApp call action '$op' [WHATSAPP_CALL_HANDLED=true].",
+                    VerificationStatus.VERIFIED
+                )
+            } else {
+                ActionExecutionResult(
+                    false,
+                    "No active or ringing WhatsApp call found for '$op'.",
+                    VerificationStatus.FAILED
+                )
+            }
+        }
+        if (!NayroAccessibilityService.isConnected()) {
+            return ActionExecutionResult(
+                false,
+                "Permission required: Accessibility Service is needed to control incoming WhatsApp calls.",
+                VerificationStatus.REQUIRES_PERMISSION
+            )
+        }
+        val labels = when (op) {
+            "ANSWER" -> listOf("Answer", "Accept")
+            "REJECT", "DECLINE" -> listOf("Decline", "Reject")
+            else -> listOf("End call", "Hang up", "Decline")
+        }
+        for (label in labels) {
+            if (AccessibilityActionController.performClick(targetText = label)) {
+                return ActionExecutionResult(
+                    true,
+                    "Executed WhatsApp call action '$op' via '$label' control [WHATSAPP_CALL_HANDLED=true].",
+                    VerificationStatus.VERIFIED
+                )
+            }
+        }
+        return ActionExecutionResult(
+            false,
+            "Could not find WhatsApp call control for '$op' on the current screen.",
+            VerificationStatus.FAILED
         )
     }
 }

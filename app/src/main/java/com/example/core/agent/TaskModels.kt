@@ -59,9 +59,11 @@ enum class ActionType {
     SCROLL_BACKWARD,
     SWIPE_SCREEN,
     NAVIGATE_BACK,
+    NAVIGATE_HOME,
     TAKE_SCREENSHOT,
     INTERACT_COORDINATES,
     ANALYZE_IMAGE_VISION,
+    CONTROL_MEDIA,
 
     // Communication & Telephony Tools
     MESSAGE_DRAFT_SEND,
@@ -74,6 +76,7 @@ enum class ActionType {
     RESOLVE_CONTACT,
     SAVE_CONTACT,
     MAKE_PHONE_CALL,
+    OPEN_PHONE_DIALER,
     READ_NOTIFICATIONS,
     SUMMARIZE_NOTIFICATIONS,
     CLASSIFY_NOTIFICATIONS,
@@ -200,11 +203,162 @@ data class PendingConfirmation(
     val target: String?,
     val parameters: Map<String, String>,
     val riskLevel: RiskLevel,
+    val displayFields: List<Pair<String, String>> = emptyList(),
     val createdAt: Long = System.currentTimeMillis(),
     val expiresAt: Long = System.currentTimeMillis() + 60_000L, // 60-second expiration timeout
     var status: ConfirmationStatus = ConfirmationStatus.PENDING
 ) {
     fun isExpired(): Boolean = System.currentTimeMillis() > expiresAt || status == ConfirmationStatus.EXPIRED
+
+    /**
+     * Returns schema-derived, user-facing display fields without exposing internal enum names
+     * or internal orchestration metadata.
+     */
+    fun getSchemaDisplayFields(): List<Pair<String, String>> {
+        if (displayFields.isNotEmpty()) return displayFields
+        return ConfirmationSchemaBuilder.buildDisplayFields(actionType, target, parameters)
+    }
+}
+
+/**
+ * Section 8 — Schema-driven Confirmation Screen Generator.
+ * Produces clean, human-readable titles, descriptions, and structured fields for Phone Calls,
+ * SMS, WhatsApp, and other high-risk actions without exposing internal identifiers like MAKE_PHONE_CALL.
+ */
+object ConfirmationSchemaBuilder {
+
+    fun buildUserFriendlyTitle(actionType: ActionType): String {
+        return when (actionType) {
+            ActionType.MAKE_PHONE_CALL -> "Confirm Phone Call"
+            ActionType.OPEN_PHONE_DIALER -> "Confirm Dialer Launch"
+            ActionType.SEND_SMS -> "Confirm SMS Message"
+            ActionType.MESSAGE_DRAFT_SEND,
+            ActionType.ASK_USER_CONFIRMATION -> "Confirm WhatsApp Message"
+            ActionType.MANAGE_CALL -> "Confirm Call Control"
+            ActionType.SAVE_CONTACT -> "Confirm New Contact"
+            ActionType.DELETE_NOTE -> "Confirm Note Deletion"
+            ActionType.DELETE_CALENDAR_EVENT -> "Confirm Calendar Event Deletion"
+            else -> "Confirm Action"
+        }
+    }
+
+    fun buildDisplayFields(
+        actionType: ActionType,
+        target: String?,
+        parameters: Map<String, String>,
+        resolvedContactName: String? = null,
+        resolvedPhoneNumber: String? = null
+    ): List<Pair<String, String>> {
+        return when (actionType) {
+            ActionType.MAKE_PHONE_CALL -> {
+                val rawTarget = (target ?: parameters["recipient"] ?: parameters["target"] ?: parameters["number"]).orEmpty().trim()
+                val contactName = resolvedContactName
+                    ?: parameters["contactName"]?.takeIf { it.isNotBlank() }
+                    ?: if (rawTarget.any { it.isLetter() }) rawTarget else "Direct Phone Number"
+                val phoneNum = resolvedPhoneNumber
+                    ?: parameters["phoneNumber"]?.takeIf { it.isNotBlank() }
+                    ?: parameters["number"]?.takeIf { it.isNotBlank() }
+                    ?: rawTarget
+                val callActionLabel = if (parameters["observeCallState"] == "true") {
+                    "Place Outgoing Call & Observe Answer State"
+                } else {
+                    "Place Outgoing Phone Call"
+                }
+                listOf(
+                    "Contact Name" to contactName,
+                    "Phone Number" to phoneNum,
+                    "Call Action" to callActionLabel
+                )
+            }
+
+            ActionType.SEND_SMS -> {
+                val rawRecipient = (target ?: parameters["recipient"]).orEmpty().trim()
+                val recipientName = resolvedContactName
+                    ?: parameters["contactName"]?.takeIf { it.isNotBlank() }
+                    ?: rawRecipient.ifBlank { "Unknown Recipient" }
+                val phoneNum = resolvedPhoneNumber
+                    ?: parameters["phoneNumber"]?.takeIf { it.isNotBlank() }
+                    ?: parameters["number"]?.takeIf { it.isNotBlank() }
+                    ?: rawRecipient
+                val msg = (parameters["message"] ?: parameters["draft"]).orEmpty()
+                listOf(
+                    "Recipient" to recipientName,
+                    "Phone Number" to phoneNum,
+                    "Message" to msg
+                )
+            }
+
+            ActionType.MESSAGE_DRAFT_SEND,
+            ActionType.ASK_USER_CONFIRMATION -> {
+                val recipient = resolvedContactName
+                    ?: (target ?: parameters["recipient"]).orEmpty().trim().ifBlank { "Unknown Recipient" }
+                val msg = (parameters["message"] ?: parameters["draft"] ?: parameters["text"]).orEmpty()
+                val attachment = parameters["attachment"]?.takeIf { it.isNotBlank() } ?: "None (Text Only)"
+                listOf(
+                    "Recipient" to recipient,
+                    "Message" to msg,
+                    "Attachment" to attachment
+                )
+            }
+
+            ActionType.SAVE_CONTACT -> {
+                val name = (parameters["name"] ?: target).orEmpty().trim().ifBlank { "New Contact" }
+                val phone = (parameters["phone"] ?: parameters["number"] ?: resolvedPhoneNumber).orEmpty().trim()
+                listOf(
+                    "Contact Name" to name,
+                    "Phone Number" to phone
+                )
+            }
+
+            ActionType.MANAGE_CALL -> {
+                val op = (parameters["operation"] ?: target ?: "END").uppercase()
+                listOf(
+                    "Call Action" to op
+                )
+            }
+
+            else -> {
+                val hiddenInternalKeys = setOf(
+                    "condition",
+                    "previousStepOutput",
+                    "usePreviousStepOutput",
+                    "observeCallState",
+                    "fromPreviousStep"
+                )
+                parameters
+                    .filterKeys { it !in hiddenInternalKeys }
+                    .map { (k, v) -> k.replaceFirstChar { it.uppercase() } to v }
+            }
+        }
+    }
+
+    fun buildConfirmationFromAction(
+        taskId: String,
+        action: AgentAction,
+        resolvedContactName: String? = null,
+        resolvedPhoneNumber: String? = null
+    ): PendingConfirmation {
+        val fields = buildDisplayFields(
+            actionType = action.actionType,
+            target = action.target,
+            parameters = action.parameters,
+            resolvedContactName = resolvedContactName,
+            resolvedPhoneNumber = resolvedPhoneNumber
+        )
+        val title = buildUserFriendlyTitle(action.actionType)
+        val summaryLines = fields.joinToString("\n") { (label, value) -> "$label: $value" }
+        return PendingConfirmation(
+            taskId = taskId,
+            actionId = action.actionId,
+            actionType = action.actionType,
+            title = title,
+            description = "$summaryLines\n\nPlease confirm to proceed.",
+            target = action.target,
+            parameters = action.parameters,
+            riskLevel = action.riskLevel,
+            displayFields = fields
+        )
+    }
 }
 
 fun ActionType.toUserFriendlyDescription(
@@ -233,9 +387,11 @@ fun ActionType.toUserFriendlyDescription(
         ActionType.SCROLL_BACKWARD -> "Scrolling up on screen..."
         ActionType.SWIPE_SCREEN -> "Swiping on screen..."
         ActionType.NAVIGATE_BACK -> "Navigating back..."
+        ActionType.NAVIGATE_HOME -> "Returning to Home screen..."
         ActionType.TAKE_SCREENSHOT -> "Capturing screen snapshot..."
         ActionType.INTERACT_COORDINATES -> "Interacting with screen coordinates..."
         ActionType.ANALYZE_IMAGE_VISION -> "Analyzing screen image..."
+        ActionType.CONTROL_MEDIA -> "Controlling media playback (${parameters["operation"] ?: target ?: "play"})..."
         ActionType.MESSAGE_DRAFT_SEND -> if (recipient != null) {
             "Preparing your WhatsApp message for $recipient..."
         } else {
@@ -249,7 +405,8 @@ fun ActionType.toUserFriendlyDescription(
         ActionType.READ_CALL_HISTORY -> "Reading recent call history..."
         ActionType.RESOLVE_CONTACT -> "Looking up contact ${query ?: target ?: ""}...".trim()
         ActionType.SAVE_CONTACT -> "Saving contact ${parameters["name"] ?: target ?: ""}...".trim()
-        ActionType.MAKE_PHONE_CALL -> "Preparing phone call${if (recipient != null) " to $recipient" else ""}..."
+        ActionType.MAKE_PHONE_CALL -> "Placing phone call${if (recipient != null) " to $recipient" else ""}..."
+        ActionType.OPEN_PHONE_DIALER -> "Opening phone dialer${if (recipient != null || target != null) " for ${recipient ?: target}" else ""}..."
         ActionType.READ_NOTIFICATIONS -> "Reading active notifications..."
         ActionType.SUMMARIZE_NOTIFICATIONS -> "Summarizing your recent notifications..."
         ActionType.CLASSIFY_NOTIFICATIONS -> "Organizing notifications by priority..."

@@ -187,6 +187,78 @@ object PermissionRegistry {
             featureDependency = "Legacy Screen Capture Fallback",
             verificationMethod = "On-demand MediaProjectionManager user consent dialog",
             fallbackBehavior = "Uses AccessibilityService.takeScreenshot() on Android 11+ or UI node hierarchy inspection."
+        ),
+        PermissionItem(
+            type = PermissionType.CALL_PHONE,
+            permissionName = "Place Outgoing Phone Calls (CALL_PHONE)",
+            purpose = "Required to initiate actual outgoing phone calls via Intent.ACTION_CALL after your explicit confirmation.",
+            category = PermissionCategory.RUNTIME,
+            minAndroidSdk = 24,
+            androidPermissionString = android.Manifest.permission.CALL_PHONE,
+            settingsAction = Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            associatedCapabilities = listOf("COMMUNICATION_TOOLS"),
+            requirementLevel = PermissionRequirementLevel.OPTIONAL_FEATURE,
+            featureDependency = "Direct Outgoing Phone Calls (MAKE_PHONE_CALL)",
+            verificationMethod = "ContextCompat.checkSelfPermission(CALL_PHONE)",
+            fallbackBehavior = "Uses OPEN_PHONE_DIALER (ACTION_DIAL) so the user can manually tap the Call button in the system dialer."
+        ),
+        PermissionItem(
+            type = PermissionType.ANSWER_PHONE_CALLS,
+            permissionName = "Answer & End Phone Calls (ANSWER_PHONE_CALLS)",
+            purpose = "Permits answering incoming ringing calls or ending active calls via Android TelecomManager (API 26+).",
+            category = PermissionCategory.RUNTIME,
+            minAndroidSdk = Build.VERSION_CODES.O,
+            androidPermissionString = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                android.Manifest.permission.ANSWER_PHONE_CALLS
+            } else "android.permission.ANSWER_PHONE_CALLS",
+            settingsAction = Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            associatedCapabilities = listOf("COMMUNICATION_TOOLS"),
+            requirementLevel = PermissionRequirementLevel.OPTIONAL_FEATURE,
+            featureDependency = "Incoming Call Answer / Reject / End (MANAGE_CALL)",
+            verificationMethod = "ContextCompat.checkSelfPermission(ANSWER_PHONE_CALLS) or RoleManager.ROLE_DIALER",
+            fallbackBehavior = "Uses NAYRO Accessibility Service on the In-Call screen if enabled, or prompts the user to answer/end manually."
+        ),
+        PermissionItem(
+            type = PermissionType.READ_CALL_LOG,
+            permissionName = "Read Call Log (READ_CALL_LOG)",
+            purpose = "Permits reading recent incoming, outgoing, and missed call records when Call Log access is permitted.",
+            category = PermissionCategory.RUNTIME,
+            minAndroidSdk = 24,
+            androidPermissionString = android.Manifest.permission.READ_CALL_LOG,
+            settingsAction = Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            associatedCapabilities = listOf("COMMUNICATION_TOOLS"),
+            requirementLevel = PermissionRequirementLevel.OPTIONAL_FEATURE,
+            featureDependency = "Call History & Missed Call Lookup (READ_CALL_HISTORY)",
+            verificationMethod = "ContextCompat.checkSelfPermission(READ_CALL_LOG)",
+            fallbackBehavior = "Reads missed/incoming call notifications via Notification Listener when authorized."
+        ),
+        PermissionItem(
+            type = PermissionType.SEND_SMS,
+            permissionName = "Send SMS Messages (SEND_SMS)",
+            purpose = "Permits transmitting SMS text messages directly via Android SmsManager after your explicit confirmation.",
+            category = PermissionCategory.RUNTIME,
+            minAndroidSdk = 24,
+            androidPermissionString = android.Manifest.permission.SEND_SMS,
+            settingsAction = Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            associatedCapabilities = listOf("COMMUNICATION_TOOLS"),
+            requirementLevel = PermissionRequirementLevel.OPTIONAL_FEATURE,
+            featureDependency = "Direct SMS Transmission (SEND_SMS)",
+            verificationMethod = "ContextCompat.checkSelfPermission(SEND_SMS)",
+            fallbackBehavior = "Opens user-mediated Android SMS composer (ACTION_SENDTO) and reports that manual Send is required."
+        ),
+        PermissionItem(
+            type = PermissionType.READ_SMS,
+            permissionName = "Read SMS Inbox (READ_SMS)",
+            purpose = "Permits reading full SMS inbox messages, unread messages, OTP codes, and bank alerts via Telephony.Sms.",
+            category = PermissionCategory.RUNTIME,
+            minAndroidSdk = 24,
+            androidPermissionString = android.Manifest.permission.READ_SMS,
+            settingsAction = Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+            associatedCapabilities = listOf("COMMUNICATION_TOOLS"),
+            requirementLevel = PermissionRequirementLevel.OPTIONAL_FEATURE,
+            featureDependency = "Full SMS Inbox Reading, Unread SMS, OTP & Bank Alert Extraction (READ_SMS)",
+            verificationMethod = "ContextCompat.checkSelfPermission(READ_SMS)",
+            fallbackBehavior = "Provides notification-based incoming SMS preview when Notification Listener is enabled (clearly distinguished from full inbox access)."
         )
     )
 
@@ -197,4 +269,40 @@ object PermissionRegistry {
 
     fun getOptionalPermissions(): List<PermissionItem> =
         items.filter { it.requirementLevel == PermissionRequirementLevel.OPTIONAL_FEATURE }
+
+    /**
+     * Returns ONLY the minimal permissions required for a specific [com.example.core.agent.ActionType]
+     * so NAYRO never requests unnecessary permissions blindly.
+     */
+    fun getRequiredPermissionsForAction(
+        actionType: com.example.core.agent.ActionType,
+        targetIsDirectPhoneNumber: Boolean = false
+    ): List<PermissionType> {
+        return when (actionType) {
+            com.example.core.agent.ActionType.MAKE_PHONE_CALL -> {
+                if (targetIsDirectPhoneNumber) {
+                    listOf(PermissionType.CALL_PHONE)
+                } else {
+                    listOf(PermissionType.READ_CONTACTS, PermissionType.CALL_PHONE)
+                }
+            }
+            com.example.core.agent.ActionType.OPEN_PHONE_DIALER -> {
+                if (targetIsDirectPhoneNumber) emptyList() else listOf(PermissionType.READ_CONTACTS)
+            }
+            com.example.core.agent.ActionType.SEND_SMS -> {
+                if (targetIsDirectPhoneNumber) {
+                    listOf(PermissionType.SEND_SMS)
+                } else {
+                    listOf(PermissionType.READ_CONTACTS, PermissionType.SEND_SMS)
+                }
+            }
+            com.example.core.agent.ActionType.READ_SMS -> listOf(PermissionType.READ_SMS)
+            com.example.core.agent.ActionType.CHECK_INCOMING_CALL -> listOf(PermissionType.READ_PHONE_STATE)
+            com.example.core.agent.ActionType.MANAGE_CALL -> listOf(PermissionType.ANSWER_PHONE_CALLS, PermissionType.READ_PHONE_STATE)
+            com.example.core.agent.ActionType.READ_CALL_HISTORY -> listOf(PermissionType.READ_CALL_LOG)
+            com.example.core.agent.ActionType.RESOLVE_CONTACT,
+            com.example.core.agent.ActionType.SAVE_CONTACT -> listOf(PermissionType.READ_CONTACTS)
+            else -> emptyList()
+        }
+    }
 }

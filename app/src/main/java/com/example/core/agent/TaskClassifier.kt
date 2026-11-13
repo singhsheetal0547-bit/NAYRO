@@ -7,6 +7,8 @@ enum class UserIntentType {
     SETTINGS_NAVIGATE,
     MESSAGE_DRAFT,
     WHATSAPP_READ,
+    SMS_SEND,
+    OPEN_DIALER,
     PHONE_CALL,
     FLASHLIGHT_CONTROL,
     NOTIFICATION_READ,
@@ -20,6 +22,7 @@ enum class UserIntentType {
     MEMORY_SAVE,
     LOCAL_TIME,
     LOCAL_CALCULATOR,
+    MEDIA_CONTROL,
     GENERAL_AI_QUERY
 }
 
@@ -215,6 +218,48 @@ object TaskClassifier {
             )
         }
 
+        // 4d. Explicit SMS Send Intent (Section 2 & Section 7: "Babu, Rahul ko SMS bhejo: main raste mein hoon", "Send SMS to +919876543210: Meeting at 5 PM")
+        val isSmsReadQuery = lower.contains("padho") || lower.contains("read") || lower.contains("check") ||
+            lower.contains("latest") || lower.contains("unread") || lower.contains("otp")
+        if (lower.contains("sms") && !isSmsReadQuery &&
+            (lower.contains("bhejo") || lower.contains("bhejna") || lower.contains("send") || lower.contains("likho") || lower.contains("karo") || lower.contains(":"))
+        ) {
+            val recipientMatch = Regex("(?i)\\b([+0-9][0-9\\-]{6,14}|[a-zA-Z0-9_]+)\\s+(?:ko|par)\\s+sms\\b").find(trimmed)
+                ?: Regex("(?i)\\bsms\\s+(?:to|for|on)\\s+([+0-9][0-9\\-]{6,14}|[a-zA-Z0-9_]+)").find(trimmed)
+                ?: Regex("(?i)\\bsend\\s+([+0-9][0-9\\-]{6,14}|[a-zA-Z0-9_]+)\\s+(?:an?\\s+)?sms\\b").find(trimmed)
+            val recipient = recipientMatch?.groupValues?.getOrNull(1)?.trim() ?: "Contact"
+
+            val splitByColon = trimmed.split(":", limit = 2)
+            val thatMatch = Regex("(?i)\\b(?:saying|that|ki)\\s+(.+)$").find(trimmed)
+            val smsBody = when {
+                splitByColon.size > 1 -> splitByColon[1].trim()
+                thatMatch != null -> thatMatch.groupValues[1].trim().removeSuffix(".")
+                else -> trimmed
+                    .replaceFirst(Regex("(?i)^.*?\\bsms\\b\\s*(?:bhejo|bhejna|send|karo|to\\s+[+a-zA-Z0-9_\\-]+)?\\s*"), "")
+                    .trim()
+            }
+            return ResolvedIntent(
+                type = UserIntentType.SMS_SEND,
+                recipient = recipient,
+                searchQueryOrContent = smsBody,
+                rawPrompt = prompt
+            )
+        }
+
+        // 4e. Open Phone Dialer Intent (Section 1A: "Open phone dialer for Rahul", "Open dialer for +919876543210")
+        if (lower.contains("dialer")) {
+            val targetMatch = Regex("(?i)\\b(?:for|with|to)\\s+([+0-9][0-9\\-]{6,14}|[a-zA-Z0-9_]+)").find(trimmed)
+                ?: Regex("(?i)\\b([+0-9][0-9\\-]{6,14}|[a-zA-Z0-9_]+)\\s+(?:ka\\s+number\\s+)?dialer").find(trimmed)
+            val target = targetMatch?.groupValues?.getOrNull(1)?.trim()
+                ?.takeIf { !it.equals("without", ignoreCase = true) && !it.equals("phone", ignoreCase = true) }
+                ?: "Contact"
+            return ResolvedIntent(
+                type = UserIntentType.OPEN_DIALER,
+                recipient = target,
+                rawPrompt = prompt
+            )
+        }
+
         // 5. Message Draft Intent (supports single-turn, multi-clause "Open WhatsApp, find Rahul, send him a message that...",
         // "Find Satyam and send Hi", "message Rahul that I will attend tomorrow's meeting", "send Rahul a message saying I will arrive tomorrow", and short "Message Rahul")
         val isShortMessageCmd = Regex("^(?i)(message|msg|text)\\s+([a-zA-Z0-9_]+)\\.?$").find(trimmed)
@@ -314,6 +359,8 @@ object TaskClassifier {
                     .replaceFirst(Regex("(?i)^.*?\\b(message|msg|sandesh)\\b\\s*"), "")
                     .replaceFirst(Regex("(?i)^\\s*(likho|draft|send|bhejo|bhejna|karo|hai)\\s*"), "")
                     .trim()
+                    .removeSuffix(".")
+                    .trim()
             }
 
             return ResolvedIntent(
@@ -325,11 +372,21 @@ object TaskClassifier {
             )
         }
 
-        // 5b. Phone Call Intent (e.g. "call Rahul", "Rahul ko call karo", "phone lagao Rahul ko")
-        if (lower.startsWith("call ") || lower.contains("ko call karo") || lower.startsWith("phone lagao") || lower.startsWith("dial ")) {
+        // 5b. Phone Call Intent (e.g. "call Rahul", "call +919876543210", "Rahul ko call karo", "phone lagao Rahul ko")
+        if (lower.startsWith("call ") ||
+            lower.contains("ko call karo") ||
+            lower.contains("ko phone karo") ||
+            lower.contains("par call karo") ||
+            lower.startsWith("phone lagao") ||
+            lower.startsWith("make a call to ") ||
+            lower.startsWith("make a phone call to ") ||
+            lower.startsWith("dial ")
+        ) {
             val targetContact = trimmed
-                .replaceFirst(Regex("^(?i)(call|dial|phone lagao)\\s+"), "")
-                .replaceFirst(Regex("(?i)\\s*(ko call karo|ko phone karo|ko)\\s*$"), "")
+                .removeSuffix(".")
+                .trim()
+                .replaceFirst(Regex("^(?i)(make a phone call to|make a call to|call|dial|phone lagao)\\s+"), "")
+                .replaceFirst(Regex("(?i)\\s*(ko call karo|ko phone karo|par call karo|ko)\\s*$"), "")
                 .trim()
                 .removeSuffix(".")
             if (targetContact.isNotBlank()) {
@@ -341,9 +398,93 @@ object TaskClassifier {
             }
         }
 
-        // 6. YouTube Search Intent
+        // 6. Media & Music Control Intent (Phase 4: "Mera favourite song chalao", "YouTube kholo aur Arijit Singh ke songs chalao",
+        // "Next song", "Previous song", "Isse pause karo", "Ab sad songs chalao", "Play Kesariya on Spotify")
+        if (lower in setOf("next song", "next track", "skip song", "skip track", "agla gaana", "agla song", "next gaana", "next song chalao", "agla gaana lagao")) {
+            return ResolvedIntent(
+                type = UserIntentType.MEDIA_CONTROL,
+                section = "NEXT_TRACK",
+                searchQueryOrContent = "Next track",
+                rawPrompt = prompt
+            )
+        }
+        if (lower in setOf("previous song", "previous track", "pichhla gaana", "pichla gaana", "prev song", "previous gaana")) {
+            return ResolvedIntent(
+                type = UserIntentType.MEDIA_CONTROL,
+                section = "PREVIOUS_TRACK",
+                searchQueryOrContent = "Previous track",
+                rawPrompt = prompt
+            )
+        }
+        if (lower in setOf("isse pause karo", "ise pause karo", "pause music", "pause song", "pause playback", "gaana roko", "music band karo", "pause karo", "song pause karo")) {
+            return ResolvedIntent(
+                type = UserIntentType.MEDIA_CONTROL,
+                section = "PAUSE",
+                searchQueryOrContent = "Pause playback",
+                rawPrompt = prompt
+            )
+        }
+        if (lower in setOf("resume music", "resume song", "resume playback", "gaana chalao", "phir se chalao", "continue music")) {
+            return ResolvedIntent(
+                type = UserIntentType.MEDIA_CONTROL,
+                section = "RESUME",
+                searchQueryOrContent = "Resume playback",
+                rawPrompt = prompt
+            )
+        }
+        if (lower.contains("favourite song") || lower.contains("favorite song") || lower.contains("pasandida gaana") || lower.contains("favourite gaana")) {
+            if (lower.contains("chalao") || lower.contains("play") || lower.contains("lagao") || lower.contains("sunao")) {
+                val targetApp = when {
+                    lower.contains("spotify") -> "com.spotify.music"
+                    lower.contains("youtube music") -> "com.google.android.apps.youtube.music"
+                    else -> "com.google.android.youtube"
+                }
+                return ResolvedIntent(
+                    type = UserIntentType.MEDIA_CONTROL,
+                    targetAppOrEntity = targetApp,
+                    section = "PLAY_FAVOURITE_SONG",
+                    searchQueryOrContent = "favourite song",
+                    rawPrompt = prompt
+                )
+            }
+        }
+        if ((lower.contains("song") || lower.contains("songs") || lower.contains("gaana") || lower.contains("gaane") || lower.contains("music")) &&
+            (lower.contains("chalao") || lower.contains("play") || lower.contains("lagao") || lower.contains("sunao"))
+        ) {
+            val targetApp = when {
+                lower.contains("spotify") -> "com.spotify.music"
+                lower.contains("youtube music") -> "com.google.android.apps.youtube.music"
+                else -> "com.google.android.youtube"
+            }
+            val cleanedQuery = trimmed
+                .removeSuffix(".")
+                .replaceFirst(Regex("^(?i)(hey babu|hi babu|babu|nayro)\\s*,?\\s*"), "")
+                .replaceFirst(Regex("^(?i)(open\\s+youtube\\s+and\\s+|youtube\\s+kholo\\s+aur\\s+|spotify\\s+kholo\\s+aur\\s+|ab\\s+|now\\s+)"), "")
+                .replaceFirst(Regex("^(?i)(play|chalao|lagao|sunao)\\s+"), "")
+                .replaceFirst(Regex("(?i)\\s+(ke\\s+songs\\s+chalao|ke\\s+gaane\\s+chalao|songs\\s+chalao|song\\s+chalao|chalao|lagao|on\\s+youtube|on\\s+spotify)\\s*$"), "")
+                .trim()
+                .removeSuffix(".")
+                .ifBlank { "Hindi songs" }
+
+            val op = when {
+                lower.contains("sad") || lower.contains("romantic") || lower.contains("party") || lower.contains("lofi") || lower.contains("bhajan") -> "PLAY_BY_GENRE_OR_MOOD"
+                lower.contains("ke songs") || lower.contains("ke gaane") -> "PLAY_BY_ARTIST"
+                else -> "PLAY_QUERY"
+            }
+            return ResolvedIntent(
+                type = UserIntentType.MEDIA_CONTROL,
+                targetAppOrEntity = targetApp,
+                section = op,
+                searchQueryOrContent = cleanedQuery,
+                rawPrompt = prompt
+            )
+        }
+
+        // 6b. YouTube Search Intent
         if (lower.contains("youtube") && (lower.contains("search") || lower.contains("dhundo"))) {
             val query = trimmed
+                .removeSuffix(".")
+                .trim()
                 .replaceFirst(Regex("^(?i)(babu|nayro)\\s*,?\\s*"), "")
                 .replaceFirst(Regex("^(?i)(open\\s+|launch\\s+)?youtube\\s*(kholo|par)?\\s*(,|and|aur)?\\s*"), "")
                 .replaceFirst(Regex("(?i)\\s*(search karo|search|dhundo)\\s*$"), "")
@@ -380,6 +521,8 @@ object TaskClassifier {
         // 8. App Launch Intent (e.g. "Chrome kholo", "open WhatsApp.", "Settings kholo")
         if (lower.contains("kholo") || lower.contains("open") || lower.contains("chalao") || lower.contains("launch") || lower.contains("start")) {
             val cleanedApp = trimmed
+                .removeSuffix(".")
+                .trim()
                 .replaceFirst(Regex("^(?i)(babu|nayro)\\s*,?\\s*"), "")
                 .replaceFirst(Regex("^(?i)(open|launch|start|kholo)\\s*"), "")
                 .replaceFirst(Regex("(?i)\\s*(kholo|chalao|start karo|open karo)\\s*$"), "")

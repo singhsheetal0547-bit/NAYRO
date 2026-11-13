@@ -33,7 +33,7 @@ class TaskStateManager {
             TaskState.PARTIALLY_COMPLETED -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.RUNNING
             TaskState.INCONCLUSIVE -> current == TaskState.VERIFYING || current == TaskState.EXECUTING || current == TaskState.RUNNING
             TaskState.NOT_SUPPORTED -> current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.VERIFYING
-            TaskState.BLOCKED_BY_ANDROID -> current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.VERIFYING
+            TaskState.BLOCKED_BY_ANDROID -> current == TaskState.VALIDATING || current == TaskState.EXECUTING || current == TaskState.RUNNING || current == TaskState.VERIFYING || current == TaskState.WAITING_FOR_PERMISSION || current == TaskState.AWAITING_PERMISSION
             TaskState.TIMED_OUT -> true
             TaskState.FAILED -> true // Can fail from any active state
             TaskState.CANCELLED -> true // Can be cancelled at any time

@@ -714,7 +714,7 @@ class SecurityAndVerificationTests {
     @Test
     fun testPermissionRegistryAuditAndSetupWizardReport() {
         val allItems = com.example.core.permission.PermissionRegistry.items
-        assertEquals("All 13 NAYRO permission items must be registered", 13, allItems.size)
+        assertEquals("All 18 NAYRO permission items must be registered", 18, allItems.size)
 
         for (item in allItems) {
             assertTrue("Permission name must not be blank for ${item.type}", item.permissionName.isNotBlank())
@@ -767,7 +767,7 @@ class SecurityAndVerificationTests {
         // individual status checks, and special access settings Intents
         val pkgSetupManager = com.example.permission.PermissionSetupManager(context = null, permissionManager = null)
         val audited = pkgSetupManager.auditPermissions()
-        assertEquals(13, audited.size)
+        assertEquals(18, audited.size)
         assertEquals(
             com.example.core.permission.PermissionStatus.DENIED,
             pkgSetupManager.checkPermissionStatus(com.example.core.permission.PermissionType.MICROPHONE)
@@ -1947,6 +1947,864 @@ class SecurityAndVerificationTests {
         assertEquals("true", scG.actions[1].parameters["usePreviousStepOutput"])
     }
 
+    // =========================================================================
+    // CRITICAL COMMUNICATION AGENT REPAIR TESTS (SECTIONS 1 – 10)
+    // =========================================================================
+
+    @Test
+    fun testSection1ActualOutgoingPhoneCallsAndOpenDialerDistinction() {
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(
+                    com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"),
+                    com.example.core.telephony.ResolvedContactItem("Amit Verma", "+919811112222"),
+                    com.example.core.telephony.ResolvedContactItem("Amit Kumar", "+919833334444")
+                )
+            }
+        )
+        callMgr.resetDuplicateCallGuard()
+        CallIntelligenceManager.lastOutgoingCallInitiated = false
+        CallIntelligenceManager.lastOutgoingCallAnswered = false
+
+        // Workflow 3: Open phone dialer without calling (OPEN_PHONE_DIALER)
+        val dialerRes = callMgr.openPhoneDialer("Rahul")
+        assertTrue(dialerRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, dialerRes.status)
+        assertTrue(dialerRes.outputMessage.contains("[DIALER_OPENED_ONLY=true]"))
+        assertFalse("Opening dialer must never mark call as initiated", CallIntelligenceManager.lastOutgoingCallInitiated)
+
+        // MAKE_PHONE_CALL without CALL_PHONE permission must return REQUIRES_PERMISSION (Rule A)
+        callMgr.testOverrideSimReady = true
+        callMgr.testOverrideCallPhonePermission = false
+        val noPermRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertFalse(noPermRes.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_PERMISSION, noPermRes.status)
+        assertFalse(CallIntelligenceManager.lastOutgoingCallInitiated)
+
+        // Missing SIM / telephony not ready must fail honestly
+        callMgr.testOverrideCallPhonePermission = true
+        callMgr.testOverrideSimReady = false
+        val noSimRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertFalse(noSimRes.isSuccess)
+        assertEquals(VerificationStatus.FAILED, noSimRes.status)
+        assertTrue(noSimRes.outputMessage.contains("SIM card"))
+
+        // Invalid phone number must be rejected
+        callMgr.testOverrideSimReady = true
+        val invalidNumRes = callMgr.initiateOutgoingCall("12", isConfirmed = true, observeCallState = true)
+        assertFalse(invalidNumRes.isSuccess)
+        assertEquals(VerificationStatus.FAILED, invalidNumRes.status)
+
+        // Ambiguous contact must be rejected with candidate list
+        val ambigRes = callMgr.initiateOutgoingCall("Amit", isConfirmed = true, observeCallState = true)
+        assertFalse(ambigRes.isSuccess)
+        assertEquals(VerificationStatus.FAILED, ambigRes.status)
+        assertTrue(ambigRes.outputMessage.contains("Ambiguous contact"))
+
+        // Unconfirmed call must require confirmation (Rule G)
+        val unconfirmedRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = false, observeCallState = true)
+        assertFalse(unconfirmedRes.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_CONFIRMATION, unconfirmedRes.status)
+
+        // Workflow 1: Call saved contact with CALL_PHONE permission and confirmation
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideLastOutgoingCallAnswered = true
+        val savedCallRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertTrue(savedCallRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, savedCallRes.status)
+        assertTrue(savedCallRes.outputMessage.contains("[CALL_INITIATED=true]"))
+        assertTrue(savedCallRes.outputMessage.contains("[CALL_ANSWERED=true]"))
+        assertTrue(CallIntelligenceManager.lastOutgoingCallInitiated)
+        assertTrue(CallIntelligenceManager.lastOutgoingCallAnswered)
+
+        // Duplicate call guard within 4 seconds must block accidental re-dial
+        val dupCallRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertFalse(dupCallRes.isSuccess)
+        assertEquals(VerificationStatus.FAILED, dupCallRes.status)
+        assertTrue(dupCallRes.outputMessage.contains("Duplicate call prevented"))
+
+        // Workflow 2: Call direct phone number when unanswered (Rule B)
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideLastOutgoingCallAnswered = false
+        val directCallRes = callMgr.initiateOutgoingCall("+919988776655", isConfirmed = true, observeCallState = true)
+        assertTrue(directCallRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, directCallRes.status)
+        assertTrue(directCallRes.outputMessage.contains("[CALL_INITIATED=true]"))
+        assertTrue(directCallRes.outputMessage.contains("[CALL_ANSWERED=false]"))
+        assertTrue(CallIntelligenceManager.lastOutgoingCallInitiated)
+        assertFalse(CallIntelligenceManager.lastOutgoingCallAnswered)
+    }
+
+    @Test
+    fun testSection2And3RealSmsSendingAndSmsReadingAccessModes() = runBlocking {
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(
+                    com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"),
+                    com.example.core.telephony.ResolvedContactItem("Amit Verma", "+919811112222"),
+                    com.example.core.telephony.ResolvedContactItem("Amit Kumar", "+919833334444")
+                )
+            }
+        ).apply {
+            testOverrideSimReady = true
+        }
+        val smsMgr = com.example.core.telephony.SmsIntelligenceManager(
+            context = null,
+            callIntelligenceManager = callMgr
+        )
+        smsMgr.resetDuplicateSmsGuard()
+
+        // Unconfirmed SMS must require confirmation (Rule G)
+        smsMgr.testOverrideSendSmsPermission = true
+        val unconfirmedSms = smsMgr.sendSmsMessage("Rahul", "Main raste mein hoon", isConfirmed = false)
+        assertFalse(unconfirmedSms.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_CONFIRMATION, unconfirmedSms.status)
+
+        // Missing SEND_SMS permission without composer fallback must return REQUIRES_PERMISSION
+        smsMgr.testOverrideSendSmsPermission = false
+        val noPermSms = smsMgr.sendSmsMessage("Rahul", "Main raste mein hoon", isConfirmed = true, allowComposerFallbackWhenRestricted = false)
+        assertFalse(noPermSms.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_PERMISSION, noPermSms.status)
+
+        // Composer fallback (ACTION_SENDTO) must NEVER report VERIFIED / SMS sent (Rule C)
+        val composerFallback = smsMgr.sendSmsMessage("Rahul", "Main raste mein hoon", isConfirmed = true, allowComposerFallbackWhenRestricted = true)
+        assertFalse("SMS composer fallback must not report isSuccess=true for automatic transmission", composerFallback.isSuccess)
+        assertEquals(VerificationStatus.INCONCLUSIVE, composerFallback.status)
+        assertTrue(composerFallback.outputMessage.contains("[SMS_COMPOSER_OPENED_ONLY=true]"))
+
+        // Workflow 4: Send SMS to saved contact via SmsManager with verified transmission
+        smsMgr.resetDuplicateSmsGuard()
+        smsMgr.testOverrideSendSmsPermission = true
+        smsMgr.testOverrideSmsTransmissionSuccess = true
+        val sentSaved = smsMgr.sendSmsMessage("Rahul", "Main raste mein hoon", isConfirmed = true)
+        assertTrue(sentSaved.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, sentSaved.status)
+        assertTrue(sentSaved.outputMessage.contains("[SMS_TRANSMITTED=true]"))
+        assertTrue(smsMgr.testSentSmsLog.any { it.first == "+919876543210" })
+
+        // Duplicate SMS guard must prevent accidental double send
+        val dupSms = smsMgr.sendSmsMessage("Rahul", "Main raste mein hoon", isConfirmed = true)
+        assertFalse(dupSms.isSuccess)
+        assertEquals(VerificationStatus.FAILED, dupSms.status)
+        assertTrue(dupSms.outputMessage.contains("Duplicate SMS prevented"))
+
+        // Workflow 5: Send SMS to direct phone number
+        smsMgr.resetDuplicateSmsGuard()
+        val sentDirect = smsMgr.sendSmsMessage("+919988776655", "Meeting at 5 PM", isConfirmed = true)
+        assertTrue(sentDirect.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, sentDirect.status)
+        assertTrue(sentDirect.outputMessage.contains("[SMS_TRANSMITTED=true]"))
+
+        // Network/radio transmission failure must report FAILED honestly
+        smsMgr.resetDuplicateSmsGuard()
+        smsMgr.testOverrideSmsTransmissionSuccess = false
+        val failedTx = smsMgr.sendSmsMessage("+919988776655", "Retry message", isConfirmed = true)
+        assertFalse(failedTx.isSuccess)
+        assertEquals(VerificationStatus.FAILED, failedTx.status)
+        assertTrue(failedTx.outputMessage.contains("[SMS_TRANSMITTED=false]"))
+
+        // Workflows 6, 7, 8: Read latest SMS, unread SMS, and OTP SMS with explicit SmsAccessMode (Rule D)
+        smsMgr.testOverrideSmsInbox = listOf(
+            com.example.core.telephony.SmsIntelligenceManager.enrichRecord(
+                id = "1",
+                address = "+919876543210",
+                resolvedContactName = "Rahul Sharma",
+                body = "Hey, are we meeting today?",
+                timestampMs = 1_700_000_020_000L,
+                isUnread = true
+            ),
+            com.example.core.telephony.SmsIntelligenceManager.enrichRecord(
+                id = "2",
+                address = "VK-HDFCBK",
+                resolvedContactName = null,
+                body = "Your OTP for transaction is 739201. Do not share this code.",
+                timestampMs = 1_700_000_010_000L,
+                isUnread = false
+            )
+        )
+        val latestSummary = smsMgr.readAndAnalyzeSms(filter = "latest")
+        assertEquals(com.example.core.telephony.SmsAccessMode.FULL_SMS_INBOX, latestSummary.accessMode)
+
+        val unreadSummary = smsMgr.readAndAnalyzeSms(filter = "unread")
+        assertEquals(1, unreadSummary.messages.size)
+        assertEquals("Rahul Sharma", unreadSummary.messages.first().resolvedContactName)
+
+        val otpSummary = smsMgr.readAndAnalyzeSms(filter = "otp")
+        assertEquals(1, otpSummary.messages.size)
+        assertEquals("739201", otpSummary.messages.first().extractedOtp)
+    }
+
+    @Test
+    fun testSection4And5IncomingCallAndWhatsAppVerification() = runBlocking {
+        com.example.core.communication.WhatsAppAutomationManager.clearDuplicateSendHistory()
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"))
+            }
+        )
+
+        // Workflows 9, 10, 11, 12: Detect, Answer, Reject, and End Call
+        callMgr.testOverrideCallState = com.example.core.telephony.CallStateSnapshot(
+            isRinging = true,
+            isOffhook = false,
+            callerDisplayName = "Rahul Sharma (+919876543210)",
+            statusSummary = "Incoming call ringing from Rahul Sharma (+919876543210)"
+        )
+        val detectRes = callMgr.manageIncomingOrActiveCall("IDENTIFY", isConfirmed = true)
+        assertTrue(detectRes.isSuccess)
+        assertTrue(detectRes.outputMessage.contains("Incoming call ringing"))
+
+        val answerRes = callMgr.manageIncomingOrActiveCall("ANSWER", isConfirmed = true)
+        assertTrue(answerRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, answerRes.status)
+        assertTrue(answerRes.outputMessage.contains("Answered incoming call"))
+
+        callMgr.testOverrideCallState = com.example.core.telephony.CallStateSnapshot(
+            isRinging = true,
+            isOffhook = false,
+            callerDisplayName = "Rahul Sharma (+919876543210)",
+            statusSummary = "Incoming call ringing from Rahul Sharma (+919876543210)"
+        )
+        val rejectRes = callMgr.manageIncomingOrActiveCall("REJECT", isConfirmed = true)
+        assertTrue(rejectRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, rejectRes.status)
+        assertTrue(rejectRes.outputMessage.contains("Call rejected"))
+
+        callMgr.testOverrideCallState = com.example.core.telephony.CallStateSnapshot(
+            isRinging = false,
+            isOffhook = true,
+            callerDisplayName = "Rahul Sharma (+919876543210)",
+            statusSummary = "Active call in progress"
+        )
+        val endRes = callMgr.manageIncomingOrActiveCall("END", isConfirmed = true)
+        assertTrue(endRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, endRes.status)
+        assertTrue(endRes.outputMessage.contains("Call ended"))
+
+        // Workflows 13 & 14: Send WhatsApp message & verify sent bubble (Rule E & F)
+        val waMgr = com.example.core.communication.WhatsAppAutomationManager(
+            context = null,
+            callIntelligenceManager = callMgr,
+            screenIntelligenceManager = null
+        ).apply {
+            testOverrideInstalled = true
+        }
+
+        // Draft-only / unverified send bubble must return INCONCLUSIVE, never VERIFIED
+        waMgr.testOverrideHeaderVerified = true
+        waMgr.testOverrideSendVerified = false
+        val unverifiedWa = waMgr.sendOrDraftMessage("Rahul", "Hello Rahul", isConfirmed = true)
+        assertFalse(unverifiedWa.isSuccess)
+        assertEquals(VerificationStatus.INCONCLUSIVE, unverifiedWa.status)
+        assertTrue(unverifiedWa.outputMessage.contains("[WHATSAPP_SENT_BUBBLE_VERIFIED=false]"))
+
+        // Mismatched conversation header must abort before clicking Send
+        com.example.core.communication.WhatsAppAutomationManager.clearDuplicateSendHistory()
+        waMgr.testOverrideHeaderVerified = false
+        waMgr.testOverrideSendVerified = true
+        val wrongHeaderWa = waMgr.sendOrDraftMessage("Rahul", "Hello Rahul", isConfirmed = true)
+        assertFalse(wrongHeaderWa.isSuccess)
+        assertEquals(VerificationStatus.FAILED, wrongHeaderWa.status)
+        assertTrue(wrongHeaderWa.outputMessage.contains("active conversation header did not match"))
+
+        // Verified conversation header + verified sent message bubble -> VERIFIED
+        com.example.core.communication.WhatsAppAutomationManager.clearDuplicateSendHistory()
+        waMgr.testOverrideHeaderVerified = true
+        waMgr.testOverrideSendVerified = true
+        val verifiedWa = waMgr.sendOrDraftMessage("Rahul", "Hello Rahul", isConfirmed = true)
+        assertTrue(verifiedWa.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, verifiedWa.status)
+        assertTrue(verifiedWa.outputMessage.contains("[WHATSAPP_SENT_BUBBLE_VERIFIED=true]"))
+
+        // Duplicate WhatsApp send within window must be blocked
+        val dupWa = waMgr.sendOrDraftMessage("Rahul", "Hello Rahul", isConfirmed = true)
+        assertFalse(dupWa.isSuccess)
+        assertEquals(VerificationStatus.FAILED, dupWa.status)
+        assertTrue(dupWa.outputMessage.contains("Blocked duplicate WhatsApp message"))
+    }
+
+    @Test
+    fun testSection6To8PermissionsToolRoutingAndConfirmationSchemas() {
+        // Section 6: Task-scoped permission lookup
+        val callContactPerms = com.example.core.permission.PermissionRegistry.getRequiredPermissionsForAction(
+            ActionType.MAKE_PHONE_CALL,
+            targetIsDirectPhoneNumber = false
+        )
+        assertTrue(callContactPerms.contains(com.example.core.permission.PermissionType.CALL_PHONE))
+        assertTrue(callContactPerms.contains(com.example.core.permission.PermissionType.READ_CONTACTS))
+
+        val callDirectPerms = com.example.core.permission.PermissionRegistry.getRequiredPermissionsForAction(
+            ActionType.MAKE_PHONE_CALL,
+            targetIsDirectPhoneNumber = true
+        )
+        assertTrue(callDirectPerms.contains(com.example.core.permission.PermissionType.CALL_PHONE))
+        assertFalse(callDirectPerms.contains(com.example.core.permission.PermissionType.READ_CONTACTS))
+
+        val dialerDirectPerms = com.example.core.permission.PermissionRegistry.getRequiredPermissionsForAction(
+            ActionType.OPEN_PHONE_DIALER,
+            targetIsDirectPhoneNumber = true
+        )
+        assertTrue("Opening dialer with direct number requires zero runtime permissions", dialerDirectPerms.isEmpty())
+
+        // Section 7: Natural language routing for Hindi, English, and Hinglish commands
+        val brain = createHeadlessBrain()
+
+        val callPlan = brain.planTaskForInstruction("Babu, Rahul ko call karo")
+        assertEquals(ActionType.MAKE_PHONE_CALL, callPlan.actions.first().actionType)
+        assertEquals("Rahul", callPlan.actions.first().target)
+
+        val dialerPlan = brain.planTaskForInstruction("Open phone dialer for Rahul")
+        assertEquals(ActionType.OPEN_PHONE_DIALER, dialerPlan.actions.first().actionType)
+        assertEquals("Rahul", dialerPlan.actions.first().target)
+
+        val smsPlan = brain.planTaskForInstruction("Babu, Rahul ko SMS bhejo: main raste mein hoon")
+        assertEquals(ActionType.SEND_SMS, smsPlan.actions.first().actionType)
+        assertEquals("Rahul", smsPlan.actions.first().target)
+        assertEquals("main raste mein hoon", smsPlan.actions.first().parameters["message"])
+
+        val readSmsPlan = brain.planTaskForInstruction("Babu, mera latest SMS padho")
+        assertEquals(ActionType.READ_SMS, readSmsPlan.actions.first().actionType)
+        assertEquals("latest", readSmsPlan.actions.first().parameters["filter"])
+
+        val answerCallPlan = brain.planTaskForInstruction("Babu, incoming call answer karo")
+        assertEquals(ActionType.MANAGE_CALL, answerCallPlan.actions.first().actionType)
+        assertEquals("ANSWER", answerCallPlan.actions.first().parameters["operation"])
+
+        val conditionalPlan = brain.planTaskForInstruction(
+            "Babu, agar Rahul call nahi uthata hai to WhatsApp par message bhej dena"
+        )
+        assertEquals(3, conditionalPlan.actions.size)
+        assertEquals(ActionType.RESOLVE_CONTACT, conditionalPlan.actions[0].actionType)
+        assertEquals(ActionType.MAKE_PHONE_CALL, conditionalPlan.actions[1].actionType)
+        assertEquals(ActionType.MESSAGE_DRAFT_SEND, conditionalPlan.actions[2].actionType)
+        assertEquals("Rahul", conditionalPlan.actions[1].target)
+
+        // Section 8: Confirmation UI Schema Generation
+        val callAction = AgentAction(
+            taskId = "t1",
+            actionType = ActionType.MAKE_PHONE_CALL,
+            target = "Rahul",
+            parameters = mapOf("target" to "Rahul", "observeCallState" to "true"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+        val callConf = com.example.core.agent.ConfirmationSchemaBuilder.buildConfirmationFromAction(
+            taskId = "t1",
+            action = callAction,
+            resolvedContactName = "Rahul Sharma",
+            resolvedPhoneNumber = "+919876543210"
+        )
+        assertEquals("Confirm Phone Call", callConf.title)
+        val callFieldLabels = callConf.getSchemaDisplayFields().map { field -> field.first }
+        assertEquals(listOf("Contact Name", "Phone Number", "Call Action"), callFieldLabels)
+        assertFalse("Internal parameter keys must never leak to Confirmation UI", callFieldLabels.contains("observeCallState"))
+
+        val smsAction = AgentAction(
+            taskId = "t2",
+            actionType = ActionType.SEND_SMS,
+            target = "Rahul",
+            parameters = mapOf("recipient" to "Rahul", "message" to "Main raste mein hoon"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+        val smsConf = com.example.core.agent.ConfirmationSchemaBuilder.buildConfirmationFromAction(
+            taskId = "t2",
+            action = smsAction,
+            resolvedContactName = "Rahul Sharma",
+            resolvedPhoneNumber = "+919876543210"
+        )
+        assertEquals("Confirm SMS Message", smsConf.title)
+        assertEquals(listOf("Recipient", "Phone Number", "Message"), smsConf.getSchemaDisplayFields().map { field -> field.first })
+
+        val waAction = AgentAction(
+            taskId = "t3",
+            actionType = ActionType.MESSAGE_DRAFT_SEND,
+            target = "Rahul",
+            parameters = mapOf("recipient" to "Rahul", "message" to "Joining in 5 mins", "condition" to "IF_CALL_UNANSWERED"),
+            riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION
+        )
+        val waConf = com.example.core.agent.ConfirmationSchemaBuilder.buildConfirmationFromAction(
+            taskId = "t3",
+            action = waAction,
+            resolvedContactName = "Rahul Sharma",
+            resolvedPhoneNumber = "+919876543210"
+        )
+        assertEquals("Confirm WhatsApp Message", waConf.title)
+        assertEquals(listOf("Recipient", "Message", "Attachment"), waConf.getSchemaDisplayFields().map { field -> field.first })
+        assertFalse("Internal condition parameter must not appear as a raw field", waConf.getSchemaDisplayFields().any { field -> field.first == "condition" })
+    }
+
+    @Test
+    fun testSection5IncomingCallerAnnouncementAndVoiceCallControl() {
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(
+                    com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"),
+                    com.example.core.telephony.ResolvedContactItem("Papa", "+919811122233")
+                )
+            }
+        )
+
+        // Saved contact caller announcement
+        var spokenText = ""
+        val knownAnnouncement = callMgr.announceIncomingCallIfPermitted("+919876543210") { spoken ->
+            spokenText = spoken
+        }
+        assertEquals("Babu: Rahul Sharma ka phone aa raha hai.", knownAnnouncement)
+        assertEquals("Babu: Rahul Sharma ka phone aa raha hai.", spokenText)
+
+        // Unknown caller announcement
+        val unknownAnnouncement = callMgr.announceIncomingCallIfPermitted("+919999900000")
+        assertEquals("Babu: Ek unknown number se call aa rahi hai.", unknownAnnouncement)
+
+        // Hidden / unavailable caller number announcement
+        val hiddenAnnouncement = callMgr.buildIncomingCallerAnnouncement(null)
+        assertEquals("Babu: Ek unknown number se call aa rahi hai.", hiddenAnnouncement)
+
+        // Verify Hindi/Hinglish incoming call commands route to the exact tools
+        val brain = createHeadlessBrain()
+        val uthaoPlan = brain.planTaskForInstruction("Call uthao")
+        assertEquals(ActionType.MANAGE_CALL, uthaoPlan.actions.first().actionType)
+        assertEquals("ANSWER", uthaoPlan.actions.first().parameters["operation"])
+
+        val rejectPlan = brain.planTaskForInstruction("Call reject karo")
+        assertEquals(ActionType.MANAGE_CALL, rejectPlan.actions.first().actionType)
+        assertEquals("REJECT", rejectPlan.actions.first().parameters["operation"])
+
+        val cutPlan = brain.planTaskForInstruction("Call cut karo")
+        assertEquals(ActionType.MANAGE_CALL, cutPlan.actions.first().actionType)
+        assertEquals("END", cutPlan.actions.first().parameters["operation"])
+
+        val whoCallingPlan = brain.planTaskForInstruction("Kaun call kar raha hai?")
+        assertEquals(ActionType.CHECK_INCOMING_CALL, whoCallingPlan.actions.first().actionType)
+
+        val kiskiCallPlan = brain.planTaskForInstruction("Mujhe batao kiski call aayi thi.")
+        assertEquals(ActionType.READ_CALL_HISTORY, kiskiCallPlan.actions.first().actionType)
+        assertEquals("all", kiskiCallPlan.actions.first().parameters["filter"])
+
+        val missedCallsPlan = brain.planTaskForInstruction("Missed calls batao.")
+        assertEquals(ActionType.READ_CALL_HISTORY, missedCallsPlan.actions.first().actionType)
+        assertEquals("missed", missedCallsPlan.actions.first().parameters["filter"])
+    }
+
+    @Test
+    fun testSection6And7WhatsAppExtendedAndSms5StateAndContactManagement() = runBlocking {
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(
+                    com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"),
+                    com.example.core.telephony.ResolvedContactItem("Priya Verma", "+919812345678"),
+                    com.example.core.telephony.ResolvedContactItem("Rahul Duplicate", "+919876543210")
+                )
+            }
+        ).apply {
+            testOverrideSimReady = true
+            testOverrideContactsPermission = true
+        }
+
+        // Duplicate contact detection (Section 7)
+        val duplicates = callMgr.findDuplicateContacts()
+        assertTrue("Duplicate phone numbers should be detected", duplicates.isNotEmpty())
+        assertTrue(duplicates.first().contains("Rahul Sharma"))
+
+        // Contact save & delete with confirmation (Section 7)
+        callMgr.saveOrUpdateContact("Satyam", "+919000011111", isConfirmed = true)
+        assertTrue(callMgr.isPhoneNumberInContacts("+919000011111"))
+
+        val unconfirmedDelete = callMgr.deleteContactByNameOrNumber("Satyam", isConfirmed = false)
+        assertFalse(unconfirmedDelete.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_CONFIRMATION, unconfirmedDelete.status)
+
+        val confirmedDelete = callMgr.deleteContactByNameOrNumber("Satyam", isConfirmed = true)
+        assertTrue(confirmedDelete.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, confirmedDelete.status)
+        assertFalse(callMgr.isPhoneNumberInContacts("+919000011111"))
+
+        // SMS 5-State Distinction & Multi-Recipient SMS (Section 7)
+        val smsMgr = com.example.core.telephony.SmsIntelligenceManager(
+            context = null,
+            callIntelligenceManager = callMgr
+        ).apply {
+            testOverrideSendSmsPermission = false
+        }
+
+        // State 1: SMS_COMPOSER_OPENED
+        val composerStateRes = smsMgr.sendSmsMessage(
+            rawRecipient = "Priya Verma",
+            messageBody = "Draft via composer",
+            isConfirmed = true,
+            allowComposerFallbackWhenRestricted = true
+        )
+        assertEquals(VerificationStatus.INCONCLUSIVE, composerStateRes.status)
+        assertTrue(composerStateRes.outputMessage.contains("[SMS_STATE=SMS_COMPOSER_OPENED]"))
+
+        // State 2: SMS_TRANSMITTED
+        smsMgr.testOverrideSendSmsPermission = true
+        smsMgr.testOverrideSmsTransmissionSuccess = true
+        smsMgr.testOverrideSmsDeliveryVerified = false
+        smsMgr.resetDuplicateSmsGuard()
+        val transmittedRes = smsMgr.sendSmsMessage("Priya Verma", "Transmitted text", isConfirmed = true)
+        assertTrue(transmittedRes.isSuccess)
+        assertTrue(transmittedRes.outputMessage.contains("[SMS_STATE=SMS_TRANSMITTED]"))
+
+        // State 3: SMS_DELIVERED
+        smsMgr.resetDuplicateSmsGuard()
+        smsMgr.testOverrideSmsDeliveryVerified = true
+        val deliveredRes = smsMgr.sendSmsMessage("Priya Verma", "Delivered text", isConfirmed = true)
+        assertTrue(deliveredRes.isSuccess)
+        assertTrue(deliveredRes.outputMessage.contains("[SMS_STATE=SMS_DELIVERED]"))
+
+        // State 4: SMS_FAILED
+        smsMgr.resetDuplicateSmsGuard()
+        smsMgr.testOverrideSmsTransmissionSuccess = false
+        val failedRes = smsMgr.sendSmsMessage("Priya Verma", "Failed text", isConfirmed = true)
+        assertFalse(failedRes.isSuccess)
+        assertTrue(failedRes.outputMessage.contains("[SMS_STATE=SMS_FAILED]"))
+
+        // Multi-recipient SMS
+        smsMgr.resetDuplicateSmsGuard()
+        smsMgr.testOverrideSmsTransmissionSuccess = true
+        val multiSmsRes = smsMgr.sendSmsMessage("Priya Verma, +919111222333", "Team update at 4 PM", isConfirmed = true)
+        assertTrue(multiSmsRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, multiSmsRes.status)
+
+        // Section 6: WhatsApp Unread Messages, Media/PDF Sharing, and Voice/Video Call Control
+        val waMgr = com.example.core.communication.WhatsAppAutomationManager(
+            context = null,
+            callIntelligenceManager = callMgr,
+            screenIntelligenceManager = null
+        ).apply {
+            testOverrideInstalled = true
+            testOverrideUnreadNotifications = listOf(
+                "Rahul Sharma" to "Bhai meeting kab hai?",
+                "Family Group" to "Dinner at 8 PM"
+            )
+            testOverrideSendVerified = true
+            testOverrideCallInitiated = true
+        }
+
+        val unreadWaRes = waMgr.getUnreadWhatsAppMessagesSummary()
+        assertTrue(unreadWaRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, unreadWaRes.status)
+        assertTrue(unreadWaRes.outputMessage.contains("Rahul Sharma"))
+        assertTrue(unreadWaRes.outputMessage.contains("Family Group"))
+
+        val unconfirmedShare = waMgr.shareMediaOrDocumentToWhatsApp(
+            rawRecipient = "Rahul Sharma",
+            filePath = "file:///storage/emulated/0/Documents/Report.pdf",
+            isConfirmed = false
+        )
+        assertEquals(VerificationStatus.REQUIRES_CONFIRMATION, unconfirmedShare.status)
+
+        val confirmedShare = waMgr.shareMediaOrDocumentToWhatsApp(
+            rawRecipient = "Rahul Sharma",
+            filePath = "file:///storage/emulated/0/Documents/Report.pdf",
+            isConfirmed = true
+        )
+        assertTrue(confirmedShare.isSuccess)
+        assertTrue(confirmedShare.outputMessage.contains("[WHATSAPP_MEDIA_SHARED=true]"))
+
+        val waVoiceCall = waMgr.initiateWhatsAppCall("Rahul Sharma", isVideoCall = false, isConfirmed = true)
+        assertTrue(waVoiceCall.isSuccess)
+        assertTrue(waVoiceCall.outputMessage.contains("[WHATSAPP_CALL_INITIATED=true]"))
+
+        val waAnswerCall = waMgr.handleIncomingWhatsAppCall("ANSWER", isConfirmed = true)
+        assertTrue(waAnswerCall.isSuccess)
+        assertTrue(waAnswerCall.outputMessage.contains("[WHATSAPP_CALL_HANDLED=true]"))
+    }
+
+    @Test
+    fun testSection2To12UniversalVoiceChatWorkflowsAndPermissionAutoResume() = runBlocking {
+        val brain = createHeadlessBrain()
+
+        // 1. "Hi Babu, WhatsApp kholo."
+        val p1 = brain.planTaskForInstruction("Hi Babu, WhatsApp kholo.")
+        assertEquals(ActionType.LAUNCH_APP, p1.actions.first().actionType)
+        assertEquals("WhatsApp", p1.actions.first().target)
+
+        // 2. "Papa ko call karo."
+        val p2 = brain.planTaskForInstruction("Papa ko call karo.")
+        assertEquals(ActionType.MAKE_PHONE_CALL, p2.actions.first().actionType)
+        assertEquals("Papa", p2.actions.first().target)
+
+        // 3. "Bluetooth on karo."
+        val p3 = brain.planTaskForInstruction("Bluetooth on karo.")
+        assertEquals(ActionType.OPEN_SETTINGS_SECTION, p3.actions.first().actionType)
+        assertEquals("bluetooth", p3.actions.first().target)
+
+        // 4. "Instagram kholo aur meri profile par jao."
+        val p4 = brain.planTaskForInstruction("Instagram kholo aur meri profile par jao.")
+        assertEquals(2, p4.actions.size)
+        assertEquals(ActionType.LAUNCH_APP, p4.actions[0].actionType)
+        assertEquals("Instagram", p4.actions[0].target)
+        assertEquals(ActionType.CLICK_ELEMENT, p4.actions[1].actionType)
+        assertEquals("Profile", p4.actions[1].target)
+
+        // 5. "WhatsApp par unread messages batao."
+        val p5 = brain.planTaskForInstruction("WhatsApp par unread messages batao.")
+        assertEquals(ActionType.WHATSAPP_READ_CONVERSATION, p5.actions.first().actionType)
+        assertEquals("true", p5.actions.first().parameters["unreadOnly"])
+
+        // 6. "Kal subah 6 baje alarm laga do."
+        val p6 = brain.planTaskForInstruction("Kal subah 6 baje alarm laga do.")
+        assertEquals(ActionType.SCHEDULE_ALARM, p6.actions.first().actionType)
+        assertEquals("6", p6.actions.first().parameters["hour"])
+
+        // 7. "Download folder mein meri PDF search karo."
+        val p7 = brain.planTaskForInstruction("Download folder mein meri PDF search karo.")
+        assertEquals(ActionType.FILE_SEARCH, p7.actions.first().actionType)
+        assertEquals(".pdf", p7.actions.first().target)
+
+        // 8. "Rahul ko message bhejo aur reply na aaye to mujhe baad mein call karne ke liye bata dena."
+        val p8 = brain.planTaskForInstruction("Rahul ko message bhejo aur reply na aaye to mujhe baad mein call karne ke liye bata dena.")
+        assertEquals(2, p8.actions.size)
+        assertEquals(ActionType.MESSAGE_DRAFT_SEND, p8.actions[0].actionType)
+        assertEquals(ActionType.CREATE_REMINDER, p8.actions[1].actionType)
+        assertEquals("Rahul", p8.actions[1].parameters["notificationWatchSender"])
+
+        // 9. "Rahul ko WhatsApp message bhejo. Agar reply na aaye to 10 minute baad mujhe bata dena."
+        val p9 = brain.planTaskForInstruction("Rahul ko WhatsApp message bhejo. Agar reply na aaye to 10 minute baad mujhe bata dena.")
+        assertEquals(2, p9.actions.size)
+        assertEquals("10", p9.actions[1].parameters["delayMinutes"])
+
+        // 10. "Ek PDF download karo, uska naam change karo aur Documents folder mein save karo."
+        val p10 = brain.planTaskForInstruction("Ek PDF download karo, uska naam change karo aur Documents folder mein save karo.")
+        assertEquals(2, p10.actions.size)
+        assertEquals(ActionType.FILE_WRITE_TEXT, p10.actions[0].actionType)
+        assertEquals(ActionType.FILE_SEARCH, p10.actions[1].actionType)
+
+        // 11. "Papa ko call karo. Agar call connect nahi hoti to WhatsApp par message bhejo."
+        val p11 = brain.planTaskForInstruction("Papa ko call karo. Agar call connect nahi hoti to WhatsApp par message bhejo.")
+        assertEquals(3, p11.actions.size)
+        assertEquals(ActionType.RESOLVE_CONTACT, p11.actions[0].actionType)
+        assertEquals("Papa", p11.actions[0].target)
+        assertEquals(ActionType.MAKE_PHONE_CALL, p11.actions[1].actionType)
+        assertEquals(ActionType.MESSAGE_DRAFT_SEND, p11.actions[2].actionType)
+        assertEquals("IF_CALL_UNANSWERED", p11.actions[2].parameters["condition"])
+
+        // 12. "Calendar check karo aur mujhe kal ki meetings batao."
+        val p12 = brain.planTaskForInstruction("Calendar check karo aur mujhe kal ki meetings batao.")
+        assertEquals(ActionType.READ_CALENDAR_EVENTS, p12.actions.first().actionType)
+        assertEquals("tomorrow", p12.actions.first().target)
+
+        // 13. "Babu, is page par Download button dabao."
+        val p13 = brain.planTaskForInstruction("Babu, is page par Download button dabao.")
+        assertEquals(2, p13.actions.size)
+        assertEquals(ActionType.READ_SCREEN, p13.actions[0].actionType)
+        assertEquals(ActionType.CLICK_ELEMENT, p13.actions[1].actionType)
+        assertEquals("Download", p13.actions[1].target)
+
+        // Section 12: Automatic Task Resume After Permission Grant vs Denial
+        val runtime = createHeadlessRuntime()
+        val blockedTask = brain.planTaskForInstruction("Papa ko call karo.").apply {
+            state = TaskState.WAITING_FOR_PERMISSION
+        }
+        runtime.recordPermissionBlockedTask(blockedTask, "android.permission.CALL_PHONE")
+        assertEquals("android.permission.CALL_PHONE", runtime.pendingRequiredPermission)
+
+        // When permission is denied -> transitions to BLOCKED_BY_ANDROID
+        val deniedSummary = runtime.onPermissionDecision("android.permission.CALL_PHONE", granted = false)
+        assertNotNull(deniedSummary)
+        assertFalse(deniedSummary!!.isSuccess)
+        assertEquals(TaskState.BLOCKED_BY_ANDROID, deniedSummary.task.state)
+        assertEquals(VerificationStatus.REQUIRES_PERMISSION, deniedSummary.verificationStatus)
+
+        // When permission is granted -> automatically resumes pending task without repeating user prompt
+        val blockedTask2 = brain.planTaskForInstruction("Papa ko call karo.").apply {
+            state = TaskState.WAITING_FOR_PERMISSION
+        }
+        runtime.recordPermissionBlockedTask(blockedTask2, "android.permission.CALL_PHONE")
+        val resumedSummary = runtime.onPermissionDecision("android.permission.CALL_PHONE", granted = true) { resumedTask ->
+            resumedTask.state = TaskState.COMPLETED
+            com.example.core.agent.AgentExecutionSummary(
+                task = resumedTask,
+                isSuccess = true,
+                message = "Automatically resumed and completed '${resumedTask.userInstruction}' after CALL_PHONE grant.",
+                verificationStatus = VerificationStatus.VERIFIED
+            )
+        }
+        assertNotNull(resumedSummary)
+        assertTrue(resumedSummary!!.isSuccess)
+        assertEquals(TaskState.COMPLETED, resumedSummary.task.state)
+        assertEquals(VerificationStatus.VERIFIED, resumedSummary.verificationStatus)
+        assertNull(runtime.pendingPermissionBlockedTask)
+    }
+
+    @Test
+    fun testPhase1To10VoiceContinuityMediaWhatsAppAndNonDestructiveRoomMigrations() = runBlocking {
+        // 1. Phase 1B & 1C (SIMULATED JVM TEST): Continuous Voice Conversation State Machine & AudioSessionOwner Coordination
+        val voiceStateValues = com.example.core.voice.VoiceState.entries.map { it.name }.toSet()
+        assertTrue(voiceStateValues.containsAll(
+            listOf(
+                "IDLE", "STANDBY", "WAKE_DETECTED", "LISTENING", "TRANSCRIBING",
+                "THINKING", "EXECUTING", "SPEAKING", "FOLLOW_UP_LISTENING",
+                "PAUSED", "STOPPED", "DISABLED", "ERROR"
+            )
+        ))
+        val sessionOwners = com.example.core.voice.AudioSessionOwner.entries.map { it.name }.toSet()
+        assertTrue(sessionOwners.containsAll(
+            listOf("NONE", "WAKE_WORD_ENGINE", "SPEECH_RECOGNIZER", "TTS_PLAYBACK", "PHONE_CALL_INTERRUPTION")
+        ))
+
+        // 2. Phase 3A & 3C: PhoneCallLifecycleState & WhatsAppMessageLifecycleState strict verification
+        val callMgr = com.example.core.telephony.CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"))
+            }
+        ).apply {
+            testOverrideCallPhonePermission = true
+            testOverrideContactsPermission = true
+            testOverrideSimReady = true
+            testOverrideDialerAvailable = true
+        }
+        val dialRes = callMgr.openPhoneDialer("Rahul")
+        assertTrue(dialRes.isSuccess)
+        assertEquals(
+            com.example.core.telephony.PhoneCallLifecycleState.DIALER_OPENED,
+            com.example.core.telephony.CallIntelligenceManager.lastCallLifecycleState
+        )
+
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideCallInitiated = true
+        callMgr.testOverrideLastOutgoingCallAnswered = null
+        val callInitRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertTrue(callInitRes.isSuccess)
+        assertEquals(
+            com.example.core.telephony.PhoneCallLifecycleState.CALL_INITIATED,
+            com.example.core.telephony.CallIntelligenceManager.lastCallLifecycleState
+        )
+
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideLastOutgoingCallAnswered = true
+        val callAnsRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertTrue(callAnsRes.isSuccess)
+        assertEquals(
+            com.example.core.telephony.PhoneCallLifecycleState.CALL_ANSWERED,
+            com.example.core.telephony.CallIntelligenceManager.lastCallLifecycleState
+        )
+
+        // WhatsAppMessageLifecycleState: sent bubble alone must NEVER be marked MESSAGE_DELIVERED or MESSAGE_READ
+        val waMgr = com.example.core.communication.WhatsAppAutomationManager(
+            context = null,
+            callIntelligenceManager = callMgr,
+            screenIntelligenceManager = null
+        )
+        val sentOnlyState = waMgr.evaluateWhatsAppMessageLifecycleState(
+            messageText = "Kal wali baat",
+            visibleScreenText = "Rahul Sharma | Kal wali baat | 10:42 AM",
+            wasSendClicked = true
+        )
+        assertEquals(com.example.core.communication.WhatsAppMessageLifecycleState.MESSAGE_SENT, sentOnlyState)
+
+        val deliveredState = waMgr.evaluateWhatsAppMessageLifecycleState(
+            messageText = "Kal wali baat",
+            visibleScreenText = "Rahul Sharma | Kal wali baat | Status: Delivered",
+            wasSendClicked = true
+        )
+        assertEquals(com.example.core.communication.WhatsAppMessageLifecycleState.MESSAGE_DELIVERED, deliveredState)
+
+        val readState = waMgr.evaluateWhatsAppMessageLifecycleState(
+            messageText = "Kal wali baat",
+            visibleScreenText = "Rahul Sharma | Kal wali baat | Status: Read",
+            wasSendClicked = true
+        )
+        assertEquals(com.example.core.communication.WhatsAppMessageLifecycleState.MESSAGE_READ, readState)
+
+        val composedOnlyState = waMgr.evaluateWhatsAppMessageLifecycleState(
+            messageText = "Kal wali baat",
+            visibleScreenText = "Draft: Kal wali baat",
+            wasSendClicked = false
+        )
+        assertEquals(com.example.core.communication.WhatsAppMessageLifecycleState.MESSAGE_COMPOSED, composedOnlyState)
+
+        // 3. Phase 3B: Authorized INCOMING_SMS_EVENT automation trigger
+        val autoEngine = com.example.core.automation.AutomationEngine(context = null)
+        val smsRule = autoEngine.createRule(
+            name = "Incoming OTP Alert",
+            triggerType = com.example.core.automation.AutomationTriggerType.INCOMING_SMS_EVENT,
+            triggerConditionValue = "OTP",
+            actionInstruction = "Save note: OTP SMS received"
+        )
+        val smsTriggeredRecords = autoEngine.onEventTriggered(
+            triggerType = com.example.core.automation.AutomationTriggerType.INCOMING_SMS_EVENT,
+            eventValue = "VK-HDFCBK: Your OTP is 482910"
+        ) { instruction ->
+            true to "Executed: $instruction"
+        }
+        assertEquals(1, smsTriggeredRecords.size)
+        assertEquals(smsRule.ruleId, smsTriggeredRecords.first().ruleId)
+        assertTrue(smsTriggeredRecords.first().isSuccess)
+
+        // 4. Phase 4 & Phase 6: Media Control Intelligence & Memory Preference Resolution
+        val favSongCandidate = com.example.core.memory.MemoryClassifier.extractCandidate(
+            "Yaad rakho mera favourite song Kesariya hai."
+        )
+        assertNotNull(favSongCandidate)
+        assertEquals("favourite_song", favSongCandidate!!.key)
+        assertTrue(favSongCandidate.value.contains("Kesariya", ignoreCase = true))
+
+        val brain = createHeadlessBrain()
+        val favSongPlan = brain.planTaskForInstruction("Mera favourite song chalao")
+        assertEquals(ActionType.CONTROL_MEDIA, favSongPlan.actions.first().actionType)
+        assertEquals("PLAY_FAVOURITE_SONG", favSongPlan.actions.first().parameters["operation"])
+
+        val arijitPlan = brain.planTaskForInstruction("YouTube kholo aur Arijit Singh ke songs chalao")
+        assertEquals(ActionType.CONTROL_MEDIA, arijitPlan.actions.first().actionType)
+        assertEquals("PLAY_BY_ARTIST", arijitPlan.actions.first().parameters["operation"])
+        assertTrue(arijitPlan.actions.first().parameters["query"]!!.contains("Arijit Singh", ignoreCase = true))
+
+        val nextSongPlan = brain.planTaskForInstruction("Next song")
+        assertEquals(ActionType.CONTROL_MEDIA, nextSongPlan.actions.first().actionType)
+        assertEquals("NEXT_TRACK", nextSongPlan.actions.first().parameters["operation"])
+
+        val pauseSongPlan = brain.planTaskForInstruction("Isse pause karo")
+        assertEquals(ActionType.CONTROL_MEDIA, pauseSongPlan.actions.first().actionType)
+        assertEquals("PAUSE", pauseSongPlan.actions.first().parameters["operation"])
+
+        val sadSongsPlan = brain.planTaskForInstruction("Ab sad songs chalao")
+        assertEquals(ActionType.CONTROL_MEDIA, sadSongsPlan.actions.first().actionType)
+        assertEquals("PLAY_BY_GENRE_OR_MOOD", sadSongsPlan.actions.first().parameters["operation"])
+
+        // 5. Phase 6: Multi-turn conversation continuity ("WhatsApp kholo" -> "Rahul ko message bhejo" -> "Kal wali baat likho" -> "Ab call bhi karo")
+        val continuity = com.example.core.memory.ConversationContinuityManager()
+        continuity.recordEntityContext(app = "com.whatsapp")
+        continuity.registerPendingSlot(
+            com.example.core.memory.PendingSlotContinuation(
+                taskId = "task_wa_1",
+                intentType = UserIntentType.MESSAGE_DRAFT,
+                missingSlotName = "message",
+                promptToUser = "Kya message bhejna hai Rahul ko?",
+                collectedEntities = mapOf("recipient" to "Rahul")
+            )
+        )
+        continuity.recordEntityContext(contact = "Rahul")
+
+        val slotRes = continuity.evaluateIncomingTurn(
+            userTurn = "Kal wali baat likho",
+            hasActivePendingConfirmation = false
+        )
+        assertTrue(slotRes is com.example.core.memory.ContinuationResolution.SlotFilledResumeIntent)
+        val filledIntent = (slotRes as com.example.core.memory.ContinuationResolution.SlotFilledResumeIntent).resolvedIntent
+        assertEquals("Rahul", filledIntent.recipient)
+        assertEquals("Kal wali baat likho", filledIntent.searchQueryOrContent)
+
+        val followUpCallPrompt = continuity.resolveReferencesInPrompt("Ab call bhi karo")
+        assertEquals("Call Rahul", followUpCallPrompt)
+        val followUpCallPlan = brain.planTaskForInstruction(followUpCallPrompt)
+        assertEquals(ActionType.MAKE_PHONE_CALL, followUpCallPlan.actions.first().actionType)
+        assertEquals("Rahul", followUpCallPlan.actions.first().target)
+
+        // 6. Phase 7: Verify non-destructive Room migrations exist and have valid version spans
+        assertEquals(1, com.example.data.local.NayroDatabase.MIGRATION_1_2.startVersion)
+        assertEquals(2, com.example.data.local.NayroDatabase.MIGRATION_1_2.endVersion)
+        assertEquals(2, com.example.data.local.NayroDatabase.MIGRATION_2_3.startVersion)
+        assertEquals(3, com.example.data.local.NayroDatabase.MIGRATION_2_3.endVersion)
+    }
+
     private fun createHeadlessBrain(): AgentBrain {
         val dummyExecutor = UnsafeTestHelper.allocateWithoutInit(ActionExecutor::class.java)
         val dummyProvider = UnsafeTestHelper.allocateWithoutInit(com.example.core.provider.AIProviderManager::class.java)
@@ -1958,6 +2816,20 @@ class SecurityAndVerificationTests {
             skillManager = SkillManager(),
             subAgentManager = SubAgentManager()
         )
+    }
+
+    private fun createHeadlessRuntime(): com.example.core.agent.AgentRuntime {
+        val instance = UnsafeTestHelper.allocateWithoutInit(com.example.core.agent.AgentRuntime::class.java)
+        val stateManagerField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("stateManager")
+        stateManagerField.isAccessible = true
+        stateManagerField.set(instance, com.example.core.agent.TaskStateManager())
+        val currentStateField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("_currentState")
+        currentStateField.isAccessible = true
+        currentStateField.set(
+            instance,
+            kotlinx.coroutines.flow.MutableStateFlow<com.example.core.agent.AgentState>(com.example.core.agent.AgentState.Idle)
+        )
+        return instance
     }
 }
 

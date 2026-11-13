@@ -26,8 +26,9 @@ enum class AutomationTriggerType(val displayName: String) {
     SCREEN_STATE_CHANGED("Screen Interactive State Changed"),
     CONNECTIVITY_CHANGED("Network / Connectivity Changed"),
 
-    // Application event triggers
+    // Application & Communication event triggers
     NOTIFICATION_ARRIVED("Authorized Notification Arrived"),
+    INCOMING_SMS_EVENT("Authorized Incoming SMS Received"),
     APP_STATE_CHANGED("Foreground Application Changed"),
 
     // Location event triggers

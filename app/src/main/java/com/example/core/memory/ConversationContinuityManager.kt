@@ -134,6 +134,20 @@ class ConversationContinuityManager {
         var resolved = rawPrompt
         val lastContact = sessionContext.lastMentionedContact
         if (!lastContact.isNullOrBlank()) {
+            // 4. Contextual follow-up call without repeating contact name: "Ab call bhi karo", "Call bhi karo", "Ab call karo"
+            if (lower in setOf(
+                    "ab call bhi karo",
+                    "ab call bhi karo.",
+                    "call bhi karo",
+                    "call bhi kar do",
+                    "ab call karo",
+                    "ab phone karo",
+                    "phone bhi lagao"
+                )
+            ) {
+                return "Call $lastContact"
+            }
+
             resolved = resolved
                 .replace(Regex("(?i)\\b(usko|usse|unhe|him|her)\\b"), lastContact)
         }

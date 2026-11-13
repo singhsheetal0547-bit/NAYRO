@@ -100,6 +100,29 @@ class PermissionManager(private val context: Context) {
             PermissionType.COARSE_LOCATION -> {
                 evaluateRuntimePermission(android.Manifest.permission.ACCESS_COARSE_LOCATION, item, activity)
             }
+            PermissionType.CALL_PHONE -> {
+                evaluateRuntimePermission(android.Manifest.permission.CALL_PHONE, item, activity)
+            }
+            PermissionType.ANSWER_PHONE_CALLS -> {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    evaluateRuntimePermission(android.Manifest.permission.ANSWER_PHONE_CALLS, item, activity)
+                } else {
+                    PermissionEvaluation(
+                        item = item,
+                        status = PermissionStatus.NOT_REQUIRED,
+                        statusExplanation = "ANSWER_PHONE_CALLS requires Android 8.0+ (API 26+)."
+                    )
+                }
+            }
+            PermissionType.READ_CALL_LOG -> {
+                evaluateRuntimePermission(android.Manifest.permission.READ_CALL_LOG, item, activity)
+            }
+            PermissionType.SEND_SMS -> {
+                evaluateRuntimePermission(android.Manifest.permission.SEND_SMS, item, activity)
+            }
+            PermissionType.READ_SMS -> {
+                evaluateRuntimePermission(android.Manifest.permission.READ_SMS, item, activity)
+            }
             PermissionType.OVERLAY -> {
                 val canDraw = Settings.canDrawOverlays(context)
                 if (canDraw) {
@@ -413,6 +436,11 @@ class PermissionManager(private val context: Context) {
             PermissionType.NOTIFICATIONS,
             PermissionType.READ_CONTACTS,
             PermissionType.READ_PHONE_STATE,
+            PermissionType.CALL_PHONE,
+            PermissionType.ANSWER_PHONE_CALLS,
+            PermissionType.READ_CALL_LOG,
+            PermissionType.SEND_SMS,
+            PermissionType.READ_SMS,
             PermissionType.READ_CALENDAR,
             PermissionType.WRITE_CALENDAR,
             PermissionType.COARSE_LOCATION -> {

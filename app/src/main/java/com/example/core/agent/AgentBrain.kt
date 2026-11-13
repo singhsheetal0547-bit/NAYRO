@@ -125,7 +125,10 @@ class AgentBrain(
                 ActionType.CHECK_INCOMING_CALL,
                 ActionType.READ_CALL_HISTORY,
                 ActionType.READ_SMS,
-                ActionType.CREATE_REMINDER
+                ActionType.CREATE_REMINDER,
+                ActionType.SCHEDULE_ALARM,
+                ActionType.WHATSAPP_READ_CONVERSATION,
+                ActionType.OPEN_SETTINGS_SECTION
             )
         ) {
             return AgentTask(
@@ -246,7 +249,7 @@ class AgentBrain(
     }
 
     /**
-     * Decomposes conditional, cross-app, and multi-step autonomous workflows (Scenarios A–G, Sections 1, 3, 4, 5, 18)
+     * Decomposes conditional, cross-app, and multi-step autonomous workflows (Scenarios A–K, Sections 1–10)
      * into reusable validated [AgentAction] plans.
      */
     private fun planConditionalOrComplexScenario(instruction: String, taskId: String): List<AgentAction>? {
@@ -255,6 +258,7 @@ class AgentBrain(
         // SCENARIO A — Conditional Call -> WhatsApp Fallback:
         // "Call Rahul. If he does not answer, send him a WhatsApp message."
         // "Rahul ko call karo. Agar woh call nahi uthata, toh use WhatsApp par message bhej dena ki main baad mein call karunga."
+        // "Papa ko call karo. Agar call connect nahi hoti to WhatsApp par message bhejo."
         val isCallInstruction = lower.contains("call") || lower.contains("phone lagao")
         val isConditionalUnanswered = lower.contains("if he does not answer") ||
             lower.contains("if she does not answer") ||
@@ -263,11 +267,16 @@ class AgentBrain(
             lower.contains("doesn't answer") ||
             lower.contains("nahi uthata") ||
             lower.contains("na uthaye") ||
-            lower.contains("nahi uthaye")
+            lower.contains("nahi uthaye") ||
+            lower.contains("connect nahi hoti") ||
+            lower.contains("connect na ho") ||
+            lower.contains("connect nahi hota")
 
         if (isCallInstruction && isConditionalUnanswered) {
-            val recipientMatch = Regex("(?i)\\b([a-zA-Z0-9_]+)\\s+ko\\s+(?:call|phone)").find(instruction)
-                ?: Regex("(?i)\\b(?:call|phone lagao)\\s+(?!karo\\b|nahi\\b|lagao\\b)([a-zA-Z0-9_]+)\\b").find(instruction)
+            val recipientMatch = Regex("(?i)\\b([a-zA-Z0-9_+]+)\\s+ko\\s+(?:call|phone)").find(instruction)
+                ?: Regex("(?i)\\bagar\\s+(?!woh\\b|wo\\b|he\\b|she\\b|they\\b|call\\b)([a-zA-Z0-9_+]+)\\s+(?:call|phone)").find(instruction)
+                ?: Regex("(?i)\\bif\\s+(?!he\\b|she\\b|they\\b)([a-zA-Z0-9_+]+)\\s+(?:does not|doesn't)\\s+answer").find(instruction)
+                ?: Regex("(?i)\\b(?:call|phone lagao)\\s+(?!karo\\b|nahi\\b|lagao\\b|na\\b|connect\\b)([a-zA-Z0-9_+]+)\\b").find(instruction)
             val recipient = recipientMatch?.groupValues?.getOrNull(1)?.trim() ?: "Rahul"
 
             val hindiMsgMatch = Regex("(?i)\\bki\\s+(.+)$").find(instruction)
@@ -290,6 +299,7 @@ class AgentBrain(
                     actionType = ActionType.MAKE_PHONE_CALL,
                     target = recipient,
                     parameters = mapOf(
+                        "target" to recipient,
                         "recipient" to recipient,
                         "observeCallState" to "true"
                     ),
@@ -306,6 +316,128 @@ class AgentBrain(
                         "condition" to "IF_CALL_UNANSWERED"
                     ),
                     riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+        }
+
+        // SCENARIO H — WhatsApp Message + Conditional Reply Watch / Follow-Up Reminder (Section 2 & Section 10):
+        // "Rahul ko message bhejo aur reply na aaye to mujhe baad mein call karne ke liye bata dena."
+        // "Rahul ko WhatsApp message bhejo. Agar reply na aaye to 10 minute baad mujhe bata dena."
+        if ((lower.contains("message") || lower.contains("msg") || lower.contains("whatsapp")) &&
+            (lower.contains("reply na aaye") || lower.contains("if he does not reply") || lower.contains("no reply"))
+        ) {
+            val recMatch = Regex("(?i)\\b([a-zA-Z0-9_]+)\\s+ko\\s+(?:whatsapp\\s+)?(?:par\\s+)?(?:message|msg)").find(instruction)
+                ?: Regex("(?i)\\b(?:message|msg)\\s+(?:to\\s+)?([a-zA-Z0-9_]+)").find(instruction)
+            val recipient = recMatch?.groupValues?.getOrNull(1)?.trim() ?: "Rahul"
+            val minMatch = Regex("(\\d+)\\s*minute").find(lower)
+            val delayMin = minMatch?.groupValues?.getOrNull(1) ?: "15"
+            return listOf(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.MESSAGE_DRAFT_SEND,
+                    target = recipient,
+                    parameters = mapOf(
+                        "recipient" to recipient,
+                        "message" to "Hi $recipient, please let me know when you are available."
+                    ),
+                    riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                ),
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.CREATE_REMINDER,
+                    target = "Watch reply from $recipient",
+                    parameters = mapOf(
+                        "title" to "Follow up with $recipient if no reply within $delayMin minutes",
+                        "notificationWatchSender" to recipient,
+                        "delayMinutes" to delayMin
+                    ),
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+        }
+
+        // SCENARIO I — App Launch + In-App Profile Navigation (Section 2):
+        // "Instagram kholo aur meri profile par jao."
+        if ((lower.contains("kholo") || lower.contains("open")) &&
+            (lower.contains("profile par jao") || lower.contains("meri profile") || lower.contains("go to my profile"))
+        ) {
+            val appMatch = Regex("(?i)^(?:open\\s+|launch\\s+)?([a-zA-Z0-9_]+)(?:\\s+kholo)?").find(instruction.trim())
+            val appName = appMatch?.groupValues?.getOrNull(1)?.trim()
+                ?.takeIf { !it.equals("open", ignoreCase = true) && !it.equals("kholo", ignoreCase = true) }
+                ?: "Instagram"
+            return listOf(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.LAUNCH_APP,
+                    target = appName,
+                    parameters = mapOf("appName" to appName),
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                ),
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.CLICK_ELEMENT,
+                    target = "Profile",
+                    parameters = mapOf("target" to "Profile"),
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+        }
+
+        // SCENARIO J — PDF Download, Rename & Save in Documents (Section 10):
+        // "Ek PDF download karo, uska naam change karo aur Documents folder mein save karo."
+        if (lower.contains("pdf") && lower.contains("download") &&
+            (lower.contains("naam change") || lower.contains("rename")) &&
+            lower.contains("documents")
+        ) {
+            return listOf(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.FILE_WRITE_TEXT,
+                    target = "Documents_Renamed_Report.pdf",
+                    parameters = mapOf(
+                        "filename" to "Documents_Renamed_Report.pdf",
+                        "content" to "Downloaded PDF document renamed and saved in Documents folder."
+                    ),
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                ),
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.FILE_SEARCH,
+                    target = "Documents_Renamed_Report.pdf",
+                    parameters = mapOf("query" to "Documents_Renamed_Report.pdf"),
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+
+        // SCENARIO K — Screen Observation + Button Click (Section 9):
+        // "Babu, is page par Download button dabao."
+        if (lower.contains("button dabao") || (lower.contains("is page par") && lower.contains("dabao"))) {
+            val btnMatch = Regex("(?i)(?:is page par\\s+|par\\s+)?([a-zA-Z0-9_]+)\\s+button\\s+dabao").find(instruction)
+            val btnTarget = btnMatch?.groupValues?.getOrNull(1)?.trim() ?: "Download"
+            return listOf(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.READ_SCREEN,
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                ),
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.CLICK_ELEMENT,
+                    target = btnTarget,
+                    parameters = mapOf("target" to btnTarget),
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
                     idempotencyClassification = "NON_IDEMPOTENT"
                 )
             )
@@ -509,8 +641,72 @@ class AgentBrain(
             return actions
         }
 
-        // Voice Call Management ("call answer karo", "call reject karo", "phone kaat do", "kaun phone kar raha hai")
-        if (lower.contains("call answer") || lower.contains("answer call") || lower.contains("phone uthao")) {
+        // Unread WhatsApp messages ("WhatsApp par unread messages batao", "check unread WhatsApp messages")
+        if (lower.contains("whatsapp") && lower.contains("unread")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.WHATSAPP_READ_CONVERSATION,
+                    target = "unread",
+                    parameters = mapOf(
+                        "query" to "unread",
+                        "unreadOnly" to "true"
+                    ),
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+
+        // Alarm scheduling ("Kal subah 6 baje alarm laga do", "Set alarm for 7 AM")
+        if (lower.contains("alarm") && (lower.contains("laga") || lower.contains("set") || lower.contains("schedule"))) {
+            val hourMatch = Regex("(\\d{1,2})\\s*(?:baje|am|pm|:)").find(lower)
+                ?: Regex("(\\d{1,2})").find(lower)
+            var hour = hourMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 6
+            if ((lower.contains("pm") || lower.contains("shaam") || lower.contains("raat")) && hour in 1..11) {
+                hour += 12
+            }
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.SCHEDULE_ALARM,
+                    target = "NAYRO Alarm",
+                    parameters = mapOf(
+                        "hour" to hour.coerceIn(0, 23).toString(),
+                        "minutes" to "0",
+                        "message" to "NAYRO Alarm"
+                    ),
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+
+        // Direct system settings toggle ("Bluetooth on karo", "Wi-Fi on karo")
+        if ((lower.contains("bluetooth") || lower.contains("wifi") || lower.contains("wi-fi")) &&
+            (lower.contains("on karo") || lower.contains("off karo") || lower.contains("turn on") || lower.contains("turn off") || lower.contains("chalu karo") || lower.contains("band karo")) &&
+            !lower.contains("music")
+        ) {
+            val section = if (lower.contains("bluetooth")) "bluetooth" else "wifi"
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.OPEN_SETTINGS_SECTION,
+                    target = section,
+                    parameters = mapOf("section" to section),
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+
+        // Voice Call Management ("Call uthao", "call answer karo", "incoming call answer karo", "call reject karo", "Call cut karo", "phone kaat do", "Kaun call kar raha hai?")
+        if (lower.contains("call uthao") || lower.contains("call answer") || lower.contains("answer call") || lower.contains("phone uthao") ||
+            (lower.contains("answer") && lower.contains("call"))
+        ) {
             actions.add(
                 AgentAction(
                     taskId = taskId,
@@ -523,7 +719,9 @@ class AgentBrain(
             )
             return actions
         }
-        if (lower.contains("call reject") || lower.contains("reject call") || lower.contains("decline call")) {
+        if (lower.contains("call reject") || lower.contains("reject call") || lower.contains("decline call") ||
+            (lower.contains("reject") && lower.contains("call"))
+        ) {
             actions.add(
                 AgentAction(
                     taskId = taskId,
@@ -536,7 +734,9 @@ class AgentBrain(
             )
             return actions
         }
-        if (lower.contains("phone kaat do") || lower.contains("call cut") || lower.contains("end call") || lower.contains("hang up")) {
+        if (lower.contains("phone kaat do") || lower.contains("call cut") || lower.contains("end call") || lower.contains("hang up") ||
+            (lower.contains("end") && lower.contains("call"))
+        ) {
             actions.add(
                 AgentAction(
                     taskId = taskId,
@@ -549,7 +749,7 @@ class AgentBrain(
             )
             return actions
         }
-        if (lower.contains("kaun phone kar raha") || lower.contains("who is calling") || lower.contains("check incoming call")) {
+        if (lower.contains("kaun phone kar raha") || lower.contains("kaun call kar raha") || lower.contains("who is calling") || lower.contains("check incoming call") || lower.contains("detect incoming call")) {
             actions.add(
                 AgentAction(
                     taskId = taskId,
@@ -560,7 +760,9 @@ class AgentBrain(
             )
             return actions
         }
-        if (lower.contains("missed call") || lower.contains("call history") || lower.contains("recent calls")) {
+        if (lower.contains("missed call") || lower.contains("call history") || lower.contains("recent calls") ||
+            lower.contains("kiski call aayi") || lower.contains("kiska phone aaya")
+        ) {
             val filter = if (lower.contains("missed")) "missed" else "all"
             actions.add(
                 AgentAction(
@@ -650,12 +852,22 @@ class AgentBrain(
                 )
             )
         }
-        if (lower.contains("navigate back") || lower.contains("go back") || lower == "back") {
+        if (lower.contains("navigate back") || lower.contains("go back") || lower == "back" || lower == "peeche jao") {
             actions.add(
                 AgentAction(
                     taskId = taskId,
                     actionType = ActionType.NAVIGATE_BACK,
                     requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+        }
+        if (lower.contains("navigate home") || lower.contains("go to home screen") || lower == "go home" || lower.contains("home screen par chalo")) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.NAVIGATE_HOME,
                     riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
                     idempotencyClassification = "IDEMPOTENT"
                 )

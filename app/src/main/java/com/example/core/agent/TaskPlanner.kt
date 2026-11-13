@@ -208,6 +208,41 @@ object TaskPlanner {
                 )
             }
 
+            UserIntentType.SMS_SEND -> {
+                val targetRecipient = intent.recipient ?: "Contact"
+                val messageBody = intent.searchQueryOrContent ?: ""
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.SEND_SMS,
+                        target = targetRecipient,
+                        parameters = mapOf(
+                            "recipient" to targetRecipient,
+                            "message" to messageBody
+                        ),
+                        riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                        idempotencyClassification = "NON_IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.OPEN_DIALER -> {
+                val targetRecipient = intent.recipient ?: "Contact"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.OPEN_PHONE_DIALER,
+                        target = targetRecipient,
+                        parameters = mapOf(
+                            "target" to targetRecipient,
+                            "recipient" to targetRecipient
+                        ),
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
             UserIntentType.PHONE_CALL -> {
                 val targetRecipient = intent.recipient ?: "Contact"
                 actions.add(
@@ -215,7 +250,10 @@ object TaskPlanner {
                         taskId = taskId,
                         actionType = ActionType.MAKE_PHONE_CALL,
                         target = targetRecipient,
-                        parameters = mapOf("recipient" to targetRecipient),
+                        parameters = mapOf(
+                            "target" to targetRecipient,
+                            "recipient" to targetRecipient
+                        ),
                         riskLevel = RiskLevel.R3_EXTERNAL_COMMUNICATION,
                         idempotencyClassification = "NON_IDEMPOTENT"
                     )
@@ -335,6 +373,26 @@ object TaskPlanner {
                         actionType = ActionType.CALCULATE_LOCAL,
                         parameters = mapOf("expression" to (intent.searchQueryOrContent ?: "")),
                         riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
+            UserIntentType.MEDIA_CONTROL -> {
+                val op = intent.section ?: "PLAY_QUERY"
+                val query = intent.searchQueryOrContent ?: ""
+                val app = intent.targetAppOrEntity ?: "com.google.android.youtube"
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.CONTROL_MEDIA,
+                        target = query.ifBlank { op },
+                        parameters = mapOf(
+                            "operation" to op,
+                            "query" to query,
+                            "app" to app
+                        ),
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
                         idempotencyClassification = "IDEMPOTENT"
                     )
                 )

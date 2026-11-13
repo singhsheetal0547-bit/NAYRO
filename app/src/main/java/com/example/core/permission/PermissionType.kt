@@ -78,5 +78,35 @@ enum class PermissionType(
         title = "MediaProjection Screen Capture",
         description = "Optional on-demand consent for capturing screen snapshots on devices without Accessibility screenshot support.",
         isSpecial = true
+    ),
+    CALL_PHONE(
+        title = "Place Phone Calls",
+        description = "Required to initiate actual outgoing phone calls via ACTION_CALL after your confirmation.",
+        isSpecial = false,
+        androidPermission = android.Manifest.permission.CALL_PHONE
+    ),
+    ANSWER_PHONE_CALLS(
+        title = "Answer & End Phone Calls",
+        description = "Required on Android 8.0+ (API 26+) to answer or end calls programmatically via TelecomManager.",
+        isSpecial = false,
+        androidPermission = android.Manifest.permission.ANSWER_PHONE_CALLS
+    ),
+    READ_CALL_LOG(
+        title = "Read Call History",
+        description = "Permits reading incoming, outgoing, and missed call records when Call Log access is allowed.",
+        isSpecial = false,
+        androidPermission = android.Manifest.permission.READ_CALL_LOG
+    ),
+    SEND_SMS(
+        title = "Send SMS Messages",
+        description = "Permits transmitting SMS messages directly via Android SmsManager after your explicit confirmation.",
+        isSpecial = false,
+        androidPermission = android.Manifest.permission.SEND_SMS
+    ),
+    READ_SMS(
+        title = "Read SMS Inbox",
+        description = "Permits reading SMS inbox messages, unread texts, OTP codes, and bank alerts via Telephony.Sms.",
+        isSpecial = false,
+        androidPermission = android.Manifest.permission.READ_SMS
     )
 }

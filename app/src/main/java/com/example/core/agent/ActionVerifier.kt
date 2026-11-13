@@ -327,6 +327,7 @@ class ActionVerifier(
             ActionType.READ_CALL_HISTORY,
             ActionType.RESOLVE_CONTACT,
             ActionType.SAVE_CONTACT,
+            ActionType.OPEN_PHONE_DIALER,
             ActionType.MAKE_PHONE_CALL,
             ActionType.SEND_SMS,
             ActionType.READ_SMS,
@@ -341,7 +342,9 @@ class ActionVerifier(
             ActionType.UPDATE_CALENDAR_EVENT,
             ActionType.DELETE_CALENDAR_EVENT,
             ActionType.WHATSAPP_READ_CONVERSATION,
-            ActionType.MESSAGE_DRAFT_SEND -> {
+            ActionType.MESSAGE_DRAFT_SEND,
+            ActionType.NAVIGATE_HOME,
+            ActionType.CONTROL_MEDIA -> {
                 if (executionResult.status == VerificationStatus.VERIFIED && executionResult.outputMessage.isNotBlank()) {
                     VerificationResult(
                         status = VerificationStatus.VERIFIED,

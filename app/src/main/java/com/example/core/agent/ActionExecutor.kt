@@ -75,7 +75,7 @@ class ActionExecutor(
     private val workspaceManager: WorkspaceManager = WorkspaceManager(context),
     private val skillManager: SkillManager = SkillManager(),
     private val subAgentManager: SubAgentManager = SubAgentManager(),
-    private val callIntelligenceManager: CallIntelligenceManager = CallIntelligenceManager(context),
+    val callIntelligenceManager: CallIntelligenceManager = CallIntelligenceManager(context),
     private val workflowEngine: CrossAppWorkflowEngine = CrossAppWorkflowEngine(),
     val calendarManager: CalendarIntegrationManager = CalendarIntegrationManager(context),
     val whatsAppManager: WhatsAppAutomationManager = WhatsAppAutomationManager(
@@ -87,6 +87,11 @@ class ActionExecutor(
     val smsManager: com.example.core.telephony.SmsIntelligenceManager = com.example.core.telephony.SmsIntelligenceManager(
         context,
         callIntelligenceManager
+    ),
+    val mediaControlManager: com.example.core.media.MediaControlManager = com.example.core.media.MediaControlManager(
+        context,
+        screenIntelligenceManager,
+        memoryManager
     )
 ) {
 
@@ -378,6 +383,41 @@ class ActionExecutor(
                 }
             }
 
+            ActionType.NAVIGATE_HOME -> {
+                val homeViaAcc = AccessibilityActionController.performGlobalHome()
+                if (homeViaAcc) {
+                    ActionExecutionResult(true, "Navigated to Android Home screen via AccessibilityService.", VerificationStatus.VERIFIED)
+                } else {
+                    try {
+                        val homeIntent = Intent(Intent.ACTION_MAIN).apply {
+                            addCategory(Intent.CATEGORY_HOME)
+                            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                        }
+                        context.startActivity(homeIntent)
+                        ActionExecutionResult(true, "Navigated to Android Home screen.", VerificationStatus.VERIFIED)
+                    } catch (e: Exception) {
+                        ActionExecutionResult(false, "Failed to navigate to Home screen: ${e.localizedMessage}", VerificationStatus.FAILED)
+                    }
+                }
+            }
+
+            ActionType.CONTROL_MEDIA -> {
+                val op = action.parameters["operation"] ?: action.target ?: "PLAY_QUERY"
+                val query = action.parameters["query"] ?: action.target
+                val artist = action.parameters["artist"]
+                val genre = action.parameters["genre"] ?: action.parameters["mood"]
+                val app = action.parameters["app"]
+                val memories = memoryManager.getCachedMemories()
+                mediaControlManager.executeMediaCommand(
+                    operationStr = op,
+                    query = query,
+                    artist = artist,
+                    genreOrMood = genre,
+                    targetApp = app,
+                    savedMemories = memories
+                )
+            }
+
             ActionType.TAKE_SCREENSHOT -> {
                 // BUG 09 Fix: Real AccessibilityService.takeScreenshot on Android 11+ (API 30+)
                 val service = NayroAccessibilityService.instance
@@ -479,111 +519,19 @@ class ActionExecutor(
                 }
             }
 
+            ActionType.OPEN_PHONE_DIALER -> {
+                val rawTarget = (action.target ?: action.parameters["target"] ?: action.parameters["number"])?.trim().orEmpty()
+                callIntelligenceManager.openPhoneDialer(rawTarget = rawTarget)
+            }
+
             ActionType.MAKE_PHONE_CALL -> {
                 val rawTarget = (action.target ?: action.parameters["target"] ?: action.parameters["number"])?.trim().orEmpty()
-                if (rawTarget.isEmpty()) {
-                    return ActionExecutionResult(false, "Cannot place call: target contact or phone number is missing.", VerificationStatus.FAILED)
-                }
-                if (!isConfirmed) {
-                    return ActionExecutionResult(
-                        false,
-                        "User confirmation is required before dialing '$rawTarget'.",
-                        VerificationStatus.REQUIRES_CONFIRMATION
-                    )
-                }
-
-                val isDirectDigits = rawTarget.any { it.isDigit() } && rawTarget.none { it.isLetter() }
-                val phoneToDial = if (isDirectDigits) {
-                    rawTarget
-                } else {
-                    when (val res = callIntelligenceManager.resolveContactsByName(rawTarget)) {
-                        is ContactResolutionResult.SingleMatch -> res.contact.phoneNumber
-                        is ContactResolutionResult.Ambiguous -> {
-                            return ActionExecutionResult(
-                                false,
-                                "Ambiguous contact '$rawTarget': multiple matches found. Please specify phone number.",
-                                VerificationStatus.FAILED
-                            )
-                        }
-                        is ContactResolutionResult.PermissionRequired -> {
-                            return ActionExecutionResult(
-                                false,
-                                "Permission required: READ_CONTACTS is needed to resolve '$rawTarget'.",
-                                VerificationStatus.REQUIRES_PERMISSION
-                            )
-                        }
-                        is ContactResolutionResult.NotFound -> {
-                            return ActionExecutionResult(
-                                false,
-                                "Contact '$rawTarget' not found in device contacts.",
-                                VerificationStatus.FAILED
-                            )
-                        }
-                    }
-                }
-
-                CallIntelligenceManager.lastDialedRecipient = rawTarget
-                callIntelligenceManager.testOverrideLastOutgoingCallAnswered?.let { answeredOverride ->
-                    CallIntelligenceManager.lastOutgoingCallAnswered = answeredOverride
-                    val stateNote = if (answeredOverride) {
-                        "Call to $rawTarget ($phoneToDial) was answered [CALL_ANSWERED=true]."
-                    } else {
-                        "Call to $rawTarget ($phoneToDial) was not answered [CALL_ANSWERED=false]."
-                    }
-                    return ActionExecutionResult(
-                        true,
-                        stateNote,
-                        VerificationStatus.VERIFIED
-                    )
-                }
-
-                val hasCallPhonePermission = try {
-                    ContextCompat.checkSelfPermission(
-                        context,
-                        Manifest.permission.CALL_PHONE
-                    ) == PackageManager.PERMISSION_GRANTED
-                } catch (_: Exception) {
-                    false
-                }
-
-                try {
-                    val callAction = if (hasCallPhonePermission && action.parameters["directCall"] == "true") {
-                        Intent.ACTION_CALL
-                    } else {
-                        Intent.ACTION_DIAL
-                    }
-                    val dialIntent = Intent(callAction, Uri.parse("tel:${Uri.encode(phoneToDial)}")).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    context.startActivity(dialIntent)
-                    val observeState = action.parameters["observeCallState"] == "true"
-                    val observedAnswered = if (observeState) {
-                        val snapshot = callIntelligenceManager.queryActiveCallState(phoneToDial)
-                        snapshot.isOffhook
-                    } else {
-                        false
-                    }
-                    CallIntelligenceManager.lastOutgoingCallAnswered = observedAnswered
-                    val obsSuffix = if (observeState) {
-                        if (observedAnswered) " [CALL_ANSWERED=true]" else " [CALL_ANSWERED=false]"
-                    } else ""
-                    val msg = if (callAction == Intent.ACTION_CALL) {
-                        "Placed phone call to $rawTarget ($phoneToDial).$obsSuffix"
-                    } else {
-                        "Opened phone dialer for $rawTarget ($phoneToDial). Tap Call in the dialer to place the call.$obsSuffix"
-                    }
-                    ActionExecutionResult(
-                        true,
-                        msg,
-                        VerificationStatus.VERIFIED
-                    )
-                } catch (e: Exception) {
-                    ActionExecutionResult(
-                        false,
-                        "Failed to open phone dialer for '$rawTarget': ${e.localizedMessage}",
-                        VerificationStatus.FAILED
-                    )
-                }
+                val observeState = action.parameters["observeCallState"] != "false"
+                callIntelligenceManager.initiateOutgoingCall(
+                    rawTarget = rawTarget,
+                    isConfirmed = isConfirmed,
+                    observeCallState = observeState
+                )
             }
 
             ActionType.READ_NOTIFICATIONS -> {
@@ -1057,6 +1005,9 @@ class ActionExecutor(
 
             ActionType.WHATSAPP_READ_CONVERSATION -> {
                 val query = (action.target ?: action.parameters["query"] ?: action.parameters["contact"] ?: "WhatsApp").trim()
+                if (action.parameters["unreadOnly"] == "true" || query.equals("unread", ignoreCase = true)) {
+                    return whatsAppManager.getUnreadWhatsAppMessagesSummary()
+                }
                 val baseRes = whatsAppManager.readOrSearchWhatsAppConversation(query)
                 if (action.parameters["analyzeReplyPriority"] == "true" && baseRes.isSuccess) {
                     val text = baseRes.outputMessage
@@ -1238,69 +1189,13 @@ class ActionExecutor(
             ActionType.SEND_SMS -> {
                 val rawRecipient = (action.target ?: action.parameters["recipient"])?.trim().orEmpty()
                 val message = (action.parameters["message"] ?: action.parameters["draft"])?.trim().orEmpty()
-                if (rawRecipient.isEmpty() || message.isEmpty()) {
-                    return ActionExecutionResult(
-                        false,
-                        "Cannot send SMS: recipient and message text are both required.",
-                        VerificationStatus.FAILED
-                    )
-                }
-                if (!isConfirmed) {
-                    return ActionExecutionResult(
-                        false,
-                        "Confirmation required before composing SMS to '$rawRecipient': \"$message\"",
-                        VerificationStatus.REQUIRES_CONFIRMATION
-                    )
-                }
-
-                val isDirectDigits = rawRecipient.any { it.isDigit() } && rawRecipient.none { it.isLetter() }
-                val phoneToSms = if (isDirectDigits) {
-                    rawRecipient
-                } else {
-                    when (val res = callIntelligenceManager.resolveContactsByName(rawRecipient)) {
-                        is ContactResolutionResult.SingleMatch -> res.contact.phoneNumber
-                        is ContactResolutionResult.Ambiguous -> {
-                            return ActionExecutionResult(
-                                false,
-                                "Ambiguous SMS recipient '$rawRecipient': multiple contacts matched.",
-                                VerificationStatus.FAILED
-                            )
-                        }
-                        is ContactResolutionResult.PermissionRequired -> {
-                            return ActionExecutionResult(
-                                false,
-                                "Permission required: READ_CONTACTS is needed to resolve '$rawRecipient'.",
-                                VerificationStatus.REQUIRES_PERMISSION
-                            )
-                        }
-                        is ContactResolutionResult.NotFound -> {
-                            return ActionExecutionResult(
-                                false,
-                                "Contact '$rawRecipient' was not found in device contacts.",
-                                VerificationStatus.FAILED
-                            )
-                        }
-                    }
-                }
-
-                return try {
-                    val smsIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(phoneToSms)}")).apply {
-                        putExtra("sms_body", message)
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                    context.startActivity(smsIntent)
-                    ActionExecutionResult(
-                        true,
-                        "Opened SMS composer for $rawRecipient ($phoneToSms) with message '$message'. Please tap Send in your SMS app to complete network transmission.",
-                        VerificationStatus.VERIFIED
-                    )
-                } catch (e: Exception) {
-                    ActionExecutionResult(
-                        false,
-                        "Failed to open SMS composer for '$rawRecipient': ${e.localizedMessage}",
-                        VerificationStatus.FAILED
-                    )
-                }
+                val allowComposerFallback = action.parameters["allowComposerFallback"] == "true"
+                smsManager.sendSmsMessage(
+                    rawRecipient = rawRecipient,
+                    messageBody = message,
+                    isConfirmed = isConfirmed,
+                    allowComposerFallbackWhenRestricted = allowComposerFallback
+                )
             }
 
             ActionType.SUMMARIZE_NOTIFICATIONS -> {
@@ -1560,6 +1455,16 @@ class ActionExecutor(
                     VerificationStatus.VERIFIED
                 )
             }
+            val callWasInitiated = prevOut.contains("[CALL_INITIATED=true]") ||
+                prevOut.contains("[CALL_ANSWERED=false]") ||
+                CallIntelligenceManager.lastOutgoingCallInitiated
+            if (!callWasInitiated) {
+                return ActionExecutionResult(
+                    false,
+                    "Skipped fallback WhatsApp message to $rawRecipient because the preceding phone call was not initiated.",
+                    VerificationStatus.FAILED
+                )
+            }
         }
         val explicitMessage = (action.parameters["message"] ?: action.parameters["draft"])?.trim().orEmpty()
         val message = if (explicitMessage.isNotEmpty() && explicitMessage != "{{PREVIOUS_STEP_OUTPUT}}") {
@@ -1575,7 +1480,8 @@ class ActionExecutor(
         return whatsAppManager.sendOrDraftMessage(
             rawRecipientSpec = rawRecipient,
             messageText = message,
-            isConfirmed = isConfirmed
+            isConfirmed = isConfirmed,
+            attachmentInfo = action.parameters["attachment"]
         )
     }
 

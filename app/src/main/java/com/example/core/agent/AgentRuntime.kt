@@ -122,6 +122,14 @@ class AgentRuntime(
     @Volatile
     private var lastDispatchedAtMs: Long = 0L
 
+    @Volatile
+    var pendingPermissionBlockedTask: AgentTask? = null
+        private set
+
+    @Volatile
+    var pendingRequiredPermission: String? = null
+        private set
+
     fun recordHeartbeat() {
         lastHeartbeatTimestampMs = System.currentTimeMillis()
     }
@@ -152,6 +160,59 @@ class AgentRuntime(
         }
     }
 
+    /**
+     * Section 12 — Permission Intelligence & Automatic Task Resume:
+     * Records a task paused due to a missing Android permission/capability so it can be automatically
+     * resumed as soon as the permission is granted.
+     */
+    fun recordPermissionBlockedTask(task: AgentTask, permissionOrCapability: String) {
+        pendingPermissionBlockedTask = task
+        pendingRequiredPermission = permissionOrCapability
+    }
+
+    /**
+     * Section 12 — Automatically resumes the pending permission-blocked task when the required
+     * permission is granted, or transitions it cleanly to `BLOCKED_BY_ANDROID` if denied.
+     */
+    suspend fun onPermissionDecision(
+        permission: String,
+        granted: Boolean,
+        customExecutor: (suspend (AgentTask) -> AgentExecutionSummary)? = null
+    ): AgentExecutionSummary? {
+        val blockedTask = pendingPermissionBlockedTask ?: return null
+        if (!granted) {
+            pendingPermissionBlockedTask = null
+            pendingRequiredPermission = null
+            val reason = "Permission '$permission' was denied by user. Task '${blockedTask.userInstruction}' cannot proceed without '$permission'."
+            stateManager.transition(blockedTask, TaskState.BLOCKED_BY_ANDROID, reason)
+            _currentState.value = AgentState.Error(reason)
+            return AgentExecutionSummary(
+                task = blockedTask,
+                isSuccess = false,
+                message = reason,
+                verificationStatus = VerificationStatus.REQUIRES_PERMISSION
+            )
+        }
+        return resumePendingTaskAfterPermissionGrant(customExecutor)
+    }
+
+    /**
+     * Resumes the pending permission-blocked task from its checkpoint without repeating already
+     * completed non-idempotent side-effect steps.
+     */
+    suspend fun resumePendingTaskAfterPermissionGrant(
+        customExecutor: (suspend (AgentTask) -> AgentExecutionSummary)? = null
+    ): AgentExecutionSummary? {
+        val blockedTask = pendingPermissionBlockedTask ?: return null
+        pendingPermissionBlockedTask = null
+        pendingRequiredPermission = null
+        stateManager.transition(blockedTask, TaskState.READY, "Permission granted; automatically resuming task.")
+        if (customExecutor != null) {
+            return customExecutor(blockedTask)
+        }
+        return executePlannedTask(blockedTask, blockedTask.userInstruction)
+    }
+
     fun hasSideEffectAlreadyExecuted(taskId: String, actionId: String): Boolean {
         return completedSideEffectSignatures.contains("$taskId:$actionId")
     }
@@ -163,6 +224,8 @@ class AgentRuntime(
     fun cancelCurrentTask() {
         isTaskCancelled = true
         isTaskPaused = false
+        pendingPermissionBlockedTask = null
+        pendingRequiredPermission = null
         agentBrain.cancelActiveLoop()
         workflowEngine.cancelAllActiveWorkflows()
         confirmationManager.clear()
@@ -252,6 +315,27 @@ class AgentRuntime(
 
         isTaskCancelled = false
         _currentState.value = AgentState.Thinking
+
+        // Handle pure wake greeting ("Hi Babu", "Hey Babu", "Hello Babu", "Hi Nayro") in continuous voice/chat mode
+        val normalizedGreeting = trimmedPrompt.lowercase().removeSuffix(".").removeSuffix("!").trim()
+        if (normalizedGreeting in setOf("hi babu", "hey babu", "hello babu", "babu", "hi nayro", "hey nayro", "hey cutie")) {
+            val greetingReply = "Haan, bolo! Main sun raha hoon."
+            val greetingTask = AgentTask(
+                userInstruction = userPrompt,
+                resolvedIntent = "WAKE_GREETING",
+                actions = emptyList(),
+                state = TaskState.COMPLETED,
+                finalResult = greetingReply
+            )
+            _currentTask.value = greetingTask
+            _currentState.value = AgentState.Idle
+            return AgentExecutionSummary(
+                task = greetingTask,
+                isSuccess = true,
+                message = greetingReply,
+                verificationStatus = VerificationStatus.VERIFIED
+            )
+        }
 
         // 0. Resolve pronouns ("him", "usko", "that file") and check multi-turn continuation (Part 9)
         val resolvedPrompt = continuityManager.resolveReferencesInPrompt(userPrompt)
@@ -387,6 +471,18 @@ class AgentRuntime(
             }
         }
 
+        return executePlannedTask(task, resolvedPrompt)
+    }
+
+    /**
+     * Executes a planned [AgentTask] through validation, step execution, verification, and audit logging.
+     * Supports automatic resume from `WAITING_FOR_PERMISSION` checkpoints without re-executing completed
+     * `NON_IDEMPOTENT` side-effect actions.
+     */
+    suspend fun executePlannedTask(
+        task: AgentTask,
+        resolvedPrompt: String = task.userInstruction
+    ): AgentExecutionSummary {
         continuityManager.recordEntityContext(executedInstruction = resolvedPrompt)
         _currentTask.value = task
         AgentEventBus.emit(AgentEvent.TaskCreated(task))
@@ -399,6 +495,7 @@ class AgentRuntime(
         stateManager.transition(task, TaskState.VALIDATING)
         when (val validation = planValidator.validatePlan(task)) {
             is ValidationResult.MissingCapability -> {
+                recordPermissionBlockedTask(task, validation.capabilityId.name)
                 stateManager.transition(task, TaskState.WAITING_FOR_PERMISSION, validation.reason)
                 _currentState.value = AgentState.WaitingForPermission(validation.capabilityId.name, validation.reason)
                 logAndPersistTask(task, "Blocked: ${validation.reason}")
@@ -410,6 +507,7 @@ class AgentRuntime(
                 )
             }
             is ValidationResult.MissingPermission -> {
+                recordPermissionBlockedTask(task, validation.permission)
                 stateManager.transition(task, TaskState.WAITING_FOR_PERMISSION, validation.reason)
                 _currentState.value = AgentState.WaitingForPermission(validation.permission, validation.reason)
                 logAndPersistTask(task, "Blocked: ${validation.reason}")
@@ -527,18 +625,25 @@ class AgentRuntime(
                 action.actionType == ActionType.ASK_USER_CONFIRMATION
             ) {
                 stateManager.transition(task, TaskState.WAITING_FOR_CONFIRMATION)
-                val recipient = action.target ?: action.parameters["recipient"] ?: "Recipient"
-                val draft = action.parameters["draft"] ?: action.parameters["message"] ?: action.parameters["text"] ?: ""
+                val rawTarget = (action.target ?: action.parameters["recipient"] ?: action.parameters["number"]).orEmpty().trim()
+                val isDirectDigits = rawTarget.any { it.isDigit() } && rawTarget.none { it.isLetter() }
+                var resolvedName: String? = null
+                var resolvedPhone: String? = if (isDirectDigits) rawTarget else null
+                if (!isDirectDigits && rawTarget.isNotBlank()) {
+                    val match = callIntelligenceManager.resolveContactsByName(rawTarget)
+                    if (match is com.example.core.telephony.ContactResolutionResult.SingleMatch) {
+                        resolvedName = match.contact.displayName
+                        resolvedPhone = match.contact.phoneNumber
+                    }
+                } else if (isDirectDigits && rawTarget.isNotBlank()) {
+                    resolvedName = callIntelligenceManager.resolveContactByPhoneNumber(rawTarget)
+                }
 
-                val pendingConf = PendingConfirmation(
+                val pendingConf = ConfirmationSchemaBuilder.buildConfirmationFromAction(
                     taskId = task.taskId,
-                    actionId = action.actionId,
-                    actionType = action.actionType,
-                    title = "Confirm ${action.actionType.name}",
-                    description = "Recipient: $recipient\nMessage Draft: \"$draft\"\n\nNAYRO requires your explicit approval before proceeding.",
-                    target = action.target,
-                    parameters = action.parameters,
-                    riskLevel = action.riskLevel
+                    action = action,
+                    resolvedContactName = resolvedName,
+                    resolvedPhoneNumber = resolvedPhone
                 )
                 _currentState.value = AgentState.WaitingForConfirmation(pendingConf)
 
@@ -575,11 +680,24 @@ class AgentRuntime(
                 }
             }
 
-            // Runtime Guard Validation
+            // Runtime Guard Validation — Revalidate real capability and permission status immediately prior to step execution (Phase 2)
+            val realCapabilityAvailable = when (action.requiredCapability) {
+                com.example.core.capability.CapabilityId.ACCESSIBILITY -> {
+                    val accState = com.example.core.accessibility.AccessibilityConnectionManager.checkStatus(context)
+                    accState == com.example.core.accessibility.AccessibilityConnectionState.OPERATIONAL ||
+                        accState == com.example.core.accessibility.AccessibilityConnectionState.CONNECTED ||
+                        com.example.core.accessibility.NayroAccessibilityService.isConnected()
+                }
+                else -> true
+            }
+            val realPermissionGranted = action.requiredPermission?.let { perm ->
+                permissionManager.isPermissionGranted(perm)
+            } ?: true
+
             val guardCheck = ActionExecutionGuard.validateExecution(
                 action = action,
-                isCapabilityAvailable = true,
-                isPermissionGranted = true,
+                isCapabilityAvailable = realCapabilityAvailable,
+                isPermissionGranted = realPermissionGranted,
                 confirmation = activeConfirmation
             )
             if (guardCheck is GuardEvaluation.Blocked) {
@@ -718,9 +836,11 @@ class AgentRuntime(
                 }
 
                 VerificationStatus.REQUIRES_PERMISSION -> {
+                    val reqPerm = action.requiredPermission ?: "ANDROID_PERMISSION"
+                    recordPermissionBlockedTask(task, reqPerm)
                     stateManager.transition(task, TaskState.WAITING_FOR_PERMISSION, verification.details)
                     _currentState.value = AgentState.WaitingForPermission(
-                        action.requiredPermission ?: "ANDROID_PERMISSION",
+                        reqPerm,
                         verification.details
                     )
                     logAndPersistTask(task, verification.details, completedStepIds, stepContext)

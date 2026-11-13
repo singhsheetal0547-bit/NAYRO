@@ -74,29 +74,44 @@ fun ConfirmationDialog(
 
                 Spacer(modifier = Modifier.height(10.dp))
 
-                Text(
-                    text = confirmation.description,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                if (confirmation.parameters.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(8.dp))
+                val schemaFields = confirmation.getSchemaDisplayFields()
+                if (schemaFields.isNotEmpty()) {
                     Card(
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
                         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            confirmation.parameters.forEach { (key, value) ->
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            schemaFields.forEachIndexed { index, (label, value) ->
                                 Text(
-                                    text = "$key: $value",
-                                    style = MaterialTheme.typography.bodySmall,
+                                    text = label,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = value,
+                                    style = MaterialTheme.typography.bodyMedium,
                                     color = MaterialTheme.colorScheme.onSurface
                                 )
+                                if (index < schemaFields.lastIndex) {
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                }
                             }
                         }
                     }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = "NAYRO requires your explicit approval before executing this action.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Text(
+                        text = confirmation.description,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
             }
         },

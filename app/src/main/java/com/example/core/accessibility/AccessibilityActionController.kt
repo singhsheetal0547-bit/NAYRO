@@ -104,6 +104,28 @@ object AccessibilityActionController {
         return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
     }
 
+    fun performGlobalHome(): Boolean {
+        val service = NayroAccessibilityService.instance ?: return false
+        return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+    }
+
+    fun performGlobalRecents(): Boolean {
+        val service = NayroAccessibilityService.instance ?: return false
+        return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
+    }
+
+    /**
+     * Phase 5 — Detects and dismisses an unexpected modal dialog ("Cancel", "Not now", "Dismiss", "Close", or Back).
+     */
+    fun dismissDialogIfPresent(): Boolean {
+        for (dismissLabel in listOf("Not now", "Dismiss", "Close", "Cancel", "Later", "No thanks")) {
+            if (performClick(targetText = dismissLabel)) {
+                return true
+            }
+        }
+        return performGlobalBack()
+    }
+
     /**
      * Section 6 — Semantic-first click with coordinate-tap fallback when `ACTION_CLICK` returns false
      * or when a matching visible label is rendered inside a custom non-clickable container.
