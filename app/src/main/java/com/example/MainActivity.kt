@@ -90,6 +90,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private var pendingStartListeningAfterMicGrant: Boolean = false
+
     // Phase 4 — Targeted Single Permission Request Launcher:
     // Directly notifies AgentRuntime.onPermissionDecision(permission, isGranted) and persists the decision
     // across process recreation. Strictly avoids calling refreshAllPermissions(), refreshReport(), or evaluateAll().
@@ -102,6 +104,14 @@ class MainActivity : ComponentActivity() {
             ?: "ANDROID_PERMISSION"
         if (::permissionManager.isInitialized) {
             permissionManager.evaluateSinglePermissionTargeted(permStr, this)
+        }
+        if (permStr == android.Manifest.permission.RECORD_AUDIO && isGranted && pendingStartListeningAfterMicGrant) {
+            pendingStartListeningAfterMicGrant = false
+            if (::voiceManager.isInitialized) {
+                voiceManager.startListening()
+            }
+        } else if (permStr == android.Manifest.permission.RECORD_AUDIO) {
+            pendingStartListeningAfterMicGrant = false
         }
         if (::agentRuntime.isInitialized) {
             agentRuntime.persistPendingPermissionDecision(permStr, isGranted)
@@ -172,6 +182,25 @@ class MainActivity : ComponentActivity() {
                                 permissionManager.markRuntimePermissionRequested(permStr)
                                 requestSinglePermissionLauncher.launch(permStr)
                             }
+                        }
+                    },
+                    onRequestMicAndListen = {
+                        val micPerm = android.Manifest.permission.RECORD_AUDIO
+                        if (permissionManager.isPermissionGranted(micPerm)) {
+                            voiceManager.startListening()
+                        } else {
+                            pendingStartListeningAfterMicGrant = true
+                            lastRequestedPermissionString = micPerm
+                            permissionManager.markRuntimePermissionRequested(micPerm)
+                            requestSinglePermissionLauncher.launch(micPerm)
+                        }
+                    },
+                    onMicrophonePermissionResult = { granted ->
+                        val micPerm = android.Manifest.permission.RECORD_AUDIO
+                        permissionManager.evaluateSinglePermissionTargeted(micPerm, this)
+                        agentRuntime.persistPendingPermissionDecision(micPerm, granted)
+                        lifecycleScope.launch {
+                            agentRuntime.onPermissionDecision(micPerm, granted)
                         }
                     },
                     onOpenPermissionSettings = { type ->
@@ -256,6 +285,8 @@ fun NayroAppContent(
     initialPendingPrompt: String?,
     onClearPendingPrompt: () -> Unit,
     onRequestRuntimePermission: (PermissionType) -> Unit,
+    onRequestMicAndListen: () -> Unit,
+    onMicrophonePermissionResult: (Boolean) -> Unit,
     onOpenPermissionSettings: (PermissionType) -> Unit,
     onRefreshPermissions: () -> Unit,
     onStartForegroundService: () -> Unit,
@@ -286,14 +317,22 @@ fun NayroAppContent(
     val voiceConfig by voiceManager.configuration.collectAsState()
     val voiceState by voiceManager.voiceState.collectAsState()
     val transcribedText by voiceManager.transcribedText.collectAsState()
+    val partialTranscript by voiceManager.partialTranscript.collectAsState()
+    val voiceError by voiceManager.errorMessage.collectAsState()
     val audioLevel by voiceManager.normalizedAudioLevel.collectAsState()
+    val isSpeechRecognitionAvailable = remember(voiceManager) {
+        voiceManager.speechRecognitionProvider.isRecognitionAvailable()
+    }
+    var micPermissionGranted by remember(evaluations) {
+        mutableStateOf(permissionManager.isMicrophoneGranted())
+    }
 
     val foregroundStatus by ServiceStateRepository.foregroundServiceStatus.collectAsState()
     val floatingStatus by ServiceStateRepository.floatingServiceStatus.collectAsState()
 
     // Unified dispatch function: executes user request through AgentRuntime orchestration
     fun processUserPrompt(promptText: String) {
-        val text = promptText.trim()
+        val text = voiceManager.normalizeVoiceInvocationCommand(promptText)
         if (text.isEmpty()) return
 
         coroutineScope.launch {
@@ -319,7 +358,7 @@ fun NayroAppContent(
             voiceManager.stopListening()
         } else {
             if (!permissionManager.isMicrophoneGranted()) {
-                onRequestRuntimePermission(PermissionType.MICROPHONE)
+                onRequestMicAndListen()
             } else {
                 voiceManager.startListening()
             }
@@ -414,7 +453,12 @@ fun NayroAppContent(
                         agentState = agentState,
                         voiceState = voiceState,
                         liveTranscript = transcribedText,
+                        partialTranscript = partialTranscript,
                         audioLevel = audioLevel,
+                        isMicrophoneGranted = micPermissionGranted,
+                        isSpeechRecognitionAvailable = isSpeechRecognitionAvailable,
+                        selectedLanguageTag = voiceConfig.languageTag,
+                        voiceError = voiceError,
                         currentTask = currentTask,
                         recentConversations = conversations,
                         isForegroundActive = foregroundStatus.state == ServiceLifecycleState.RUNNING,
@@ -422,6 +466,25 @@ fun NayroAppContent(
                         isAiReady = activeProvider != null,
                         onVoiceTap = {
                             handleVoiceToggle()
+                        },
+                        onStartListening = {
+                            voiceManager.startListening()
+                        },
+                        onStopListening = {
+                            voiceManager.stopListening()
+                        },
+                        onStopSpeaking = {
+                            voiceManager.stopSpeaking()
+                        },
+                        onMicrophonePermissionResult = { granted ->
+                            micPermissionGranted = granted
+                            onMicrophonePermissionResult(granted)
+                        },
+                        onLanguageSelected = { langTag ->
+                            voiceManager.setRecognitionLanguage(langTag)
+                        },
+                        onClearTranscript = {
+                            voiceManager.clearTranscriptAndError()
                         },
                         onSendText = { text ->
                             processUserPrompt(text)

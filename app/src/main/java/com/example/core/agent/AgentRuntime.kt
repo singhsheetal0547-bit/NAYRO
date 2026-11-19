@@ -38,7 +38,10 @@ data class AgentExecutionSummary(
     val isSuccess: Boolean,
     val message: String,
     val verificationStatus: VerificationStatus = VerificationStatus.VERIFIED
-)
+) {
+    val executionState: ActionExecutionState
+        get() = verificationStatus.toActionExecutionState()
+}
 
 typealias UnifiedAgentRuntime = AgentRuntime
 
@@ -108,7 +111,8 @@ class AgentRuntime(
     private val uncertainExternalActionSignatures = java.util.Collections.synchronizedSet(mutableSetOf<String>())
 
     @Volatile
-    var assistantName: String = "Babu"
+    var assistantName: String = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+        ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
         private set
 
     @Volatile
@@ -156,8 +160,9 @@ class AgentRuntime(
         private set
 
     fun setAssistantIdentity(newName: String) {
-        val clean = newName.trim().ifEmpty { "Babu" }
+        val clean = newName.trim().ifEmpty { com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME }
         assistantName = clean
+        com.example.core.identity.AssistantIdentityStore.sharedInstance?.updateDisplayName(clean, autoSyncWakePhrases = true)
     }
 
     fun recordHeartbeat() {
@@ -240,16 +245,37 @@ class AgentRuntime(
     }
 
     /**
-     * Targeted single-permission check (Phase 4).
+     * Targeted single-permission check (Fail-Closed).
      * Never calls PermissionManager.refreshAllPermissions(), permissionSetupManager.refreshReport(),
      * or capabilityManager.evaluateAll().
+     * Returns structured [PermissionManager.PermissionVerificationDetail] (GRANTED, DENIED, INCONCLUSIVE, UNAVAILABLE).
+     */
+    fun verifySinglePermissionDetailed(permission: String): PermissionManager.PermissionVerificationDetail {
+        val clean = permission.trim()
+        if (clean.isEmpty()) {
+            return PermissionManager.PermissionVerificationDetail(
+                permission = permission,
+                outcome = PermissionManager.PermissionCheckOutcome.UNAVAILABLE,
+                reason = "Permission name is blank or unavailable."
+            )
+        }
+        return try {
+            permissionManager.checkPermissionFailClosed(clean)
+        } catch (e: Exception) {
+            PermissionManager.PermissionVerificationDetail(
+                permission = clean,
+                outcome = PermissionManager.PermissionCheckOutcome.INCONCLUSIVE,
+                reason = "Fail-closed: targeted permission verification threw ${e.javaClass.simpleName}."
+            )
+        }
+    }
+
+    /**
+     * Targeted single-permission check (Phase 4, strictly FAIL-CLOSED).
+     * Never returns true when verification throws an exception or is inconclusive/unavailable.
      */
     fun verifySinglePermissionTargeted(permission: String): Boolean {
-        return try {
-            permissionManager.isPermissionGranted(permission)
-        } catch (_: Exception) {
-            true
-        }
+        return verifySinglePermissionDetailed(permission).isGranted
     }
 
     /**
@@ -792,13 +818,21 @@ class AgentRuntime(
         } catch (_: Exception) {}
 
         val resumeStartStepIndex = task.currentActionIndex.coerceAtLeast(0)
+        val actionQueue = ArrayDeque<AgentAction>(task.actions)
+        val executedHistory = mutableListOf<AgentAction>()
+        var dynamicStepIndex = 0
+        var replanCount = 0
 
-        for ((index, rawAction) in task.actions.withIndex()) {
+        while (actionQueue.isNotEmpty() && dynamicStepIndex < AgentBrain.MAX_ITERATIVE_STEPS) {
+            val rawAction = actionQueue.removeFirst()
+            val index = dynamicStepIndex
+            dynamicStepIndex++
+
             while (isTaskPaused && !isTaskCancelled) {
                 delay(150)
             }
             if (isTaskCancelled) {
-                stateManager.transition(task, TaskState.CANCELLED, "Cancelled during multi-step loop.")
+                stateManager.transition(task, TaskState.CANCELLED, "Cancelled during dynamic execution loop.")
                 logAndPersistTask(task, "Cancelled by user at step ${index + 1}.", completedStepIds, stepContext)
                 return AgentExecutionSummary(
                     task = task,
@@ -818,6 +852,20 @@ class AgentRuntime(
                 completedStepIds.add(rawAction.actionId)
                 stepOutputs.add(skipMsg)
                 continue
+            }
+
+            // Prevent repeated identical tool-call loops during dynamic replanning
+            if (agentBrain.hasRepeatedToolCallLoop(executedHistory, rawAction, maxConsecutiveRepeats = 2)) {
+                val loopReason = "Aborted repeated identical action (${rawAction.actionType.name}) to prevent an infinite execution loop."
+                stateManager.transition(task, TaskState.FAILED, loopReason)
+                _currentState.value = AgentState.Error(loopReason)
+                logAndPersistTask(task, loopReason, completedStepIds, stepContext)
+                return AgentExecutionSummary(
+                    task = task,
+                    isSuccess = false,
+                    message = loopReason,
+                    verificationStatus = VerificationStatus.FAILED
+                )
             }
 
             task.currentActionIndex = index
@@ -853,7 +901,7 @@ class AgentRuntime(
                     task = task,
                     isSuccess = false,
                     message = lockDecision.reason,
-                    verificationStatus = VerificationStatus.REQUIRES_CONFIRMATION
+                    verificationStatus = VerificationStatus.WAITING_FOR_UNLOCK
                 )
             }
 
@@ -862,7 +910,7 @@ class AgentRuntime(
             if (autonomyDecision is AutonomyDecision.DenyExecution) {
                 stateManager.transition(task, TaskState.FAILED, autonomyDecision.reason)
                 _currentState.value = AgentState.Error(autonomyDecision.reason)
-                logAndPersistTask(task, "Blocked by Autonomy Policy: ${autonomyDecision.reason}")
+                logAndPersistTask(task, "Blocked by Autonomy Policy: ${autonomyDecision.reason}", completedStepIds, stepContext)
                 return AgentExecutionSummary(
                     task = task,
                     isSuccess = false,
@@ -911,7 +959,7 @@ class AgentRuntime(
                         val reason = "Confirmation request expired after 60s. Action was not executed."
                         stateManager.transition(task, TaskState.TIMED_OUT, reason)
                         _currentState.value = AgentState.Cancelled(reason)
-                        logAndPersistTask(task, reason)
+                        logAndPersistTask(task, reason, completedStepIds, stepContext)
                         return AgentExecutionSummary(
                             task = task,
                             isSuccess = false,
@@ -923,7 +971,7 @@ class AgentRuntime(
                         val reason = "Action rejected or cancelled by user."
                         stateManager.transition(task, TaskState.CANCELLED, reason)
                         _currentState.value = AgentState.Cancelled(reason)
-                        logAndPersistTask(task, reason)
+                        logAndPersistTask(task, reason, completedStepIds, stepContext)
                         return AgentExecutionSummary(
                             task = task,
                             isSuccess = false,
@@ -934,10 +982,14 @@ class AgentRuntime(
                 }
             }
 
-            // Runtime Guard Validation — Revalidate real capability and permission status immediately prior to step execution (Phase 2)
+            // Runtime Guard Validation — Fail-Closed capability & targeted permission verification
             val realCapabilityAvailable = when (action.requiredCapability) {
                 com.example.core.capability.CapabilityId.ACCESSIBILITY -> {
-                    val accState = com.example.core.accessibility.AccessibilityConnectionManager.checkStatus(context)
+                    val accState = try {
+                        com.example.core.accessibility.AccessibilityConnectionManager.checkStatus(context)
+                    } catch (_: Exception) {
+                        com.example.core.accessibility.AccessibilityConnectionState.DISCONNECTED
+                    }
                     accState == com.example.core.accessibility.AccessibilityConnectionState.OPERATIONAL ||
                         accState == com.example.core.accessibility.AccessibilityConnectionState.CONNECTED ||
                         com.example.core.accessibility.NayroAccessibilityService.isConnected()
@@ -945,7 +997,7 @@ class AgentRuntime(
                 else -> true
             }
             val realPermissionGranted = action.requiredPermission?.let { perm ->
-                permissionManager.isPermissionGranted(perm)
+                verifySinglePermissionTargeted(perm)
             } ?: true
 
             val guardCheck = ActionExecutionGuard.validateExecution(
@@ -957,24 +1009,26 @@ class AgentRuntime(
             if (guardCheck is GuardEvaluation.Blocked) {
                 stateManager.transition(task, TaskState.FAILED, guardCheck.reason)
                 _currentState.value = AgentState.Error(guardCheck.reason)
-                logAndPersistTask(task, "Blocked by Guard: ${guardCheck.reason}")
+                logAndPersistTask(task, "Blocked by Guard: ${guardCheck.reason}", completedStepIds, stepContext)
                 return AgentExecutionSummary(
                     task = task,
                     isSuccess = false,
                     message = "Execution blocked for safety: ${guardCheck.reason}",
-                    verificationStatus = VerificationStatus.FAILED
+                    verificationStatus = if (!realPermissionGranted) VerificationStatus.REQUIRES_PERMISSION else VerificationStatus.FAILED
                 )
             }
 
             // Transition to EXECUTING
+            executedHistory.add(action)
+            val totalKnownSteps = index + 1 + actionQueue.size
             stateManager.transition(task, TaskState.EXECUTING)
             _currentState.value = AgentState.ExecutingTask(
                 task = task,
                 currentAction = action,
                 step = index + 1,
-                totalSteps = task.actions.size
+                totalSteps = totalKnownSteps
             )
-            AgentEventBus.emit(AgentEvent.ActionStarted(task.taskId, action, index + 1, task.actions.size))
+            AgentEventBus.emit(AgentEvent.ActionStarted(task.taskId, action, index + 1, totalKnownSteps))
 
             val preState = actionVerifier.capturePreState()
             val resolvedPkg = if (action.actionType == ActionType.LAUNCH_APP && action.target != null) {
@@ -983,7 +1037,7 @@ class AgentRuntime(
 
             val isConfirmedFlag = activeConfirmation?.status == ConfirmationStatus.CONFIRMED
 
-            var execResult = withTimeoutOrNull(action.timeoutMs) {
+            val execResult = withTimeoutOrNull(action.timeoutMs) {
                 com.example.core.agent.tools.CommandDispatcher.dispatch(action, actionExecutor, isConfirmed = isConfirmedFlag)
             } ?: ActionExecutionResult(
                 isSuccess = false,
@@ -991,58 +1045,26 @@ class AgentRuntime(
                 status = VerificationStatus.TIMED_OUT
             )
 
-            // Transition to VERIFYING
-            stateManager.transition(task, TaskState.VERIFYING)
+            // Transition to OBSERVING & VERIFYING
+            stateManager.transition(task, TaskState.OBSERVING)
             if (action.actionType == ActionType.LAUNCH_APP || action.actionType == ActionType.OPEN_SETTINGS_SECTION || action.actionType == ActionType.CLICK_ELEMENT) {
                 delay(350)
             }
 
-            var verification = actionVerifier.verifyAction(
+            val observedSnapshot = if (com.example.core.accessibility.NayroAccessibilityService.isConnected()) {
+                screenIntelligenceManager.captureCurrentSnapshot()
+            } else null
+            val observedSemantics = if (observedSnapshot != null) {
+                screenIntelligenceManager.analyzeScreenSemantics(observedSnapshot)
+            } else null
+
+            stateManager.transition(task, TaskState.VERIFYING)
+            val verification = actionVerifier.verifyAction(
                 action = action,
                 executionResult = execResult,
                 preStateSummary = preState,
                 resolvedTargetPackage = resolvedPkg
             )
-
-            // ARTEMIS-Inspired Observe -> Plan -> Act -> Verify -> Recover (Section 3A, 4, 13):
-            // If a step fails (e.g., off-screen CLICK_ELEMENT or missing filename), attempt bounded recovery replanning once.
-            if (verification.status == VerificationStatus.FAILED) {
-                val recoveryAction = agentBrain.replanFailedStep(action, verification.details)
-                if (recoveryAction != null && !isTaskCancelled) {
-                    stateManager.transition(
-                        task,
-                        TaskState.REPLANNING,
-                        "Replanning after step ${index + 1} failure using ${recoveryAction.actionType.name}"
-                    )
-                    val recoveryExec = withTimeoutOrNull(recoveryAction.timeoutMs) {
-                        com.example.core.agent.tools.CommandDispatcher.dispatch(
-                            recoveryAction,
-                            actionExecutor,
-                            isConfirmed = isConfirmedFlag
-                        )
-                    }
-                    if (recoveryExec?.isSuccess == true) {
-                        stateManager.transition(task, TaskState.EXECUTING, "Retrying step ${index + 1} after recovery")
-                        val retryExec = withTimeoutOrNull(action.timeoutMs) {
-                            com.example.core.agent.tools.CommandDispatcher.dispatch(
-                                action,
-                                actionExecutor,
-                                isConfirmed = isConfirmedFlag
-                            )
-                        }
-                        if (retryExec != null) {
-                            execResult = retryExec
-                            stateManager.transition(task, TaskState.VERIFYING)
-                            verification = actionVerifier.verifyAction(
-                                action = action,
-                                executionResult = execResult,
-                                preStateSummary = preState,
-                                resolvedTargetPackage = resolvedPkg
-                            )
-                        }
-                    }
-                }
-            }
 
             if (verification.status == VerificationStatus.VERIFIED) {
                 AgentEventBus.emit(AgentEvent.ActionCompleted(task.taskId, action.actionId, verification.details))
@@ -1061,15 +1083,65 @@ class AgentRuntime(
             brainTraceSteps.add(
                 BrainReasoningStep(
                     stepIndex = index + 1,
-                    thought = "Step ${index + 1}/${task.actions.size}: ${action.actionType.name}",
+                    thought = "Step ${index + 1}/$totalKnownSteps: ${action.actionType.name} -> ${verification.status.name}",
                     selectedAction = action.actionType,
                     target = action.target,
                     executionOutput = verification.details,
                     verificationStatus = verification.status,
-                    isComplete = (index == task.actions.lastIndex) && verification.status == VerificationStatus.VERIFIED
+                    isComplete = actionQueue.isEmpty() && verification.status == VerificationStatus.VERIFIED
                 )
             )
             agentBrain.recordTrace(brainTraceSteps)
+
+            // Section 1 — Dynamic Observe -> Verify -> Reason -> Replan / Recovery Decision
+            if (verification.status == VerificationStatus.FAILED ||
+                (observedSemantics?.hasDialogOrPopup == true && actionQueue.isNotEmpty())
+            ) {
+                val dynamicDecision = agentBrain.observeAndDecideNextStep(
+                    DynamicObservationContext(
+                        goal = task.userInstruction,
+                        lastExecutedAction = action,
+                        lastExecutionResult = execResult,
+                        lastVerification = verification,
+                        screenSnapshot = observedSnapshot,
+                        screenSemantics = observedSemantics,
+                        memoryContext = stepContext["memoryContext"],
+                        completedStepOutputs = stepOutputs,
+                        remainingPlannedActions = actionQueue.toList(),
+                        executedHistory = executedHistory,
+                        replanAttemptsUsed = replanCount
+                    )
+                )
+
+                when (dynamicDecision) {
+                    is DynamicReasoningDecision.InjectRecoveryActions -> {
+                        replanCount++
+                        stateManager.transition(task, TaskState.REPLANNING, dynamicDecision.thought)
+                        if (verification.status == VerificationStatus.VERIFIED) {
+                            verifiedStepCount++
+                            completedStepIds.add(action.actionId)
+                            stepOutputs.add(verification.details)
+                            stepContext["previousStepOutput"] = verification.details
+                        }
+                        for (recoveryAct in dynamicDecision.actions.asReversed()) {
+                            actionQueue.addFirst(recoveryAct)
+                        }
+                        logAndPersistTask(task, dynamicDecision.thought, completedStepIds, stepContext)
+                        continue
+                    }
+                    is DynamicReasoningDecision.ReplanRemaining -> {
+                        replanCount++
+                        stateManager.transition(task, TaskState.REPLANNING, dynamicDecision.thought)
+                        actionQueue.clear()
+                        actionQueue.addAll(dynamicDecision.newActions)
+                        logAndPersistTask(task, dynamicDecision.thought, completedStepIds, stepContext)
+                        continue
+                    }
+                    else -> {
+                        // Fall through to strict verification outcome handling below
+                    }
+                }
+            }
 
             // Strict Verification Handling (BUG 05 & BUG 06 Fixed: NOT_SUPPORTED and INCONCLUSIVE are NEVER grouped with VERIFIED)
             when (verification.status) {

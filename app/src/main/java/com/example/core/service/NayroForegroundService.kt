@@ -186,11 +186,39 @@ class NayroForegroundService : Service() {
         }
     }
 
+    data class BackgroundVoiceEligibility(
+        val canStartMicrophoneFgs: Boolean,
+        val batteryOptimizationExempt: Boolean,
+        val reason: String
+    )
+
     private fun resolveAssistantName(): String {
+        com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+            ?.takeIf { it.isNotBlank() }?.let { return it }
         return try {
             NayroApplication.instance.permissionSetupManager.getSavedAssistantName()
         } catch (_: Exception) {
-            "Babu"
+            com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
+        }
+    }
+
+    private fun hasRecordAudioPermission(): Boolean {
+        return try {
+            androidx.core.content.ContextCompat.checkSelfPermission(
+                this,
+                android.Manifest.permission.RECORD_AUDIO
+            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun isBatteryOptimizationIgnored(): Boolean {
+        return try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            pm?.isIgnoringBatteryOptimizations(packageName) == true
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -255,6 +283,25 @@ class NayroForegroundService : Service() {
         try {
             pauseTimerJob?.cancel()
             val personaName = resolveAssistantName()
+            val hasMicPerm = hasRecordAudioPermission()
+            val batteryExempt = isBatteryOptimizationIgnored()
+
+            // Android 14+ (API 34+) strictly enforces RECORD_AUDIO before starting a microphone-typed FGS
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE && !hasMicPerm) {
+                isRunningInForeground = false
+                val msg = "Android 14+ requires RECORD_AUDIO permission before starting NAYRO's microphone foreground service."
+                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.FAILED, msg)
+                ServiceStateRepository.appendActivityLog(msg)
+                stopSelf()
+                return START_NOT_STICKY
+            }
+
+            if (!batteryExempt) {
+                ServiceStateRepository.appendActivityLog(
+                    "Battery optimization is active for NAYRO; Android OEM power policies may throttle background listening."
+                )
+            }
+
             val notification = createNotification(
                 title = "NAYRO Agent Active ($personaName)",
                 content = "$personaName background agent engine is ready. Tap to open.",
@@ -262,7 +309,7 @@ class NayroForegroundService : Service() {
             )
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && hasMicPerm) {
                     ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 } else {
                     0
@@ -278,16 +325,30 @@ class NayroForegroundService : Service() {
             // Activate local wake-word listening in background if permission is available
             setupBackgroundVoicePipeline()
 
+        } catch (se: SecurityException) {
+            isRunningInForeground = false
+            val msg = "Microphone foreground service blocked by Android SecurityException (missing RECORD_AUDIO or background restriction): ${se.localizedMessage ?: "denied"}"
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.FAILED, msg)
+            ServiceStateRepository.appendActivityLog(msg)
+            stopSelf()
+            return START_NOT_STICKY
         } catch (e: Exception) {
             isRunningInForeground = false
-            ServiceStateRepository.updateForegroundStatus(
-                ServiceLifecycleState.FAILED,
+            val isBgStartBlocked = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                e is android.app.ForegroundServiceStartNotAllowedException
+            val msg = if (isBgStartBlocked) {
+                "Android blocked background foreground-service start (ForegroundServiceStartNotAllowedException). Open NAYRO to reactivate voice standby."
+            } else {
                 "startForeground failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
-            )
+            }
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.FAILED, msg)
+            ServiceStateRepository.appendActivityLog(msg)
             stopSelf()
             return START_NOT_STICKY
         }
 
+        // Note: START_STICKY requests restart if OS reclaims memory, but Android 12+/14+ OEM policies
+        // may still restrict background microphone restarts without user foreground interaction.
         return START_STICKY
     }
 

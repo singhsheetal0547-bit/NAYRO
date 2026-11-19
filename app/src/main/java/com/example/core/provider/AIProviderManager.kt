@@ -132,7 +132,11 @@ class AIProviderManager(
     suspend fun sendRequest(
         userPrompt: String,
         history: List<AIChatMessage> = emptyList(),
-        systemPrompt: String = "You are Babu, a friendly, helpful, highly capable personal Android AI assistant for NAYRO. You communicate fluently in Hindi, English, and Hinglish. Provide concise, clear, and direct responses."
+        systemPrompt: String = run {
+            val activeName = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+                ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
+            "You are $activeName, a friendly, helpful, highly capable personal Android AI assistant for NAYRO. You communicate fluently in Hindi, English, and Hinglish. Provide concise, clear, and direct responses."
+        }
     ): AIResult {
         refreshActiveProvider()
 

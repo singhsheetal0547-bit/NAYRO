@@ -63,6 +63,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import com.example.core.voice.VoiceState
 import com.example.data.local.entities.ConversationEntity
 import com.example.ui.components.AssistantOrb
+import com.example.ui.components.SpeechToTextVoicePanel
 import com.example.ui.components.StatusBadge
 import com.example.ui.components.TaskExecutionCard
 import com.example.ui.theme.Coral
@@ -77,13 +78,24 @@ fun HomeScreen(
     agentState: AgentState = AgentState.Idle,
     voiceState: VoiceState = VoiceState.DISABLED,
     liveTranscript: String = "",
+    partialTranscript: String = "",
     audioLevel: Float = 0f,
+    isMicrophoneGranted: Boolean = false,
+    isSpeechRecognitionAvailable: Boolean = true,
+    selectedLanguageTag: String = "en-IN",
+    voiceError: String? = null,
     currentTask: AgentTask? = null,
     recentConversations: List<ConversationEntity> = emptyList(),
     isForegroundActive: Boolean = false,
     isFloatingActive: Boolean = false,
     isAiReady: Boolean = false,
     onVoiceTap: () -> Unit = {},
+    onStartListening: () -> Unit = onVoiceTap,
+    onStopListening: () -> Unit = onVoiceTap,
+    onStopSpeaking: () -> Unit = {},
+    onMicrophonePermissionResult: (Boolean) -> Unit = {},
+    onLanguageSelected: (String) -> Unit = {},
+    onClearTranscript: () -> Unit = {},
     onSendText: (String) -> Unit = {},
     onCancelTask: () -> Unit = {},
     onPauseTask: () -> Unit = {},
@@ -108,12 +120,12 @@ fun HomeScreen(
     )
 
     val suggestedCommands = listOf(
+        "Babu NAYRO cute baby, time kya hua hai?",
+        "Babu NAYRO cute baby, YouTube kholo aur Android AI search karo",
         "Screen par kya likha hai?",
-        "YouTube kholo aur Android AI search karo",
         "Settings kholo aur Wi-Fi section tak jao",
         "Summarize my recent notifications",
         "Run workflow: Read Screen & Save Summary Note",
-        "Time kya hua hai?",
         "Note banao: NAYRO release checklist"
     )
 
@@ -349,6 +361,28 @@ fun HomeScreen(
                 }
             }
         }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Dedicated Android Speech-to-Text Voice Command Interface for "Babu NAYRO cute baby"
+        SpeechToTextVoicePanel(
+            assistantName = assistantName,
+            voiceState = voiceState,
+            isMicrophoneGranted = isMicrophoneGranted,
+            isSpeechRecognitionAvailable = isSpeechRecognitionAvailable,
+            partialTranscript = partialTranscript,
+            finalTranscript = liveTranscript,
+            audioLevel = audioLevel,
+            selectedLanguageTag = selectedLanguageTag,
+            voiceError = voiceError,
+            onStartListening = onStartListening,
+            onStopListening = onStopListening,
+            onStopSpeaking = onStopSpeaking,
+            onMicrophonePermissionResult = onMicrophonePermissionResult,
+            onLanguageSelected = onLanguageSelected,
+            onSendRecognizedCommand = onSendText,
+            onClearTranscript = onClearTranscript
+        )
 
         Spacer(modifier = Modifier.height(16.dp))
 

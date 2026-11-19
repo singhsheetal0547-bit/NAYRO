@@ -38,12 +38,23 @@ object TaskPlanner {
             }
 
             UserIntentType.YOUTUBE_SEARCH -> {
+                val ytQuery = intent.searchQueryOrContent ?: "Android"
+                val lowerRaw = intent.rawPrompt.lowercase()
+                val wantsPlaybackSelection = lowerRaw.contains("play") ||
+                    lowerRaw.contains("watch") ||
+                    lowerRaw.contains("chalao") ||
+                    lowerRaw.contains("bajao") ||
+                    lowerRaw.contains("sunao") ||
+                    lowerRaw.contains("video") ||
+                    lowerRaw.contains("song") ||
+                    lowerRaw.contains("gaana")
                 actions.add(
                     AgentAction(
                         taskId = taskId,
                         actionType = ActionType.LAUNCH_APP,
                         target = "com.google.android.youtube",
                         riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        verificationStrategy = "VERIFY_FOREGROUND_PACKAGE",
                         idempotencyClassification = "IDEMPOTENT"
                     )
                 )
@@ -61,12 +72,46 @@ object TaskPlanner {
                     AgentAction(
                         taskId = taskId,
                         actionType = ActionType.SET_TEXT,
-                        parameters = mapOf("query" to (intent.searchQueryOrContent ?: "Android")),
+                        target = "Search",
+                        parameters = mapOf(
+                            "query" to ytQuery,
+                            "text" to ytQuery,
+                            "submit" to "true"
+                        ),
                         requiredCapability = CapabilityId.ACCESSIBILITY,
                         riskLevel = RiskLevel.R2_APPLICATION_STATE,
                         idempotencyClassification = "NON_IDEMPOTENT"
                     )
                 )
+                if (wantsPlaybackSelection) {
+                    actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.READ_SCREEN,
+                            target = "YouTube Search Results",
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                            verificationStrategy = "VERIFY_SCREEN_READ",
+                            idempotencyClassification = "IDEMPOTENT"
+                        )
+                    )
+                    actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.CONTROL_MEDIA,
+                            target = ytQuery,
+                            parameters = mapOf(
+                                "operation" to "SELECT_AND_VERIFY_YOUTUBE",
+                                "query" to ytQuery,
+                                "app" to "com.google.android.youtube"
+                            ),
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            verificationStrategy = "VERIFY_MEDIA_PLAYBACK",
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                }
             }
 
             UserIntentType.SETTINGS_NAVIGATE -> {

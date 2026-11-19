@@ -30,9 +30,13 @@ class PlanValidator(
                 return ValidationResult.InvalidPlan("Action '${action.actionType}' is classified as R4 (Financial/Prohibited) and cannot be executed.")
             }
 
-            // Check Accessibility capability if required
+            // Check Accessibility capability if required (fail-closed on errors)
             if (action.requiredCapability == CapabilityId.ACCESSIBILITY) {
-                val accState = AccessibilityConnectionManager.checkStatus(context)
+                val accState = try {
+                    AccessibilityConnectionManager.checkStatus(context)
+                } catch (_: Exception) {
+                    com.example.core.accessibility.AccessibilityConnectionState.DISCONNECTED
+                }
                 if (accState != com.example.core.accessibility.AccessibilityConnectionState.OPERATIONAL &&
                     accState != com.example.core.accessibility.AccessibilityConnectionState.CONNECTED
                 ) {
@@ -43,12 +47,21 @@ class PlanValidator(
                 }
             }
 
-            // Check runtime permission if required
+            // Check runtime permission if required (strict fail-closed)
             action.requiredPermission?.let { perm ->
-                if (!permissionManager.isPermissionGranted(perm)) {
+                val checkDetail = try {
+                    permissionManager.checkPermissionFailClosed(perm)
+                } catch (e: Exception) {
+                    PermissionManager.PermissionVerificationDetail(
+                        permission = perm,
+                        outcome = PermissionManager.PermissionCheckOutcome.INCONCLUSIVE,
+                        reason = "Unable to verify permission '$perm' (${e.javaClass.simpleName}). Failing closed."
+                    )
+                }
+                if (!checkDetail.isGranted) {
                     return ValidationResult.MissingPermission(
                         permission = perm,
-                        reason = "Action '${action.actionType}' requires permission '$perm'."
+                        reason = "Action '${action.actionType}' blocked (${checkDetail.outcome.name}): ${checkDetail.reason}"
                     )
                 }
             }

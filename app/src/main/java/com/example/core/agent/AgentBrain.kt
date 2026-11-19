@@ -29,6 +29,37 @@ data class BrainExecutionOutcome(
     val isFullyVerified: Boolean
 )
 
+data class DynamicObservationContext(
+    val goal: String,
+    val lastExecutedAction: AgentAction?,
+    val lastExecutionResult: ActionExecutionResult?,
+    val lastVerification: VerificationResult?,
+    val screenSnapshot: com.example.core.screen.ScreenSnapshot? = null,
+    val screenSemantics: com.example.core.screen.ScreenSemanticSignals? = null,
+    val memoryContext: String? = null,
+    val completedStepOutputs: List<String> = emptyList(),
+    val remainingPlannedActions: List<AgentAction> = emptyList(),
+    val executedHistory: List<AgentAction> = emptyList(),
+    val replanAttemptsUsed: Int = 0
+)
+
+sealed class DynamicReasoningDecision {
+    data class ContinueNextPlanned(val thought: String) : DynamicReasoningDecision()
+    data class InjectRecoveryActions(
+        val actions: List<AgentAction>,
+        val thought: String
+    ) : DynamicReasoningDecision()
+    data class ReplanRemaining(
+        val newActions: List<AgentAction>,
+        val thought: String
+    ) : DynamicReasoningDecision()
+    data class GoalCompleted(val summary: String) : DynamicReasoningDecision()
+    data class AbortWithState(
+        val reason: String,
+        val status: VerificationStatus
+    ) : DynamicReasoningDecision()
+}
+
 /**
  * Authoritative Multi-Step Reasoning, Planning & Iterative Orchestration Engine (Sections 5, 6, 8, 9).
  * Integrated directly with AgentRuntime so all user entry points share one unified planning and
@@ -66,8 +97,10 @@ class AgentBrain(
         userPrompt: String,
         existingTaskId: String = UUID.randomUUID().toString()
     ): AgentTask {
-        val trimmed = userPrompt.trim()
-            .replaceFirst(Regex("^(?i)(hey babu|hi babu|babu|hey nayro|hi nayro|nayro|hey cutie)\\s*,?\\s*"), "")
+        val identityStripped = com.example.core.identity.AssistantIdentityStore.sharedInstance
+            ?.stripWakePrefix(userPrompt) ?: userPrompt
+        val trimmed = identityStripped.trim()
+            .replaceFirst(Regex("^(?i)(hey babu|hi babu|babu|hey nayro|hi nayro|nayro|hey nero|hi nero|nero|hey qki|hi qki|qki|hey cutie)\\s*,?\\s*"), "")
             .trim()
             .ifBlank { userPrompt.trim() }
 
@@ -175,8 +208,10 @@ class AgentBrain(
 
         val activeProvider = try { providerManager.activeProvider.value } catch (_: Exception) { null }
         if (activeProvider != null && activeProvider.hasKeySaved) {
+            val activeName = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+                ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
             val systemPrompt = buildString {
-                append("You are the NAYRO Agent Planner (Babu). ")
+                append("You are the NAYRO Agent Planner ($activeName). ")
                 append("If the user is asking to perform device/app actions, decompose the goal into a JSON array of tool calls using ONLY the registered ActionTypes below. ")
                 append("If it is a general knowledge question, output a single QUERY_LLM action.\n")
                 append("Output ONLY valid JSON array: [{\"actionType\": \"...\", \"target\": \"...\", \"parameters\": {...}}]\n")
@@ -217,6 +252,19 @@ class AgentBrain(
                     idempotencyClassification = "IDEMPOTENT"
                 )
             }
+            ActionType.SET_TEXT -> {
+                // If setting text failed because an input field wasn't focused, click target field first
+                val fieldTarget = failedAction.target ?: "Search"
+                AgentAction(
+                    taskId = failedAction.taskId,
+                    actionType = ActionType.CLICK_ELEMENT,
+                    target = fieldTarget,
+                    parameters = mapOf("target" to fieldTarget),
+                    requiredCapability = failedAction.requiredCapability,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            }
             ActionType.FILE_READ_TEXT -> {
                 // If reading a specific filename failed, search workspace files to locate matching file
                 val query = failedAction.target ?: failedAction.parameters["filename"] ?: "md"
@@ -229,8 +277,200 @@ class AgentBrain(
                     idempotencyClassification = "IDEMPOTENT"
                 )
             }
+            ActionType.LAUNCH_APP -> {
+                // Observe screen to check whether a chooser/dialog or foreground app state blocked launch verification
+                AgentAction(
+                    taskId = failedAction.taskId,
+                    actionType = ActionType.READ_SCREEN,
+                    target = failedAction.target,
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            }
             else -> null
         }
+    }
+
+    /**
+     * Section 1 — Real Dynamic Observe -> Verify -> Reason -> Next-Action/Replan Decision Engine.
+     * Evaluates actual post-action verification results, live screen snapshots/semantics, memory context,
+     * and remaining planned actions to dynamically decide whether to continue, inject recovery steps,
+     * replan remaining actions (deterministically first, or via Gemini API when needed), complete, or abort honestly.
+     */
+    suspend fun observeAndDecideNextStep(obs: DynamicObservationContext): DynamicReasoningDecision {
+        val nextPlanned = obs.remainingPlannedActions.firstOrNull()
+        val uiInteractionTypes = setOf(
+            ActionType.CLICK_ELEMENT,
+            ActionType.LONG_PRESS_ELEMENT,
+            ActionType.SET_TEXT,
+            ActionType.INTERACT_COORDINATES
+        )
+
+        // 1. Protect secure/authentication screens (never auto-interact with PIN/password/biometric screens)
+        if (obs.screenSnapshot != null &&
+            com.example.core.screen.ScreenIntelligenceManager.isSecureOrAuthenticationScreen(obs.screenSnapshot) &&
+            nextPlanned?.actionType in uiInteractionTypes
+        ) {
+            return DynamicReasoningDecision.AbortWithState(
+                reason = "Protected or authentication screen detected (${obs.screenSnapshot.packageName}). Automated UI interaction paused for user safety.",
+                status = VerificationStatus.REQUIRES_CONFIRMATION
+            )
+        }
+
+        // 2. Abort honestly on target app error/offline screens
+        if (obs.screenSemantics?.isErrorScreen == true) {
+            return DynamicReasoningDecision.AbortWithState(
+                reason = "Observed error or offline state on screen while working on '${obs.goal}'.",
+                status = VerificationStatus.FAILED
+            )
+        }
+
+        // 3. Handle unexpected modal dialogs/popups before proceeding with UI steps (never auto-approve permissions!)
+        if (obs.screenSemantics?.hasDialogOrPopup == true &&
+            obs.replanAttemptsUsed < 2 &&
+            (nextPlanned != null && (nextPlanned.actionType in uiInteractionTypes || nextPlanned.actionType == ActionType.CONTROL_MEDIA))
+        ) {
+            val safeDismissLabels = listOf("Skip", "Not now", "No thanks", "Dismiss", "Later", "Close")
+            val matchedDismissLabel = obs.screenSnapshot?.interactiveElements
+                ?.firstOrNull { node ->
+                    node.isClickable && safeDismissLabels.any { lbl ->
+                        node.displayLabel.equals(lbl, ignoreCase = true)
+                    }
+                }?.displayLabel
+
+            val dismissAction = if (matchedDismissLabel != null) {
+                AgentAction(
+                    taskId = nextPlanned.taskId,
+                    actionType = ActionType.CLICK_ELEMENT,
+                    target = matchedDismissLabel,
+                    parameters = mapOf("target" to matchedDismissLabel, "recoveryReason" to "DISMISS_UNEXPECTED_POPUP"),
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            } else {
+                AgentAction(
+                    taskId = nextPlanned.taskId,
+                    actionType = ActionType.NAVIGATE_BACK,
+                    target = "Dismiss Dialog",
+                    parameters = mapOf("recoveryReason" to "DISMISS_UNEXPECTED_POPUP"),
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            }
+
+            if (!hasRepeatedToolCallLoop(obs.executedHistory, dismissAction, maxConsecutiveRepeats = 2)) {
+                return DynamicReasoningDecision.InjectRecoveryActions(
+                    actions = listOf(dismissAction),
+                    thought = "Observed unexpected modal dialog on screen; injecting safe dismissal (${dismissAction.actionType.name}: ${dismissAction.target}) before continuing."
+                )
+            }
+        }
+
+        // 4. Evaluate last executed step's verification outcome
+        val lastAction = obs.lastExecutedAction
+        val lastVer = obs.lastVerification
+        if (lastAction != null && lastVer != null && lastVer.status != VerificationStatus.VERIFIED) {
+            // Non-recoverable terminal/gating states propagate honestly without blind retries
+            if (lastVer.status in setOf(
+                    VerificationStatus.REQUIRES_PERMISSION,
+                    VerificationStatus.REQUIRES_CONFIRMATION,
+                    VerificationStatus.WAITING_FOR_UNLOCK,
+                    VerificationStatus.NOT_SUPPORTED,
+                    VerificationStatus.CANCELLED
+                )
+            ) {
+                return DynamicReasoningDecision.AbortWithState(lastVer.details, lastVer.status)
+            }
+
+            // Bounded replanning limit prevents infinite retry loops
+            if (obs.replanAttemptsUsed >= 2) {
+                return DynamicReasoningDecision.AbortWithState(
+                    reason = "Recovery limit reached after ${lastAction.actionType.name}: ${lastVer.details}",
+                    status = lastVer.status
+                )
+            }
+
+            // 4A. Deterministic fast-path recovery (zero LLM latency/cost for known Android UI recovery patterns)
+            val deterministicRecovery = replanFailedStep(lastAction, lastVer.details)
+            if (deterministicRecovery != null &&
+                !hasRepeatedToolCallLoop(obs.executedHistory, deterministicRecovery, maxConsecutiveRepeats = 2)
+            ) {
+                val recoverySequence = when (lastAction.actionType) {
+                    ActionType.CLICK_ELEMENT, ActionType.SET_TEXT -> listOf(deterministicRecovery, lastAction)
+                    else -> listOf(deterministicRecovery)
+                }
+                return DynamicReasoningDecision.InjectRecoveryActions(
+                    actions = recoverySequence,
+                    thought = "Deterministic recovery for ${lastAction.actionType.name} (${lastVer.status.name}): trying ${deterministicRecovery.actionType.name}."
+                )
+            }
+
+            // 4B. Dynamic Gemini/LLM replanning ONLY when deterministic recovery is unavailable & a provider key is active
+            val activeProvider = try { providerManager.activeProvider.value } catch (_: Exception) { null }
+            if (activeProvider != null && activeProvider.hasKeySaved) {
+                val screenPreview = obs.screenSnapshot?.visibleTexts?.take(12)?.joinToString(" | ") ?: "Unavailable"
+                val interactivePreview = obs.screenSnapshot?.interactiveElements?.take(10)
+                    ?.joinToString(", ") { it.displayLabel } ?: "None"
+                val replanPrompt = buildString {
+                    append("Goal: ${obs.goal}\n")
+                    append("Failed/Inconclusive Step: ${lastAction.actionType.name} (target=${lastAction.target}, status=${lastVer.status.name})\n")
+                    append("Failure Details: ${lastVer.details}\n")
+                    append("Observed Screen Texts: $screenPreview\n")
+                    append("Observed Interactive Elements: $interactivePreview\n")
+                    if (!obs.memoryContext.isNullOrBlank()) {
+                        append("Relevant Memory: ${obs.memoryContext}\n")
+                    }
+                    append("Propose 1-3 safe recovery actions as a JSON array using registered ActionTypes, or [] if impossible.")
+                }
+                val activeName = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+                    ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
+                val systemPrompt = buildString {
+                    append("You are the NAYRO Dynamic Recovery Planner ($activeName). ")
+                    append("Output ONLY a valid JSON array [{\"actionType\":\"...\",\"target\":\"...\",\"parameters\":{...}}]. ")
+                    append("Never propose financial/destructive actions.\n")
+                    append(ToolRegistryManager.generateLlmToolPromptSummary())
+                }
+                val aiRes = try {
+                    providerManager.sendRequest(userPrompt = replanPrompt, systemPrompt = systemPrompt)
+                } catch (_: Exception) {
+                    null
+                }
+                if (aiRes is AIResult.Success) {
+                    val raw = aiRes.response.content.trim()
+                    val startIdx = raw.indexOf('[')
+                    val endIdx = raw.lastIndexOf(']')
+                    if (startIdx >= 0 && endIdx > startIdx) {
+                        val parsed = TaskPlanner.planTaskFromJson(raw.substring(startIdx, endIdx + 1), obs.goal)
+                        val safeActions = parsed?.actions
+                            ?.filter { it.riskLevel != RiskLevel.R4_FINANCIAL_PROHIBITED }
+                            ?.filterNot { hasRepeatedToolCallLoop(obs.executedHistory, it, maxConsecutiveRepeats = 2) }
+                            ?.take(3)
+                            .orEmpty()
+                        if (safeActions.isNotEmpty()) {
+                            return DynamicReasoningDecision.ReplanRemaining(
+                                newActions = safeActions.map { it.copy(taskId = lastAction.taskId) },
+                                thought = "AI dynamic replanning generated ${safeActions.size} recovery step(s) from observed state."
+                            )
+                        }
+                    }
+                }
+            }
+
+            return DynamicReasoningDecision.AbortWithState(lastVer.details, lastVer.status)
+        }
+
+        // 5. All steps completed or continue to next planned action
+        if (obs.remainingPlannedActions.isEmpty()) {
+            val summary = obs.completedStepOutputs.lastOrNull() ?: "Task completed."
+            return DynamicReasoningDecision.GoalCompleted(summary)
+        }
+
+        return DynamicReasoningDecision.ContinueNextPlanned(
+            thought = "Step verified; continuing to next action (${nextPlanned?.actionType?.name})."
+        )
     }
 
     private fun planSingleOrDynamicClause(clause: String, taskId: String): List<AgentAction> {
@@ -1191,6 +1431,219 @@ class AgentBrain(
             finalResponse = combinedSummary,
             stepsExecuted = steps,
             overallStatus = finalOverallStatus,
+            isFullyVerified = allVerified
+        )
+    }
+
+    /**
+     * Section 1 — Dynamic Observe -> Execute -> Verify -> Reason -> Replan loop over an evolving action queue.
+     * Supports injecting recovery steps, dismissing unexpected dialogs, replanning on failure,
+     * loop protection, and bounded execution budgets.
+     */
+    suspend fun executeDynamicReasoningLoop(
+        task: AgentTask,
+        maxSteps: Int = MAX_ITERATIVE_STEPS,
+        timeoutMs: Long = DEFAULT_LOOP_TIMEOUT_MS,
+        memoryContext: String? = null,
+        screenSnapshotProvider: suspend () -> com.example.core.screen.ScreenSnapshot? = { null },
+        screenSemanticsProvider: suspend (com.example.core.screen.ScreenSnapshot?) -> com.example.core.screen.ScreenSemanticSignals? = { null },
+        customStepExecutor: suspend (AgentAction, Map<String, String>) -> Pair<ActionExecutionResult, VerificationResult>
+    ): BrainExecutionOutcome {
+        isCancelled = false
+        val steps = mutableListOf<BrainReasoningStep>()
+        val executedHistory = mutableListOf<AgentAction>()
+        val actionQueue = ArrayDeque<AgentAction>(task.actions)
+        val stepContext = mutableMapOf<String, String>()
+        if (!memoryContext.isNullOrBlank()) {
+            stepContext["memoryContext"] = memoryContext
+        }
+        _reasoningTrace.value = emptyList()
+
+        if (actionQueue.isEmpty()) {
+            return BrainExecutionOutcome(
+                finalResponse = "No executable actions were generated for this instruction.",
+                stepsExecuted = emptyList(),
+                overallStatus = VerificationStatus.FAILED,
+                isFullyVerified = false
+            )
+        }
+
+        var verifiedCount = 0
+        var replanCount = 0
+        var finalStatus = VerificationStatus.VERIFIED
+        var abortReason: String? = null
+
+        val timedOk = withTimeoutOrNull(timeoutMs) {
+            while (actionQueue.isNotEmpty() && steps.size < maxSteps) {
+                if (isCancelled) {
+                    finalStatus = VerificationStatus.CANCELLED
+                    break
+                }
+
+                // Pre-step observation check (handles unexpected dialogs / secure screens before acting)
+                val preSnapshot = screenSnapshotProvider()
+                val preSemantics = screenSemanticsProvider(preSnapshot)
+                if (preSnapshot != null || preSemantics != null) {
+                    val preDecision = observeAndDecideNextStep(
+                        DynamicObservationContext(
+                            goal = task.userInstruction,
+                            lastExecutedAction = null,
+                            lastExecutionResult = null,
+                            lastVerification = null,
+                            screenSnapshot = preSnapshot,
+                            screenSemantics = preSemantics,
+                            memoryContext = memoryContext,
+                            completedStepOutputs = steps.map { it.executionOutput },
+                            remainingPlannedActions = actionQueue.toList(),
+                            executedHistory = executedHistory,
+                            replanAttemptsUsed = replanCount
+                        )
+                    )
+                    when (preDecision) {
+                        is DynamicReasoningDecision.InjectRecoveryActions -> {
+                            replanCount++
+                            for (act in preDecision.actions.asReversed()) {
+                                actionQueue.addFirst(act)
+                            }
+                        }
+                        is DynamicReasoningDecision.AbortWithState -> {
+                            finalStatus = preDecision.status
+                            abortReason = preDecision.reason
+                            break
+                        }
+                        else -> {}
+                    }
+                }
+
+                val rawAction = actionQueue.removeFirst()
+                if (hasRepeatedToolCallLoop(executedHistory, rawAction, maxConsecutiveRepeats = 2)) {
+                    finalStatus = VerificationStatus.FAILED
+                    abortReason = "Aborted repeated identical tool call (${rawAction.actionType.name}) to prevent an infinite loop."
+                    steps.add(
+                        BrainReasoningStep(
+                            stepIndex = steps.size + 1,
+                            thought = abortReason!!,
+                            selectedAction = rawAction.actionType,
+                            target = rawAction.target,
+                            executionOutput = abortReason!!,
+                            verificationStatus = VerificationStatus.FAILED,
+                            isComplete = false
+                        )
+                    )
+                    _reasoningTrace.value = steps.toList()
+                    break
+                }
+
+                executedHistory.add(rawAction)
+                val enrichedParams = rawAction.parameters.toMutableMap()
+                stepContext["previousStepOutput"]?.let { prev ->
+                    enrichedParams.putIfAbsent("previousStepOutput", prev)
+                }
+                val action = rawAction.copy(parameters = enrichedParams)
+
+                val (execResult, verification) = customStepExecutor(action, stepContext)
+                val stepNum = steps.size + 1
+                steps.add(
+                    BrainReasoningStep(
+                        stepIndex = stepNum,
+                        thought = "Dynamic Step $stepNum: ${action.actionType.name} -> ${verification.status.name}",
+                        selectedAction = action.actionType,
+                        target = action.target,
+                        executionOutput = verification.details,
+                        verificationStatus = verification.status,
+                        isComplete = actionQueue.isEmpty() && verification.isVerified
+                    )
+                )
+                _reasoningTrace.value = steps.toList()
+
+                if (verification.isVerified) {
+                    verifiedCount++
+                    stepContext["previousStepOutput"] = execResult.outputMessage
+                }
+
+                // Post-step observation & dynamic next-action reasoning
+                val postSnapshot = screenSnapshotProvider()
+                val postSemantics = screenSemanticsProvider(postSnapshot)
+                val decision = observeAndDecideNextStep(
+                    DynamicObservationContext(
+                        goal = task.userInstruction,
+                        lastExecutedAction = action,
+                        lastExecutionResult = execResult,
+                        lastVerification = verification,
+                        screenSnapshot = postSnapshot,
+                        screenSemantics = postSemantics,
+                        memoryContext = memoryContext,
+                        completedStepOutputs = steps.map { it.executionOutput },
+                        remainingPlannedActions = actionQueue.toList(),
+                        executedHistory = executedHistory,
+                        replanAttemptsUsed = replanCount
+                    )
+                )
+
+                when (decision) {
+                    is DynamicReasoningDecision.ContinueNextPlanned -> {
+                        // Proceed to next action in queue
+                    }
+                    is DynamicReasoningDecision.InjectRecoveryActions -> {
+                        replanCount++
+                        for (recoveryAct in decision.actions.asReversed()) {
+                            actionQueue.addFirst(recoveryAct)
+                        }
+                    }
+                    is DynamicReasoningDecision.ReplanRemaining -> {
+                        replanCount++
+                        actionQueue.clear()
+                        actionQueue.addAll(decision.newActions)
+                    }
+                    is DynamicReasoningDecision.GoalCompleted -> {
+                        finalStatus = VerificationStatus.VERIFIED
+                        break
+                    }
+                    is DynamicReasoningDecision.AbortWithState -> {
+                        finalStatus = decision.status
+                        abortReason = decision.reason
+                        break
+                    }
+                }
+            }
+            true
+        }
+
+        if (timedOk == null) {
+            return BrainExecutionOutcome(
+                finalResponse = "Dynamic reasoning loop timed out after ${timeoutMs}ms ($verifiedCount steps verified).",
+                stepsExecuted = steps,
+                overallStatus = if (verifiedCount > 0) VerificationStatus.PARTIALLY_COMPLETED else VerificationStatus.TIMED_OUT,
+                isFullyVerified = false
+            )
+        }
+
+        if (isCancelled || finalStatus == VerificationStatus.CANCELLED) {
+            return BrainExecutionOutcome(
+                finalResponse = "Task cancelled ($verifiedCount steps verified).",
+                stepsExecuted = steps,
+                overallStatus = VerificationStatus.CANCELLED,
+                isFullyVerified = false
+            )
+        }
+
+        val allVerified = finalStatus == VerificationStatus.VERIFIED && abortReason == null && actionQueue.isEmpty()
+        val combined = buildString {
+            if (steps.isNotEmpty()) {
+                append(steps.joinToString("\n") { s ->
+                    "[Step ${s.stepIndex} - ${s.selectedAction.name} (${s.verificationStatus.name})]: ${s.executionOutput}"
+                })
+            }
+            if (!abortReason.isNullOrBlank()) {
+                if (isNotEmpty()) append("\n")
+                append(abortReason)
+            }
+        }.ifBlank { "Task finished with status ${finalStatus.name}." }
+
+        return BrainExecutionOutcome(
+            finalResponse = combined,
+            stepsExecuted = steps,
+            overallStatus = if (allVerified) VerificationStatus.VERIFIED else finalStatus,
             isFullyVerified = allVerified
         )
     }

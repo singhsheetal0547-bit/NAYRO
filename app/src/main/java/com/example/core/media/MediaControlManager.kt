@@ -21,6 +21,7 @@ import kotlinx.coroutines.delay
 
 enum class MediaOperation {
     PLAY_QUERY,
+    SELECT_AND_VERIFY_YOUTUBE,
     PLAY_FAVOURITE_SONG,
     PLAY_FAVOURITE_ARTIST,
     PLAY_BY_GENRE_OR_MOOD,
@@ -35,6 +36,7 @@ enum class MediaOperation {
 enum class MediaPlaybackVerificationState {
     APP_OPENED,
     SEARCH_OPENED,
+    RESULT_SELECTED_PLAYBACK_UNVERIFIED,
     COMMAND_DISPATCHED,
     PLAYBACK_VERIFIED,
     PAUSED_VERIFIED,
@@ -47,6 +49,14 @@ enum class MediaPlaybackVerificationState {
     APP_SEARCH_OPENED_INCONCLUSIVE,
     PLAYBACK_FAILED
 }
+
+data class YouTubeResultCandidate(
+    val title: String,
+    val centerX: Int,
+    val centerY: Int,
+    val relevanceScore: Float,
+    val isClickable: Boolean
+)
 
 data class MediaSessionState(
     var lastPlayedQuery: String? = null,
@@ -258,6 +268,43 @@ class MediaControlManager(
                 playSearchQueryInMediaApp(fullQuery, resolvedAppPkg)
             }
 
+            MediaOperation.SELECT_AND_VERIFY_YOUTUBE -> {
+                val cleanQuery = query?.trim()?.takeIf { it.isNotBlank() }
+                    ?: sessionState.lastPlayedQuery
+                    ?: "Android"
+                sessionState.lastPlayedQuery = cleanQuery
+                sessionState.lastMediaAppPackage = PKG_YOUTUBE
+                runYouTubeObservationWorkflow(
+                    query = cleanQuery,
+                    snapshotProvider = {
+                        if (NayroAccessibilityService.isConnected()) {
+                            screenIntelligenceManager.captureCurrentSnapshot()
+                        } else null
+                    },
+                    clickHandler = { target, x, y ->
+                        if (!NayroAccessibilityService.isConnected()) {
+                            false
+                        } else {
+                            val semanticOk = AccessibilityActionController.performClickWithCoordinateFallback(targetText = target)
+                            if (semanticOk) {
+                                true
+                            } else if (x != null && y != null && x > 0 && y > 0) {
+                                NayroAccessibilityService.instance?.dispatchTapGesture(x.toFloat(), y.toFloat())?.first == true
+                            } else {
+                                false
+                            }
+                        }
+                    },
+                    scrollHandler = {
+                        if (NayroAccessibilityService.isConnected()) {
+                            AccessibilityActionController.performScrollForward()
+                        } else false
+                    },
+                    playbackVerifier = { isAudioCurrentlyPlaying() },
+                    stepDelayMs = 300L
+                )
+            }
+
             MediaOperation.PLAY_QUERY -> {
                 val cleanQuery = query?.trim()?.takeIf { it.isNotBlank() }
                     ?: artist?.trim()?.takeIf { it.isNotBlank() }?.let { "$it songs" }
@@ -415,16 +462,39 @@ class MediaControlManager(
             }
         }
 
-        // 3. If Accessibility Service is connected, attempt to tap the first video/song result to start playback
+        // 3. Full YouTube / media observation -> result selection -> playback verification pipeline
+        val favPrefix = if (isFavouriteLookup) "Favourite song resolved ('$searchQuery'). " else ""
         if (NayroAccessibilityService.isConnected()) {
             delay(350)
-            AccessibilityActionController.performClickWithCoordinateFallback(targetText = searchQuery) ||
-                AccessibilityActionController.performClickWithCoordinateFallback(targetText = "Play")
-            delay(200)
+            val pipelineResult = runYouTubeObservationWorkflow(
+                query = searchQuery,
+                snapshotProvider = { screenIntelligenceManager.captureCurrentSnapshot() },
+                clickHandler = { target, x, y ->
+                    val semanticOk = AccessibilityActionController.performClickWithCoordinateFallback(targetText = target)
+                    if (semanticOk) {
+                        true
+                    } else if (x != null && y != null && x > 0 && y > 0) {
+                        NayroAccessibilityService.instance?.dispatchTapGesture(x.toFloat(), y.toFloat())?.first == true
+                    } else {
+                        false
+                    }
+                },
+                scrollHandler = { AccessibilityActionController.performScrollForward() },
+                playbackVerifier = { isAudioCurrentlyPlaying() },
+                stepDelayMs = 300L
+            )
+            if (pipelineResult.status == VerificationStatus.VERIFIED) {
+                return pipelineResult.copy(outputMessage = "$favPrefix${pipelineResult.outputMessage}")
+            }
+            if (pipelineResult.status == VerificationStatus.FAILED && !intentDispatched) {
+                return pipelineResult
+            }
+            if (pipelineResult.status == VerificationStatus.INCONCLUSIVE && intentDispatched) {
+                return pipelineResult.copy(outputMessage = "$favPrefix${pipelineResult.outputMessage}")
+            }
         }
 
         val musicActive = isAudioCurrentlyPlaying()
-        val favPrefix = if (isFavouriteLookup) "Favourite song resolved ('$searchQuery'). " else ""
 
         return when {
             musicActive -> {
@@ -454,5 +524,203 @@ class MediaControlManager(
                 )
             }
         }
+    }
+
+    /**
+     * Scores and selects the best matching YouTube video/song result node from an observed [ScreenSnapshot],
+     * filtering out navigation chrome, search bars, ads, and non-content controls.
+     */
+    fun selectBestYouTubeResult(
+        query: String,
+        snapshot: com.example.core.screen.ScreenSnapshot?
+    ): YouTubeResultCandidate? {
+        if (snapshot == null) return null
+        val chromeExclusions = setOf(
+            "search", "voice search", "navigate up", "back", "home", "shorts",
+            "subscriptions", "library", "you", "cast", "notifications", "filter",
+            "filters", "sign in", "sponsored", "ad", "skip", "dismiss", "close",
+            "clear", "clear query", "more options", "action menu"
+        )
+        val queryTokens = query.lowercase()
+            .replace(Regex("[^a-z0-9\\s]"), " ")
+            .split(Regex("\\s+"))
+            .filter { it.length >= 2 }
+            .toSet()
+
+        val candidates = snapshot.interactiveElements.mapNotNull { node ->
+            val label = node.displayLabel.trim()
+            val lower = label.lowercase()
+            if (label.length < 4) return@mapNotNull null
+            if (node.isEditable) return@mapNotNull null
+            if (lower in chromeExclusions) return@mapNotNull null
+            if (lower.startsWith("sponsored") || lower.contains("ad ·") || lower == "advertisement") return@mapNotNull null
+            if (lower == query.trim().lowercase() && node.viewId?.contains("search", ignoreCase = true) == true) {
+                return@mapNotNull null
+            }
+
+            val labelTokens = lower.replace(Regex("[^a-z0-9\\s]"), " ")
+                .split(Regex("\\s+"))
+                .filter { it.length >= 2 }
+                .toSet()
+
+            val matchedTokens = queryTokens.count { qt -> labelTokens.any { lt -> lt.contains(qt) || qt.contains(lt) } }
+            val tokenOverlap = if (queryTokens.isNotEmpty()) {
+                matchedTokens.toFloat() / queryTokens.size.toFloat()
+            } else {
+                0.2f
+            }
+
+            var score = tokenOverlap * 0.70f
+            if (lower.contains(query.trim().lowercase()) && query.trim().length >= 3) {
+                score += 0.25f
+            }
+            if (node.isClickable) score += 0.10f
+            if (label.length in 10..180) score += 0.08f
+            if (lower.contains("minutes") || lower.contains("views") || lower.contains("official") || lower.contains("video")) {
+                score += 0.07f
+            }
+
+            YouTubeResultCandidate(
+                title = label,
+                centerX = node.centerX,
+                centerY = node.centerY,
+                relevanceScore = score.coerceIn(0f, 1f),
+                isClickable = node.isClickable
+            )
+        }
+
+        return candidates.maxByOrNull { it.relevanceScore }
+    }
+
+    /**
+     * Full YouTube Search-to-Playback Observation & Verification Workflow (Section 5):
+     * OBSERVE SEARCH RESULTS -> HANDLE LOADING / DIALOGS / ERRORS -> SELECT CORRECT RESULT
+     * (scrolling once if needed) -> START PLAYBACK -> VERIFY PLAYBACK (with single retry/ad-skip).
+     *
+     * Never claims [VerificationStatus.VERIFIED] merely because YouTube or search results opened.
+     */
+    suspend fun runYouTubeObservationWorkflow(
+        query: String,
+        snapshotProvider: suspend () -> com.example.core.screen.ScreenSnapshot?,
+        clickHandler: suspend (targetLabel: String, centerX: Int?, centerY: Int?) -> Boolean,
+        scrollHandler: suspend () -> Boolean,
+        playbackVerifier: suspend () -> Boolean,
+        stepDelayMs: Long = 250L
+    ): ActionExecutionResult {
+        var snapshot = snapshotProvider()
+        if (snapshot == null) {
+            sessionState.lastVerificationState = MediaPlaybackVerificationState.SEARCH_OPENED
+            return ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "YouTube search opened for '$query', but live screen observation is unavailable (Accessibility snapshot unavailable) [STATE=SEARCH_OPENED].",
+                status = VerificationStatus.INCONCLUSIVE
+            )
+        }
+
+        // 1. Wait briefly if YouTube is still loading results (max 2 retries)
+        var loadingAttempts = 0
+        while (loadingAttempts < 2 && screenIntelligenceManager.analyzeScreenSemantics(snapshot).isLoadingState) {
+            loadingAttempts++
+            if (stepDelayMs > 0) delay(stepDelayMs)
+            snapshot = snapshotProvider() ?: break
+        }
+
+        val semantics = screenIntelligenceManager.analyzeScreenSemantics(snapshot)
+
+        // 2. Abort honestly on network / YouTube error screens
+        if (semantics.isErrorScreen) {
+            sessionState.lastVerificationState = MediaPlaybackVerificationState.FAILED
+            return ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "YouTube displayed an error or offline screen while searching for '$query' [STATE=FAILED].",
+                status = VerificationStatus.FAILED
+            )
+        }
+
+        // 3. Dismiss blocking modal dialogs / promos if present
+        if (semantics.hasDialogOrPopup) {
+            val dismissLabels = listOf("Skip", "Not now", "No thanks", "Dismiss", "Cancel")
+            val dismissed = dismissLabels.any { lbl -> clickHandler(lbl, null, null) }
+            if (dismissed) {
+                if (stepDelayMs > 0) delay(stepDelayMs)
+                snapshot = snapshotProvider() ?: snapshot
+            }
+        }
+
+        // 4. Select best matching result from observed search results; scroll once if none visible yet
+        var bestCandidate = selectBestYouTubeResult(query, snapshot)
+        if (bestCandidate == null) {
+            if (scrollHandler()) {
+                if (stepDelayMs > 0) delay(stepDelayMs)
+                snapshot = snapshotProvider()
+                bestCandidate = selectBestYouTubeResult(query, snapshot)
+            }
+        }
+
+        if (bestCandidate == null) {
+            sessionState.lastVerificationState = MediaPlaybackVerificationState.SEARCH_OPENED
+            return ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "YouTube search results observed for '$query', but no selectable video result was found on screen [STATE=SEARCH_OPENED].",
+                status = VerificationStatus.INCONCLUSIVE
+            )
+        }
+
+        // 5. Tap selected result to start playback
+        val clicked = clickHandler(
+            bestCandidate.title,
+            bestCandidate.centerX.takeIf { it > 0 },
+            bestCandidate.centerY.takeIf { it > 0 }
+        )
+        if (!clicked) {
+            sessionState.lastVerificationState = MediaPlaybackVerificationState.FAILED
+            return ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "Located YouTube result '${bestCandidate.title}', but tapping it failed [STATE=FAILED].",
+                status = VerificationStatus.FAILED
+            )
+        }
+
+        if (stepDelayMs > 0) delay(stepDelayMs)
+
+        // 6. Verify actual playback via MediaSessionManager / AudioManager
+        if (playbackVerifier()) {
+            sessionState.lastPlayedQuery = query
+            sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_VERIFIED
+            return ActionExecutionResult(
+                isSuccess = true,
+                outputMessage = "Selected '${bestCandidate.title}' on YouTube and verified active playback [STATE=PLAYBACK_VERIFIED].",
+                status = VerificationStatus.VERIFIED
+            )
+        }
+
+        // 7. Single bounded recovery: check for pre-roll Skip Ad or paused Play button and re-verify
+        val postTapSnapshot = snapshotProvider()
+        val postTexts = postTapSnapshot?.visibleTexts.orEmpty().joinToString(" ").lowercase()
+        if (postTexts.contains("skip ad") || postTexts.contains("skip")) {
+            clickHandler("Skip", null, null)
+            if (stepDelayMs > 0) delay(stepDelayMs)
+        } else {
+            clickHandler("Play", null, null)
+            if (stepDelayMs > 0) delay(stepDelayMs)
+        }
+
+        if (playbackVerifier()) {
+            sessionState.lastPlayedQuery = query
+            sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_VERIFIED
+            return ActionExecutionResult(
+                isSuccess = true,
+                outputMessage = "Selected '${bestCandidate.title}' on YouTube and verified active playback after recovery tap [STATE=PLAYBACK_VERIFIED].",
+                status = VerificationStatus.VERIFIED
+            )
+        }
+
+        // Honest reporting: never claim playback verified when AudioManager/MediaSession is inactive!
+        sessionState.lastVerificationState = MediaPlaybackVerificationState.RESULT_SELECTED_PLAYBACK_UNVERIFIED
+        return ActionExecutionResult(
+            isSuccess = false,
+            outputMessage = "Selected YouTube result '${bestCandidate.title}', but active audio/MediaSession playback could not be verified [STATE=RESULT_SELECTED_PLAYBACK_UNVERIFIED].",
+            status = VerificationStatus.INCONCLUSIVE
+        )
     }
 }

@@ -100,14 +100,16 @@ data class AmbientNoiseReport(
 )
 
 /**
- * Section 5 — Advanced Local Wake-Word Engine for NAYRO (Babu).
+ * Section 5 — Local Wake-Word Engine for NAYRO (MFCC + DTW Acoustic Template Matcher).
  *
  * Implements:
- * - Honest binary inspection of `app/src/main/assets/nayro_kws_model.tflite` via [inspectBundledAssetFormat]:
- *   detects whether the asset is a TensorFlow Lite FlatBuffer (`TFL3`) or JSON acoustic templates
- *   (`JSON_ACOUSTIC_TEMPLATES`) and treats it transparently as a local MFCC + DTW template system.
+ * - Honest asset loading and format inspection of `app/src/main/assets/nayro_kws_templates.json`
+ *   via [inspectBundledAssetFormat]: explicitly identifies itself as a local MFCC + DTW JSON
+ *   acoustic template engine (`JSON_ACOUSTIC_TEMPLATES`, non-TFLite).
+ * - Configurable wake phrases (e.g. "Hi Nayro", "Hi Nero", "Hi Babu", "Hi Qki", or any user-defined
+ *   wake phrase via [AssistantIdentityStore] and on-device voice enrollment).
  * - Audio input pipeline via Android `AudioRecord` (16kHz, mono, 16-bit PCM) with adaptive noise floor,
- *   audio segmentation, and strict microphone lifecycle management.
+ *   SNR false-positive rejection, silence hangover segmentation, and strict microphone lifecycle management.
  * - Audio preprocessing: DC offset removal, 0.97 pre-emphasis filter, and Hamming windowing.
  * - Feature extraction: 13-coefficient Mel-Frequency Cepstral Coefficient (MFCC) single-frame and
  *   multi-frame sliding-window sequences (`extractMfccSequence`).
@@ -118,15 +120,28 @@ data class AmbientNoiseReport(
 class LocalWakeWordEngine(private val context: Context?) {
 
     companion object {
-        val SUPPORTED_PHRASES = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hi Nairo", "Hey Nairo", "Hey Cutie")
+        val SUPPORTED_PHRASES = listOf(
+            "Hi Nayro", "Hey Nayro",
+            "Hi Nero", "Hey Nero",
+            "Hi Babu", "Hey Babu",
+            "Hi Qki", "Hey Qki",
+            "Hi Nairo", "Hey Nairo",
+            "Hey Cutie"
+        )
         val VOICE_EXIT_COMMANDS = setOf(
             "stop", "cancel", "stop babu", "cancel babu", "bye babu",
             "stop nayro", "cancel nayro", "stop nairo", "cancel nairo",
+            "stop nero", "cancel nero", "stop qki", "cancel qki",
             "exit", "band karo", "ruko", "bas karo", "chup ho jao"
         )
-        const val BUNDLED_KWS_MODEL_ASSET = "nayro_kws_model.tflite"
+        const val BUNDLED_KWS_TEMPLATES_ASSET = "nayro_kws_templates.json"
+        /** Backward-compatible alias pointing to the honestly named JSON MFCC+DTW template asset. */
+        const val BUNDLED_KWS_MODEL_ASSET = BUNDLED_KWS_TEMPLATES_ASSET
+        const val ENGINE_IMPLEMENTATION_DESCRIPTION = "Local MFCC + DTW Acoustic Template Matcher (JSON templates, non-TFLite)"
         const val DEFAULT_SAMPLE_RATE_HZ = 16000
         const val NUM_MFCC = 13
+        const val MIN_SNR_MARGIN_RATIO = 1.6
+        const val SILENCE_HANGOVER_FRAMES = 4
     }
 
     private val _engineState = MutableStateFlow(WakeEngineState.STOPPED)
@@ -139,7 +154,9 @@ class LocalWakeWordEngine(private val context: Context?) {
     private val loadedTemplates = mutableMapOf<String, WakePhraseAcousticTemplate>()
 
     @Volatile
-    private var configuredAssistantName: String = "Babu"
+    private var configuredAssistantName: String =
+        com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+            ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
 
     @Volatile
     private var detectedAssetFormat: WakeAssetFormat = WakeAssetFormat.MISSING
@@ -343,10 +360,14 @@ class LocalWakeWordEngine(private val context: Context?) {
 
     private fun seedDefaultAcousticTemplates() {
         val defaults = listOf(
-            "Hi Babu" to floatArrayOf(12.4f, -3.2f, 4.1f, -1.8f, 2.5f, -0.9f, 1.4f, -0.6f, 0.8f, -0.3f, 0.5f, -0.2f, 0.3f),
-            "Hey Babu" to floatArrayOf(13.1f, -2.9f, 3.8f, -1.5f, 2.2f, -1.1f, 1.3f, -0.5f, 0.7f, -0.4f, 0.4f, -0.2f, 0.3f),
             "Hi Nayro" to floatArrayOf(11.8f, -3.5f, 4.4f, -2.1f, 2.7f, -0.8f, 1.6f, -0.7f, 0.9f, -0.3f, 0.6f, -0.2f, 0.4f),
             "Hey Nayro" to floatArrayOf(12.2f, -3.1f, 4.0f, -1.9f, 2.4f, -1.0f, 1.5f, -0.6f, 0.8f, -0.4f, 0.5f, -0.2f, 0.3f),
+            "Hi Nero" to floatArrayOf(12.0f, -3.3f, 4.2f, -2.0f, 2.6f, -0.9f, 1.5f, -0.6f, 0.85f, -0.3f, 0.55f, -0.2f, 0.35f),
+            "Hey Nero" to floatArrayOf(12.3f, -3.0f, 3.9f, -1.8f, 2.3f, -1.0f, 1.4f, -0.6f, 0.8f, -0.35f, 0.5f, -0.2f, 0.3f),
+            "Hi Babu" to floatArrayOf(12.4f, -3.2f, 4.1f, -1.8f, 2.5f, -0.9f, 1.4f, -0.6f, 0.8f, -0.3f, 0.5f, -0.2f, 0.3f),
+            "Hey Babu" to floatArrayOf(13.1f, -2.9f, 3.8f, -1.5f, 2.2f, -1.1f, 1.3f, -0.5f, 0.7f, -0.4f, 0.4f, -0.2f, 0.3f),
+            "Hi Qki" to floatArrayOf(11.6f, -2.6f, 4.6f, -1.5f, 2.8f, -1.1f, 1.6f, -0.7f, 0.95f, -0.4f, 0.55f, -0.25f, 0.35f),
+            "Hey Qki" to floatArrayOf(11.9f, -2.5f, 4.5f, -1.4f, 2.7f, -1.1f, 1.55f, -0.7f, 0.9f, -0.4f, 0.5f, -0.25f, 0.35f),
             "Hi Nairo" to floatArrayOf(11.8f, -3.5f, 4.4f, -2.1f, 2.7f, -0.8f, 1.6f, -0.7f, 0.9f, -0.3f, 0.6f, -0.2f, 0.4f),
             "Hey Nairo" to floatArrayOf(12.2f, -3.1f, 4.0f, -1.9f, 2.4f, -1.0f, 1.5f, -0.6f, 0.8f, -0.4f, 0.5f, -0.2f, 0.3f),
             "Hey Cutie" to floatArrayOf(11.5f, -2.4f, 4.8f, -1.4f, 2.9f, -1.2f, 1.7f, -0.8f, 1.0f, -0.5f, 0.6f, -0.3f, 0.4f)
@@ -744,18 +765,18 @@ class LocalWakeWordEngine(private val context: Context?) {
     }
 
     /**
-     * Configures dynamic wake phrases for any user-defined assistant name (e.g. "Babu", "Jarvis", "Friday", "Alex")
+     * Configures dynamic wake phrases for any user-defined assistant name (e.g. "Nero", "Babu", "Qki", "Alex")
      * and returns the honest [WakePhraseSupportStatus] for each configured phrase.
      */
     fun configureWakePhrasesForAssistantName(assistantName: String): Map<String, WakePhraseSupportStatus> = synchronized(activeWakePhrases) {
-        val cleanName = assistantName.trim().ifEmpty { "Babu" }
+        val cleanName = assistantName.trim().ifEmpty { com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME }
         configuredAssistantName = cleanName
         val primaryPhrases = listOf(
             "Hi $cleanName",
             "Hey $cleanName",
             "Hi Nayro",
             "Hey Nayro"
-        ).distinct()
+        ).distinctBy { it.lowercase() }
 
         for (p in primaryPhrases) {
             if (activeWakePhrases.none { it.equals(p, ignoreCase = true) }) {
@@ -763,6 +784,55 @@ class LocalWakeWordEngine(private val context: Context?) {
             }
         }
         primaryPhrases.associateWith { getWakePhraseSupportStatus(it) }
+    }
+
+    /**
+     * Replaces the active wake-phrase list with the exact user-configured list (e.g. from [AssistantIdentityStore]).
+     */
+    fun setConfiguredWakePhrases(phrases: List<String>): Map<String, WakePhraseSupportStatus> = synchronized(activeWakePhrases) {
+        val cleaned = phrases.map { it.trim() }
+            .filter { it.length >= 3 }
+            .distinctBy { it.lowercase() }
+        if (cleaned.isNotEmpty()) {
+            activeWakePhrases.clear()
+            activeWakePhrases.addAll(cleaned)
+        }
+        activeWakePhrases.associateWith { getWakePhraseSupportStatus(it) }
+    }
+
+    fun syncFromIdentityStore(store: com.example.core.identity.AssistantIdentityStore) {
+        val profile = store.getCurrentProfile()
+        configuredAssistantName = profile.assistantDisplayName
+        setConfiguredWakePhrases(profile.wakePhrases)
+    }
+
+    /**
+     * False-positive rejection gate applied before DTW wake matching:
+     * rejects silence, constant-amplitude DC/hum, impulsive clicks (too short), and broadband static noise (ZCR > 0.48)
+     * or signals below the adaptive SNR margin.
+     */
+    fun evaluateFalsePositiveGate(
+        pcmSamples: ShortArray,
+        length: Int = pcmSamples.size,
+        noiseFloorRms: Double = adaptiveNoiseFloorRms
+    ): Pair<Boolean, String> {
+        val safeLen = length.coerceAtMost(pcmSamples.size)
+        if (safeLen < 800) {
+            return false to "Rejected: utterance too short (< 50ms) to be a wake phrase."
+        }
+        val features = extractAcousticFeatures(pcmSamples, safeLen)
+        val rms = features[0].toDouble()
+        val zcr = features[1].toDouble()
+        if (rms < 350.0) {
+            return false to "Rejected: below speech energy threshold (rms=${"%.1f".format(rms)})."
+        }
+        if (rms < noiseFloorRms * MIN_SNR_MARGIN_RATIO) {
+            return false to "Rejected: insufficient SNR margin over background noise floor (rms=${"%.1f".format(rms)}, floor=${"%.1f".format(noiseFloorRms)})."
+        }
+        if (zcr < 0.015 || zcr > 0.48) {
+            return false to "Rejected: non-speech zero-crossing rate (zcr=${"%.3f".format(zcr)})."
+        }
+        return true to "Accepted speech candidate (rms=${"%.1f".format(rms)}, zcr=${"%.3f".format(zcr)})."
     }
 
     fun addWakePhrase(phrase: String): Boolean = synchronized(activeWakePhrases) {
@@ -1195,6 +1265,7 @@ class LocalWakeWordEngine(private val context: Context?) {
                 val segmentWindow = ShortArray(DEFAULT_SAMPLE_RATE_HZ) // 1.0s rolling speech segment
                 var segmentWritePos = 0
                 var activeVoicedFrames = 0
+                var silenceHangoverCount = 0
 
                 while (isActive && _engineState.value == WakeEngineState.LISTENING_FOR_WAKE) {
                     val read = try {
@@ -1206,14 +1277,12 @@ class LocalWakeWordEngine(private val context: Context?) {
                         val features = extractAcousticFeatures(frameBuf, read)
                         val rms = features[0].toDouble()
                         val zcr = features[1].toDouble()
-                        if (rms < 400.0) {
-                            adaptiveNoiseFloorRms = (0.92 * adaptiveNoiseFloorRms + 0.08 * rms).coerceIn(80.0, 650.0)
-                            if (activeVoicedFrames >= 6 && segmentWritePos >= 1600) {
-                                matchUtteranceByDtw(segmentWindow, segmentWritePos)
-                            }
-                            activeVoicedFrames = 0
-                            segmentWritePos = 0
-                        } else if (rms > adaptiveNoiseFloorRms * 1.8 && zcr in 0.03..0.44) {
+                        val isSpeechFrame = rms >= 400.0 &&
+                            rms > adaptiveNoiseFloorRms * MIN_SNR_MARGIN_RATIO &&
+                            zcr in 0.02..0.46
+
+                        if (isSpeechFrame) {
+                            silenceHangoverCount = 0
                             val toCopy = kotlin.math.min(read, segmentWindow.size - segmentWritePos)
                             if (toCopy > 0) {
                                 System.arraycopy(frameBuf, 0, segmentWindow, segmentWritePos, toCopy)
@@ -1221,9 +1290,34 @@ class LocalWakeWordEngine(private val context: Context?) {
                             }
                             activeVoicedFrames++
                             if (segmentWritePos >= segmentWindow.size) {
-                                matchUtteranceByDtw(segmentWindow, segmentWritePos)
+                                val (accepted, _) = evaluateFalsePositiveGate(segmentWindow, segmentWritePos, adaptiveNoiseFloorRms)
+                                if (accepted) {
+                                    matchUtteranceByDtw(segmentWindow, segmentWritePos)
+                                }
                                 segmentWritePos = 0
                                 activeVoicedFrames = 0
+                            }
+                        } else {
+                            if (rms < 400.0) {
+                                adaptiveNoiseFloorRms = (0.92 * adaptiveNoiseFloorRms + 0.08 * rms).coerceIn(80.0, 650.0)
+                            }
+                            if (activeVoicedFrames > 0) {
+                                silenceHangoverCount++
+                                if (silenceHangoverCount < SILENCE_HANGOVER_FRAMES && segmentWritePos + read <= segmentWindow.size) {
+                                    // Preserve brief inter-syllable pause inside two-word wake phrases ("Hi ... Nero")
+                                    System.arraycopy(frameBuf, 0, segmentWindow, segmentWritePos, read)
+                                    segmentWritePos += read
+                                } else {
+                                    if (activeVoicedFrames >= 6 && segmentWritePos >= 2400) {
+                                        val (accepted, _) = evaluateFalsePositiveGate(segmentWindow, segmentWritePos, adaptiveNoiseFloorRms)
+                                        if (accepted) {
+                                            matchUtteranceByDtw(segmentWindow, segmentWritePos)
+                                        }
+                                    }
+                                    activeVoicedFrames = 0
+                                    segmentWritePos = 0
+                                    silenceHangoverCount = 0
+                                }
                             }
                         }
                     } else {

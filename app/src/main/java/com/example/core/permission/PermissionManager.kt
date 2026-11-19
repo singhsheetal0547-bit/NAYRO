@@ -429,8 +429,60 @@ class PermissionManager(private val context: Context) {
         }
     }
 
+    enum class PermissionCheckOutcome {
+        GRANTED,
+        DENIED,
+        INCONCLUSIVE,
+        UNAVAILABLE
+    }
+
+    data class PermissionVerificationDetail(
+        val permission: String,
+        val outcome: PermissionCheckOutcome,
+        val reason: String
+    ) {
+        val isGranted: Boolean get() = outcome == PermissionCheckOutcome.GRANTED
+    }
+
+    /**
+     * Strict fail-closed single-permission check without triggering any global permission refresh.
+     * Never treats exceptions, null context, or unknown states as GRANTED.
+     */
+    fun checkPermissionFailClosed(permission: String): PermissionVerificationDetail {
+        val clean = permission.trim()
+        if (clean.isEmpty()) {
+            return PermissionVerificationDetail(
+                permission = permission,
+                outcome = PermissionCheckOutcome.UNAVAILABLE,
+                reason = "Permission identifier is empty or unavailable."
+            )
+        }
+        return try {
+            val status = ContextCompat.checkSelfPermission(context, clean)
+            if (status == PackageManager.PERMISSION_GRANTED) {
+                PermissionVerificationDetail(
+                    permission = clean,
+                    outcome = PermissionCheckOutcome.GRANTED,
+                    reason = "Permission $clean is granted by Android."
+                )
+            } else {
+                PermissionVerificationDetail(
+                    permission = clean,
+                    outcome = PermissionCheckOutcome.DENIED,
+                    reason = "Permission $clean is not granted."
+                )
+            }
+        } catch (e: Exception) {
+            PermissionVerificationDetail(
+                permission = clean,
+                outcome = PermissionCheckOutcome.INCONCLUSIVE,
+                reason = "Fail-closed: unable to verify permission $clean (${e.javaClass.simpleName}: ${e.localizedMessage ?: "error"})."
+            )
+        }
+    }
+
     fun isPermissionGranted(permission: String): Boolean {
-        return ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+        return checkPermissionFailClosed(permission).isGranted
     }
 
     fun canDrawOverlays(): Boolean {

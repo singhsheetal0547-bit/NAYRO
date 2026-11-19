@@ -1003,7 +1003,9 @@ class ActionExecutor(
                     ?: (System.currentTimeMillis() + 3_600_000L)
                 val endTimeMs = action.parameters["endTimeMs"]?.toLongOrNull()
                     ?: (startTimeMs + 3_600_000L)
-                val description = action.parameters["description"] ?: "Scheduled by NAYRO (Babu)"
+                val activeAssistantName = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+                    ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
+                val description = action.parameters["description"] ?: "Scheduled by NAYRO ($activeAssistantName)"
                 val location = action.parameters["location"] ?: ""
                 calendarManager.createEvent(
                     title = title,
@@ -1098,8 +1100,10 @@ class ActionExecutor(
                     )
                 }
 
+                val activeAssistantName = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
+                    ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
                 val systemPrompt = buildString {
-                    append("You are Babu, the intelligent voice-first personal AI assistant inside NAYRO for Android. ")
+                    append("You are $activeAssistantName, the intelligent voice-first personal AI assistant inside NAYRO for Android. ")
                     append("Respond naturally in the user's language (Hindi, English, or Hinglish). Keep responses concise, helpful, and honest. ")
                     append("Available Dynamic Tools:\n")
                     append(ToolRegistryManager.generateLlmToolPromptSummary())

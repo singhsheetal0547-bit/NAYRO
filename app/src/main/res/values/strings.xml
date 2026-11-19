@@ -17,4 +17,21 @@
     <string name="accessibility_service_description">NAYRO assistant accessibility service for screen reading context and user-authorized UI navigation assistance.</string>
     <string name="status_accessibility_connected">Accessibility Connected</string>
     <string name="status_accessibility_disconnected">Accessibility Disconnected</string>
+    <string name="stt_persona_title">Babu NAYRO cute baby</string>
+    <string name="stt_panel_subtitle">Voice Commands • Android Speech-to-Text</string>
+    <string name="stt_mic_permission_granted">Mic Ready</string>
+    <string name="stt_mic_permission_needed">Mic Permission Needed</string>
+    <string name="stt_mic_rationale_title">Microphone Access Required</string>
+    <string name="stt_mic_rationale_body">Allow Android microphone permission so you can speak voice commands directly to Babu NAYRO cute baby.</string>
+    <string name="stt_grant_mic_permission">Allow Microphone</string>
+    <string name="stt_open_app_settings">Open App Settings</string>
+    <string name="stt_tap_to_speak">Tap microphone to speak a command</string>
+    <string name="stt_listening_prompt">Listening to you… speak clearly now</string>
+    <string name="stt_transcribing_prompt">Converting your speech to text…</string>
+    <string name="stt_speaking_prompt">Babu NAYRO cute baby is replying…</string>
+    <string name="stt_stop_listening">Stop Listening</string>
+    <string name="stt_stop_speaking">Stop Speaking</string>
+    <string name="stt_retry_listening">Try Again</string>
+    <string name="stt_clear_transcript">Clear</string>
+    <string name="stt_service_unavailable">Android Speech Recognition service is not available on this device.</string>
 </resources>

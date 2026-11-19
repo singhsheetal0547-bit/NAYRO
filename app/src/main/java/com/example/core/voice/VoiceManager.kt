@@ -250,6 +250,41 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
     }
 
     /**
+     * Normalizes a spoken Speech-to-Text command addressed to "Babu NAYRO cute baby" or the
+     * user's configured assistant name. Strips the invocation prefix when a concrete command
+     * follows, while preserving standalone greetings so the assistant responds warmly.
+     */
+    fun normalizeVoiceInvocationCommand(rawText: String): String {
+        val clean = normalizeTranscript(rawText)
+        if (clean.isEmpty()) return ""
+        val customPrefixes = listOf(
+            "Hey Babu NAYRO cute baby",
+            "Hi Babu NAYRO cute baby",
+            "Babu NAYRO cute baby",
+            "Hey Babu Nayro",
+            "Hi Babu Nayro",
+            "Babu Nayro"
+        )
+        for (prefix in customPrefixes) {
+            if (clean.equals(prefix, ignoreCase = true)) {
+                return clean
+            }
+            val regex = Regex("^(?i)${Regex.escape(prefix)}(?:[\\s,:!.-]+)(.+)$")
+            val match = regex.find(clean)
+            if (match != null) {
+                val remainder = match.groupValues[1].trim()
+                if (remainder.isNotBlank()) return remainder
+            }
+        }
+        return identityStore?.stripWakePrefix(clean) ?: clean
+    }
+
+    fun clearTranscriptAndError() {
+        _transcribedText.value = ""
+        _errorMessage.value = null
+    }
+
+    /**
      * Section 4 — Prevents duplicate voice command execution if SpeechRecognizer emits identical final results within a short window.
      */
     @Synchronized
@@ -299,31 +334,137 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
         }
     }
 
+    private var identityStore: com.example.core.identity.AssistantIdentityStore? =
+        com.example.core.identity.AssistantIdentityStore.sharedInstance
+
+    enum class TwoStageWakeOutcome {
+        WAKE_ONLY_ACTIVATED,
+        WAKE_AND_COMMAND_DISPATCHED,
+        FOLLOW_UP_COMMAND_DISPATCHED,
+        VOICE_EXIT_STOPPED,
+        IGNORED_NO_WAKE_PHRASE
+    }
+
+    /**
+     * Binds the single authoritative [AssistantIdentityStore] so assistant display name,
+     * wake phrases, language, speech rate, and activation prompts stay unified.
+     */
+    fun bindIdentityStore(store: com.example.core.identity.AssistantIdentityStore) {
+        identityStore = store
+        val profile = store.getCurrentProfile()
+        wakeWordEngine.syncFromIdentityStore(store)
+        _configuration.value = _configuration.value.copy(
+            assistantName = profile.assistantDisplayName,
+            wakePhrase = profile.wakePhrases.firstOrNull() ?: "Hi ${profile.assistantDisplayName}",
+            wakePhrases = profile.wakePhrases,
+            languageTag = profile.languageTag,
+            speechRate = profile.speechRate,
+            isTtsEnabled = profile.isTtsEnabled,
+            isWakeWordEnabled = profile.isWakeWordEnabled,
+            isContinuousConversationEnabled = profile.isContinuousConversationEnabled
+        )
+    }
+
+    /**
+     * Two-Stage Wake Word & Voice Activation handler (Section 2):
+     * - Stage A (Wake Detection): detects any configured wake phrase (e.g. "Hi Nero", "Hi Babu", "Hi Qki", custom).
+     *   If only the wake phrase is spoken, transitions to WAKE_DETECTED, opens follow-up session, and emits the
+     *   activation cue without needing the wake phrase repeated for the next command.
+     * - Stage B (Command Understanding & Follow-Up): if an inline command follows the wake phrase or if a
+     *   follow-up conversation window is already active, strips any wake prefix and dispatches directly to
+     *   the unified AgentRuntime listener.
+     */
+    fun processTwoStageVoiceUtterance(
+        rawUtterance: String,
+        onActivationCue: ((String) -> Unit)? = null,
+        onCommandReady: ((String) -> Unit)? = null
+    ): TwoStageWakeOutcome {
+        val clean = normalizeTranscript(rawUtterance)
+        if (clean.isEmpty()) return TwoStageWakeOutcome.IGNORED_NO_WAKE_PHRASE
+
+        val activeName = identityStore?.getDisplayName() ?: _configuration.value.assistantName
+        if (wakeWordEngine.isVoiceExitCommand(clean, activeName) || isConversationExitPhrase(clean)) {
+            _isFollowUpSessionActive.value = false
+            _voiceState.value = if (_configuration.value.isWakeWordEnabled) VoiceState.STANDBY else VoiceState.IDLE
+            return TwoStageWakeOutcome.VOICE_EXIT_STOPPED
+        }
+
+        // Check configured wake phrases (identityStore first, then engine configured phrases)
+        val matchedPair: Pair<String, String>? = identityStore?.matchWakePhraseInText(clean) ?: run {
+            val phrases = wakeWordEngine.getConfiguredWakePhrases().sortedByDescending { it.length }
+            phrases.firstNotNullOfOrNull { phrase ->
+                val regex = Regex("^(?i)${Regex.escape(phrase)}(?:[\\s,:!.-]+(.*))?$")
+                val m = regex.find(clean)
+                if (m != null) phrase to (m.groupValues.getOrNull(1)?.trim().orEmpty()) else null
+            }
+        }
+
+        if (matchedPair != null) {
+            val (_, inlineCommand) = matchedPair
+            _voiceState.value = VoiceState.WAKE_DETECTED
+            _isFollowUpSessionActive.value = _configuration.value.isContinuousConversationEnabled
+            return if (inlineCommand.isBlank()) {
+                // Stage A only: activate assistant and open Stage B listening window
+                val activationCue = identityStore?.getCurrentProfile()?.activationResponse
+                    ?: if (_configuration.value.languageTag.startsWith("hi", ignoreCase = true)) "Haan, boliye" else "Yes, listening"
+                onActivationCue?.invoke(activationCue)
+                TwoStageWakeOutcome.WAKE_ONLY_ACTIVATED
+            } else {
+                // Stage A + Stage B inline: dispatch command immediately to unified AgentRuntime
+                onCommandReady?.invoke(inlineCommand) ?: dispatchRecognizedSpeech(inlineCommand)
+                TwoStageWakeOutcome.WAKE_AND_COMMAND_DISPATCHED
+            }
+        }
+
+        // Stage B follow-up turn without repeating the wake phrase
+        if (_isFollowUpSessionActive.value) {
+            onCommandReady?.invoke(clean) ?: dispatchRecognizedSpeech(clean)
+            return TwoStageWakeOutcome.FOLLOW_UP_COMMAND_DISPATCHED
+        }
+
+        return TwoStageWakeOutcome.IGNORED_NO_WAKE_PHRASE
+    }
+
     fun updateAssistantIdentity(assistantName: String) {
-        val cleanName = assistantName.trim().ifEmpty { "Babu" }
-        val configuredPhrases = wakeWordEngine.configureWakePhrasesForAssistantName(cleanName)
+        val cleanName = assistantName.trim().ifEmpty { com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME }
+        identityStore?.updateDisplayName(cleanName, autoSyncWakePhrases = true)
+        val defaultMap = wakeWordEngine.configureWakePhrasesForAssistantName(cleanName)
+        val configuredPhrases = identityStore?.getWakePhrases() ?: defaultMap.keys.toList()
+        wakeWordEngine.setConfiguredWakePhrases(configuredPhrases)
         _configuration.value = _configuration.value.copy(
             assistantName = cleanName,
-            wakePhrase = "Hey $cleanName",
-            wakePhrases = configuredPhrases.keys.toList()
+            wakePhrase = configuredPhrases.firstOrNull() ?: "Hi $cleanName",
+            wakePhrases = configuredPhrases
         )
     }
 
     fun updateConfiguration(newConfig: VoiceConfiguration) {
         _configuration.value = newConfig
         wakeWordEngine.setSensitivity(newConfig.sensitivity)
+        val desiredPhrases = buildList {
+            if (newConfig.wakePhrases.isNotEmpty()) {
+                addAll(newConfig.wakePhrases)
+            }
+            if (newConfig.wakePhrase.isNotBlank()) {
+                add(newConfig.wakePhrase)
+            }
+            if (newConfig.assistantName.isNotBlank()) {
+                add("Hi ${newConfig.assistantName}")
+                add("Hey ${newConfig.assistantName}")
+            }
+        }.map { it.trim() }.filter { it.length >= 3 }.distinctBy { it.lowercase() }
+
         wakeWordEngine.configureWakePhrasesForAssistantName(newConfig.assistantName)
-        listOf(
-            newConfig.wakePhrase,
-            "Hi ${newConfig.assistantName}",
-            "Hey ${newConfig.assistantName}",
-            "Hey Babu",
-            "Hi Babu",
-            "Hey Cutie",
-            "Hi Nayro"
+        if (desiredPhrases.isNotEmpty()) {
+            wakeWordEngine.setConfiguredWakePhrases(desiredPhrases)
+        }
+        identityStore?.updateVoiceAndLanguage(
+            languageTag = newConfig.languageTag,
+            speechRate = newConfig.speechRate,
+            isTtsEnabled = newConfig.isTtsEnabled,
+            isWakeWordEnabled = newConfig.isWakeWordEnabled,
+            isContinuousConversationEnabled = newConfig.isContinuousConversationEnabled
         )
-            .distinct()
-            .forEach { wakeWordEngine.addWakePhrase(it) }
 
         if (isTtsReady) {
             tts?.language = Locale.forLanguageTag(newConfig.languageTag)
@@ -362,21 +503,36 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
             onExternalAudioInterruption("Phone call active during wake trigger")
             return
         }
-        // Step 1: Release wake-word AudioRecord immediately before starting ASR or TTS
+        // Stage A: Release wake-word AudioRecord immediately before activation prompt / ASR
         wakeWordEngine.pauseForAsr()
         _voiceState.value = VoiceState.WAKE_DETECTED
         _isFollowUpSessionActive.value = _configuration.value.isContinuousConversationEnabled
 
-        // Start active speech recognition for the user's command
-        startManualListening(isFollowUpTurn = false) { recognizedText ->
-            serviceResultListener?.invoke(recognizedText)
+        val startStageBCommandListening = {
+            startManualListening(isFollowUpTurn = false) { recognizedText ->
+                val cleanedCommand = identityStore?.stripWakePrefix(recognizedText) ?: recognizedText
+                dispatchRecognizedSpeech(cleanedCommand)
+            }
+        }
+
+        // Speak short activation confirmation cue when TTS is ready; handleTtsCompleted opens Stage B listening window
+        val activationCue = identityStore?.getCurrentProfile()?.activationResponse
+            ?: if (_configuration.value.languageTag.startsWith("hi", ignoreCase = true)) "Haan, boliye" else "Yes, listening"
+
+        if (_configuration.value.isTtsEnabled && isTtsReady && tts != null) {
+            _isFollowUpSessionActive.value = true
+            speak(text = activationCue, expectFollowUp = true)
+        } else {
+            startStageBCommandListening()
         }
     }
 
     fun startListening() {
         startManualListening(isFollowUpTurn = false) { recognized ->
-            onSpeechRecognized?.invoke(recognized)
-            serviceResultListener?.invoke(recognized)
+            val command = normalizeVoiceInvocationCommand(recognized)
+            if (command.isNotBlank()) {
+                dispatchRecognizedSpeech(command)
+            }
         }
     }
 
