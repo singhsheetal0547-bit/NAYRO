@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: nayro-debug-apk-${{ github.ref }}
@@ -84,13 +85,43 @@ jobs:
           "$AAPT" dump permissions "$APK" || true
           echo "$APK" > apk-path.txt
 
+      - name: Remove previous NAYRO debug APK artifacts to free Actions storage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            );
+
+            const previousApks = artifacts.filter(
+              artifact =>
+                artifact.name === "NAYRO-debug-apk" &&
+                !artifact.expired
+            );
+
+            for (const artifact of previousApks) {
+              core.info(`Deleting old artifact ${artifact.name} (ID: ${artifact.id}, size: ${artifact.size_in_bytes} bytes)`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id
+              });
+            }
+
+            core.info(`Deleted ${previousApks.length} previous NAYRO debug APK artifact(s).`);
+
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
           name: NAYRO-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 1
 
       - name: Run unit tests
         run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
