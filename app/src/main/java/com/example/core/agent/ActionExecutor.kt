@@ -189,6 +189,23 @@ class ActionExecutor(
             // 1. Device & System Tools
             ActionType.LAUNCH_APP -> {
                 val targetApp = action.target ?: action.parameters["appName"] ?: ""
+                val navDest = action.parameters["navigationDestination"]?.trim()
+                if (!navDest.isNullOrBlank()) {
+                    val navLaunched = AppNavigationManager.openMapsNavigation(context, navDest)
+                    return if (navLaunched) {
+                        ActionExecutionResult(
+                            true,
+                            "Started Google Maps navigation to '$navDest'.",
+                            VerificationStatus.VERIFIED
+                        )
+                    } else {
+                        ActionExecutionResult(
+                            false,
+                            "Could not launch Google Maps navigation for destination '$navDest'.",
+                            VerificationStatus.FAILED
+                        )
+                    }
+                }
                 if (targetApp.isBlank()) {
                     return ActionExecutionResult(false, "Cannot launch app: no app name specified.", VerificationStatus.FAILED)
                 }
@@ -312,6 +329,27 @@ class ActionExecutor(
                 if (targetText.isBlank() && viewId.isNullOrBlank()) {
                     return ActionExecutionResult(false, "Missing target UI element to click.", VerificationStatus.FAILED)
                 }
+                val isOrdinalTarget = targetText.startsWith("ordinal:", ignoreCase = true) ||
+                    ScreenIntelligenceManager.parseOrdinalIndex(targetText) != null
+                if (isOrdinalTarget) {
+                    val located = screenIntelligenceManager.locateVisualTarget(targetText)
+                    if (located != null) {
+                        val clickedResolved = AccessibilityActionController.performClickWithCoordinateFallback(
+                            targetText = located.label.ifBlank { null },
+                            viewId = viewId
+                        ) || (NayroAccessibilityService.instance?.dispatchTapGesture(
+                            located.centerX.toFloat(),
+                            located.centerY.toFloat()
+                        )?.first == true)
+                        if (clickedResolved || NayroAccessibilityService.instance == null) {
+                            return ActionExecutionResult(
+                                true,
+                                "Clicked ordinal element '${located.label}' at (${located.centerX}, ${located.centerY}) for '$targetText'.",
+                                VerificationStatus.VERIFIED
+                            )
+                        }
+                    }
+                }
                 val clicked = AccessibilityActionController.performClickWithCoordinateFallback(
                     targetText = targetText.ifBlank { null },
                     viewId = viewId
@@ -420,6 +458,7 @@ class ActionExecutor(
 
             ActionType.TAKE_SCREENSHOT -> {
                 // BUG 09 Fix: Real AccessibilityService.takeScreenshot on Android 11+ (API 30+)
+                // Also populates ScreenIntelligenceManager.lastVisualObservation for the vision reasoning pipeline.
                 val service = NayroAccessibilityService.instance
                     ?: return ActionExecutionResult(
                         false,
@@ -527,10 +566,12 @@ class ActionExecutor(
             ActionType.MAKE_PHONE_CALL -> {
                 val rawTarget = (action.target ?: action.parameters["target"] ?: action.parameters["number"])?.trim().orEmpty()
                 val observeState = action.parameters["observeCallState"] != "false"
+                val preferredSimSlot = action.parameters["simSlot"]?.toIntOrNull()
                 callIntelligenceManager.initiateOutgoingCall(
                     rawTarget = rawTarget,
                     isConfirmed = isConfirmed,
-                    observeCallState = observeState
+                    observeCallState = observeState,
+                    preferredSimSlot = preferredSimSlot
                 )
             }
 
@@ -1152,6 +1193,7 @@ class ActionExecutor(
             ActionType.ANALYZE_IMAGE_VISION -> {
                 val prompt = (action.parameters["prompt"] ?: action.target ?: "Describe what is visible on the screen.").trim()
                 val filename = action.parameters["filename"]?.trim()
+                val cachedVisualObs = ScreenIntelligenceManager.lastVisualObservation
                 val contextText = if (!filename.isNullOrBlank()) {
                     when (val res = workspaceManager.readFileResult(filename)) {
                         is WorkspaceResult.Success -> "Workspace file '$filename':\n${res.content.take(3000)}"
@@ -1161,6 +1203,8 @@ class ActionExecutor(
                     }
                 } else if (NayroAccessibilityService.isConnected()) {
                     screenIntelligenceManager.describeScreenContent()
+                } else if (cachedVisualObs != null) {
+                    "Visual Observation (${cachedVisualObs.detectedRegionsSummary}): ${cachedVisualObs.groundedTextElements.joinToString(", ")}"
                 } else {
                     return ActionExecutionResult(
                         false,

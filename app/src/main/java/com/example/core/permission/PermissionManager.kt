@@ -239,8 +239,14 @@ class PermissionManager(private val context: Context) {
         item: PermissionItem,
         activity: Activity? = null
     ): PermissionEvaluation {
+        val prefs = try {
+            context.getSharedPreferences("nayro_perm_prefs", Context.MODE_PRIVATE)
+        } catch (_: Exception) {
+            null
+        }
         val granted = ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
         if (granted) {
+            prefs?.edit()?.putBoolean("granted_history_$permission", true)?.apply()
             return PermissionEvaluation(
                 item = item,
                 status = PermissionStatus.GRANTED,
@@ -248,8 +254,8 @@ class PermissionManager(private val context: Context) {
             )
         }
 
-        val prefs = context.getSharedPreferences("nayro_perm_prefs", Context.MODE_PRIVATE)
-        val requestedBefore = prefs.getBoolean("requested_$permission", false)
+        val requestedBefore = prefs?.getBoolean("requested_$permission", false) ?: false
+        val wasGrantedBefore = prefs?.getBoolean("granted_history_$permission", false) ?: false
 
         if (activity != null) {
             val shouldShowRationale = ActivityCompat.shouldShowRequestPermissionRationale(activity, permission)
@@ -257,7 +263,11 @@ class PermissionManager(private val context: Context) {
                 return PermissionEvaluation(
                     item = item,
                     status = PermissionStatus.PERMANENTLY_DENIED,
-                    statusExplanation = "Permission denied permanently ('Don't ask again'). Open App Settings to enable."
+                    statusExplanation = if (wasGrantedBefore) {
+                        "Permission was previously granted and later revoked/expired. Open App Settings to re-enable."
+                    } else {
+                        "Permission denied permanently ('Don't ask again'). Open App Settings to enable."
+                    }
                 )
             }
         }
@@ -265,12 +275,57 @@ class PermissionManager(private val context: Context) {
         return PermissionEvaluation(
             item = item,
             status = PermissionStatus.DENIED,
-            statusExplanation = if (requestedBefore) {
-                "Permission was denied previously. Tap Request or Open Settings to grant."
-            } else {
-                "Runtime permission not yet granted."
+            statusExplanation = when {
+                wasGrantedBefore -> "Permission was previously granted and later revoked or one-time access expired. Tap Request to re-grant."
+                requestedBefore -> "Permission was denied previously. Tap Request or Open Settings to grant."
+                else -> "Runtime permission not yet granted."
             }
         )
+    }
+
+    /**
+     * Evaluates ONLY a single permission or PermissionType without refreshing all permissions.
+     * Updates only that permission's entry in [evaluations] and [permissionStates].
+     */
+    fun evaluateSinglePermissionTargeted(permissionOrType: String, activity: Activity? = null): Boolean {
+        val matchedItem = PermissionRegistry.items.firstOrNull { item ->
+            item.androidPermissionString.equals(permissionOrType, ignoreCase = true) ||
+                item.type.name.equals(permissionOrType, ignoreCase = true)
+        }
+        if (matchedItem != null) {
+            val eval = evaluatePermission(matchedItem, activity)
+            val updatedEvals = _evaluations.value.toMutableMap()
+            updatedEvals[matchedItem.type] = eval
+            _evaluations.value = updatedEvals
+
+            val updatedStates = _permissionStates.value.toMutableMap()
+            updatedStates[matchedItem.type] = when (eval.status) {
+                PermissionStatus.GRANTED -> PermissionState.Granted
+                PermissionStatus.DENIED -> PermissionState.Denied
+                PermissionStatus.PERMANENTLY_DENIED -> PermissionState.PermanentlyDenied
+                PermissionStatus.SPECIAL_ACCESS_REQUIRED -> PermissionState.NeedsSystemSettings
+                PermissionStatus.NOT_REQUIRED -> PermissionState.Granted
+                PermissionStatus.UNAVAILABLE -> PermissionState.Denied
+            }
+            _permissionStates.value = updatedStates
+            return eval.status == PermissionStatus.GRANTED || eval.status == PermissionStatus.NOT_REQUIRED
+        }
+        return if (permissionOrType.startsWith("android.permission.")) {
+            isPermissionGranted(permissionOrType)
+        } else {
+            false
+        }
+    }
+
+    fun wasPermissionRevoked(permission: String): Boolean {
+        val currentlyGranted = isPermissionGranted(permission)
+        if (currentlyGranted) return false
+        val prefs = try {
+            context.getSharedPreferences("nayro_perm_prefs", Context.MODE_PRIVATE)
+        } catch (_: Exception) {
+            null
+        }
+        return prefs?.getBoolean("granted_history_$permission", false) ?: false
     }
 
     fun markRuntimePermissionRequested(permission: String) {

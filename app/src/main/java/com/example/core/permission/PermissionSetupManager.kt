@@ -81,6 +81,9 @@ open class PermissionSetupManager(
     private var inMemoryAssistantName: String = "Babu"
     private var inMemoryStepOrdinal: Int = 0
 
+    private val _assistantNameFlow = MutableStateFlow(getSavedAssistantName())
+    val assistantNameFlow: StateFlow<String> = _assistantNameFlow.asStateFlow()
+
     private val _currentStep = MutableStateFlow(loadSavedStep())
     val currentStep: StateFlow<SetupWizardStep> = _currentStep.asStateFlow()
 
@@ -100,10 +103,16 @@ open class PermissionSetupManager(
     fun saveAssistantName(name: String) {
         val clean = name.trim().ifEmpty { "Babu" }
         inMemoryAssistantName = clean
+        _assistantNameFlow.value = clean
         context?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             ?.edit()
             ?.putString(KEY_ASSISTANT_NAME, clean)
             ?.apply()
+    }
+
+    fun getDynamicWakePhrasesForAssistant(assistantName: String = getSavedAssistantName()): List<String> {
+        val clean = assistantName.trim().ifEmpty { "Babu" }
+        return listOf("Hi $clean", "Hey $clean", "Hi Nayro", "Hey Nayro").distinct()
     }
 
     fun setWizardStep(step: SetupWizardStep) {

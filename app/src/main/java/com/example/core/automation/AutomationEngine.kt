@@ -125,6 +125,25 @@ class AutomationEngine(private val context: Context? = null) {
         persistRules()
     }
 
+    var testOverrideCanScheduleExactAlarms: Boolean? = null
+
+    fun isDuplicateSchedule(
+        name: String,
+        triggerType: AutomationTriggerType,
+        triggerConditionValue: String,
+        actionInstruction: String
+    ): Boolean {
+        val cleanName = name.trim().lowercase()
+        val cleanCond = triggerConditionValue.trim().lowercase()
+        val cleanAct = actionInstruction.trim().lowercase()
+        return _rules.value.any {
+            it.name.trim().lowercase() == cleanName &&
+                it.triggerType == triggerType &&
+                it.triggerConditionValue.trim().lowercase() == cleanCond &&
+                it.actionInstruction.trim().lowercase() == cleanAct
+        }
+    }
+
     fun createRule(
         name: String,
         triggerType: AutomationTriggerType,
@@ -134,6 +153,16 @@ class AutomationEngine(private val context: Context? = null) {
         cooldownMs: Long = 60_000L,
         retryCountOnFailure: Int = 1
     ): AutomationRule {
+        val existingDup = _rules.value.firstOrNull {
+            it.name.equals(name.trim(), ignoreCase = true) &&
+                it.triggerType == triggerType &&
+                it.triggerConditionValue.equals(triggerConditionValue.trim(), ignoreCase = true) &&
+                it.actionInstruction.equals(actionInstruction.trim(), ignoreCase = true)
+        }
+        if (existingDup != null) {
+            return existingDup
+        }
+
         val rule = AutomationRule(
             name = name.trim(),
             triggerType = triggerType,
@@ -427,35 +456,76 @@ class AutomationEngine(private val context: Context? = null) {
     }
 
     /**
-     * Phase 9 — Parses natural language reminder specifications ("tomorrow at 7 AM",
-     * "today at 6:30 PM", "in 15 minutes", "in 2 hours", "kal subah 7 baje") in the device timezone.
+     * Phase 9 & Section 13 — Parses natural language reminder specifications in English, Hindi, and Hinglish:
+     * - "Today" / "aaj", "Tomorrow" / "kal", "Day after tomorrow" / "parso", "Next week" / "agle hafte"
+     * - "Tonight" / "aaj raat", "Morning" / "subah", "Afternoon" / "dopahar", "Evening" / "shaam"
+     * - "In 10 minutes" / "30 minute baad", "After one hour" / "1 ghante baad"
+     * - "Every day" / "har din", "Every Monday" / "har somwar"
+     * - "At 6 AM" / "subah 6 baje" / "shaam 7 baje"
+     * Uses the actual Android device system time and timezone.
      */
     fun parseReminderTimeMillis(rawSpec: String, nowMs: Long = System.currentTimeMillis()): Long {
         val lower = rawSpec.trim().lowercase()
 
-        // 1. Relative minutes/hours: "in 15 minutes", "in 2 hours", "+15m"
-        val inMinsMatch = Regex("\\bin\\s+(\\d+)\\s*(?:minute|minutes|min|mins)\\b").find(lower)
+        // 1. Relative minutes: "in 15 minutes", "after 10 minutes", "30 minute baad", "+15m"
+        val inMinsMatch = Regex("(?:\\b(?:in|after)\\s+(\\d+)\\s*(?:minute|minutes|min|mins)\\b|\\b(\\d+)\\s*(?:minute|minutes|min|mins)\\s*(?:baad|later)\\b)").find(lower)
         if (inMinsMatch != null) {
-            val mins = inMinsMatch.groupValues[1].toLongOrNull() ?: 15L
+            val minsStr = inMinsMatch.groupValues[1].ifEmpty { inMinsMatch.groupValues[2] }
+            val mins = minsStr.toLongOrNull() ?: 15L
             return nowMs + mins * 60_000L
         }
-        val inHoursMatch = Regex("\\bin\\s+(\\d+)\\s*(?:hour|hours|hr|hrs)\\b").find(lower)
+        if (lower.contains("after half an hour") || lower.contains("aadhe ghante baad")) {
+            return nowMs + 30L * 60_000L
+        }
+
+        // 2. Relative hours: "in 2 hours", "after one hour", "after 1 hour", "1 ghante baad", "ek ghante baad"
+        if (lower.contains("after one hour") || lower.contains("in one hour") || lower.contains("ek ghante baad")) {
+            return nowMs + 3_600_000L
+        }
+        val inHoursMatch = Regex("(?:\\b(?:in|after)\\s+(\\d+)\\s*(?:hour|hours|hr|hrs|ghanta|ghante)\\b|\\b(\\d+)\\s*(?:hour|hours|hr|hrs|ghanta|ghante)\\s*(?:baad|later)\\b)").find(lower)
         if (inHoursMatch != null) {
-            val hours = inHoursMatch.groupValues[1].toLongOrNull() ?: 1L
+            val hrsStr = inHoursMatch.groupValues[1].ifEmpty { inHoursMatch.groupValues[2] }
+            val hours = hrsStr.toLongOrNull() ?: 1L
             return nowMs + hours * 3_600_000L
         }
 
-        val isTomorrow = lower.contains("tomorrow") || lower.contains("kal")
-        val isDayAfter = lower.contains("day after tomorrow") || lower.contains("parso")
+        val isTomorrow = lower.contains("tomorrow") || Regex("\\bkal\\b").containsMatchIn(lower)
+        val isDayAfter = lower.contains("day after tomorrow") || Regex("\\bparso\\b").containsMatchIn(lower)
+        val isNextWeek = lower.contains("next week") || lower.contains("agle hafte")
+        val isToday = lower.contains("today") || Regex("\\baaj\\b").containsMatchIn(lower)
 
-        // 2. Time of day: "7 AM", "7:30 PM", "19:00", "7 baje"
+        val targetDayOfWeek: Int? = when {
+            lower.contains("monday") || lower.contains("somwar") -> Calendar.MONDAY
+            lower.contains("tuesday") || lower.contains("mangalwar") -> Calendar.TUESDAY
+            lower.contains("wednesday") || lower.contains("budhwar") -> Calendar.WEDNESDAY
+            lower.contains("thursday") || lower.contains("guruwar") -> Calendar.THURSDAY
+            lower.contains("friday") || lower.contains("shukrawar") -> Calendar.FRIDAY
+            lower.contains("saturday") || lower.contains("shaniwar") -> Calendar.SATURDAY
+            lower.contains("sunday") || lower.contains("raviwar") -> Calendar.SUNDAY
+            else -> null
+        }
+
+        // 3. Time of day: "7 AM", "7:30 PM", "19:00", "7 baje"
         val amPmMatch = Regex("\\b(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)\\b").find(lower)
         val twentyFourMatch = Regex("\\b(\\d{1,2}):(\\d{2})\\b").find(lower)
-        val bajeMatch = Regex("\\b(\\d{1,2})\\s*baje\\b").find(lower)
+        val bajeMatch = Regex("\\b(\\d{1,2})(?::(\\d{2}))?\\s*baje\\b").find(lower)
 
-        var hourOfDay = 9
+        var hourOfDay = when {
+            lower.contains("tonight") || lower.contains("aaj raat") || lower.contains("raat") -> 21
+            lower.contains("evening") || lower.contains("shaam") -> 18
+            lower.contains("afternoon") || lower.contains("dopahar") -> 14
+            lower.contains("morning") || lower.contains("subah") -> 8
+            else -> 9
+        }
         var minute = 0
-        var hasExplicitTime = false
+        var hasExplicitTime = lower.contains("tonight") ||
+            lower.contains("aaj raat") ||
+            lower.contains("evening") ||
+            lower.contains("shaam") ||
+            lower.contains("afternoon") ||
+            lower.contains("dopahar") ||
+            lower.contains("morning") ||
+            lower.contains("subah")
 
         if (amPmMatch != null) {
             hasExplicitTime = true
@@ -474,21 +544,29 @@ class AutomationEngine(private val context: Context? = null) {
         } else if (bajeMatch != null) {
             hasExplicitTime = true
             val rawHour = (bajeMatch.groupValues[1].toIntOrNull() ?: 9).coerceIn(0, 23)
-            hourOfDay = if ((lower.contains("shaam") || lower.contains("raat")) && rawHour in 1..11) {
-                rawHour + 12
-            } else {
-                rawHour
+            minute = (bajeMatch.groupValues[2].toIntOrNull() ?: 0).coerceIn(0, 59)
+            hourOfDay = when {
+                (lower.contains("shaam") || lower.contains("evening") || lower.contains("raat") || lower.contains("tonight") || lower.contains("dopahar") || lower.contains("afternoon")) && rawHour in 1..11 ->
+                    rawHour + 12
+                lower.contains("subah") && rawHour == 12 -> 0
+                else -> rawHour
             }
         }
 
         val cal = Calendar.getInstance().apply {
             timeInMillis = nowMs
-            if (isDayAfter) {
-                add(Calendar.DAY_OF_YEAR, 2)
-            } else if (isTomorrow) {
-                add(Calendar.DAY_OF_YEAR, 1)
+            when {
+                isNextWeek -> add(Calendar.DAY_OF_YEAR, 7)
+                isDayAfter -> add(Calendar.DAY_OF_YEAR, 2)
+                isTomorrow -> add(Calendar.DAY_OF_YEAR, 1)
+                targetDayOfWeek != null -> {
+                    val currentDow = get(Calendar.DAY_OF_WEEK)
+                    var daysAhead = (targetDayOfWeek - currentDow + 7) % 7
+                    if (daysAhead == 0) daysAhead = 7
+                    add(Calendar.DAY_OF_YEAR, daysAhead)
+                }
             }
-            if (hasExplicitTime || isTomorrow || isDayAfter) {
+            if (hasExplicitTime || isTomorrow || isDayAfter || isNextWeek || isToday || targetDayOfWeek != null || lower.contains("every day") || lower.contains("har din") || lower.contains("roz")) {
                 set(Calendar.HOUR_OF_DAY, hourOfDay)
                 set(Calendar.MINUTE, minute)
                 set(Calendar.SECOND, 0)
@@ -598,6 +676,63 @@ class AutomationEngine(private val context: Context? = null) {
             true
         } catch (_: Exception) {
             false
+        }
+    }
+
+    fun canScheduleExactAlarmsHonest(targetContext: Context? = context): Boolean {
+        testOverrideCanScheduleExactAlarms?.let { return it }
+        val ctx = targetContext ?: return false
+        return try {
+            val alarmManager = ctx.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return false
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                alarmManager.canScheduleExactAlarms()
+            } else {
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Section 9 — Handles timezone changes (`ACTION_TIMEZONE_CHANGED`) and manual clock changes (`ACTION_TIME_CHANGED`)
+     * by re-evaluating and re-registering all active time-based schedules.
+     */
+    fun onTimezoneOrClockChanged(targetContext: Context? = context): Int {
+        if (_isPaused.value) return 0
+        var rescheduled = 0
+        _rules.value.filter { it.isEnabled && it.triggerType == AutomationTriggerType.TIME_SCHEDULE }.forEach { rule ->
+            cancelRuleAlarmIfPossible(rule.ruleId)
+            scheduleRuleAlarmIfPossible(rule, targetContext)
+            rescheduled++
+        }
+        return rescheduled
+    }
+
+    /**
+     * Section 9 — Identifies enabled daily/recurring `TIME_SCHEDULE` rules whose scheduled HH:mm window
+     * was missed within [missedWindowMinutes] (e.g., while device was powered off or in deep maintenance)
+     * and has not yet fired today.
+     */
+    fun recoverMissedSchedules(
+        nowMs: Long = System.currentTimeMillis(),
+        missedWindowMinutes: Int = 60
+    ): List<AutomationRule> {
+        if (_isPaused.value) return emptyList()
+        val calNow = Calendar.getInstance().apply { timeInMillis = nowMs }
+        val nowMinutesOfDay = calNow.get(Calendar.HOUR_OF_DAY) * 60 + calNow.get(Calendar.MINUTE)
+        return _rules.value.filter { rule ->
+            if (!rule.isEnabled || rule.triggerType != AutomationTriggerType.TIME_SCHEDULE) return@filter false
+            val cond = rule.triggerConditionValue.trim()
+            if (!cond.matches(Regex("^\\d{1,2}:\\d{2}$"))) return@filter false
+            val parts = cond.split(":")
+            val h = parts[0].toIntOrNull() ?: return@filter false
+            val m = parts[1].toIntOrNull() ?: return@filter false
+            val ruleMinutesOfDay = h * 60 + m
+            val diffMin = nowMinutesOfDay - ruleMinutesOfDay
+            val withinMissedWindow = diffMin in 1..missedWindowMinutes
+            val notTriggeredRecently = (nowMs - rule.lastTriggeredAtMs) > (missedWindowMinutes * 60_000L)
+            withinMissedWindow && notTriggeredRecently
         }
     }
 

@@ -14,8 +14,10 @@ enum class TaskState {
     VALIDATING,
     AWAITING_PERMISSION,
     WAITING_FOR_PERMISSION,
+    WAITING_FOR_DEVICE_UNLOCK,
     AWAITING_CONFIRMATION,
     WAITING_FOR_CONFIRMATION,
+    WAITING_FOR_USER_CONFIRMATION,
     WAITING_FOR_USER_INPUT,
     READY,
     RUNNING,
@@ -33,7 +35,17 @@ enum class TaskState {
     BLOCKED_BY_ANDROID,
     TIMED_OUT,
     FAILED,
-    CANCELLED
+    CANCELLED;
+
+    fun toActionExecutionState(): ActionExecutionState = when (this) {
+        COMPLETED -> ActionExecutionState.SUCCESS
+        AWAITING_PERMISSION, WAITING_FOR_PERMISSION -> ActionExecutionState.WAITING_FOR_PERMISSION
+        WAITING_FOR_DEVICE_UNLOCK -> ActionExecutionState.WAITING_FOR_UNLOCK
+        AWAITING_CONFIRMATION, WAITING_FOR_CONFIRMATION, WAITING_FOR_USER_CONFIRMATION -> ActionExecutionState.WAITING_FOR_CONFIRMATION
+        INCONCLUSIVE, PARTIALLY_COMPLETED -> ActionExecutionState.INCONCLUSIVE
+        FAILED, NOT_SUPPORTED, BLOCKED_BY_ANDROID, TIMED_OUT, CANCELLED -> ActionExecutionState.FAILED
+        else -> ActionExecutionState.IN_PROGRESS
+    }
 }
 
 enum class ActionType {
@@ -135,16 +147,46 @@ enum class ConfirmationStatus {
     CANCELLED
 }
 
+enum class ActionExecutionState {
+    SUCCESS,
+    FAILED,
+    IN_PROGRESS,
+    WAITING_FOR_PERMISSION,
+    WAITING_FOR_UNLOCK,
+    WAITING_FOR_CONFIRMATION,
+    INCONCLUSIVE
+}
+
 enum class VerificationStatus {
     VERIFIED,
     FAILED,
     INCONCLUSIVE,
     NOT_SUPPORTED,
     REQUIRES_PERMISSION,
+    WAITING_FOR_UNLOCK,
     REQUIRES_CONFIRMATION,
     CANCELLED,
     TIMED_OUT,
-    PARTIALLY_COMPLETED
+    PARTIALLY_COMPLETED;
+
+    fun toActionExecutionState(): ActionExecutionState = when (this) {
+        VERIFIED -> ActionExecutionState.SUCCESS
+        REQUIRES_PERMISSION -> ActionExecutionState.WAITING_FOR_PERMISSION
+        WAITING_FOR_UNLOCK -> ActionExecutionState.WAITING_FOR_UNLOCK
+        REQUIRES_CONFIRMATION -> ActionExecutionState.WAITING_FOR_CONFIRMATION
+        INCONCLUSIVE, PARTIALLY_COMPLETED -> ActionExecutionState.INCONCLUSIVE
+        FAILED, NOT_SUPPORTED, CANCELLED, TIMED_OUT -> ActionExecutionState.FAILED
+    }
+}
+
+fun TaskState.toActionExecutionState(): ActionExecutionState = when (this) {
+    TaskState.COMPLETED -> ActionExecutionState.SUCCESS
+    TaskState.AWAITING_PERMISSION, TaskState.WAITING_FOR_PERMISSION -> ActionExecutionState.WAITING_FOR_PERMISSION
+    TaskState.WAITING_FOR_DEVICE_UNLOCK -> ActionExecutionState.WAITING_FOR_UNLOCK
+    TaskState.AWAITING_CONFIRMATION, TaskState.WAITING_FOR_CONFIRMATION, TaskState.WAITING_FOR_USER_CONFIRMATION -> ActionExecutionState.WAITING_FOR_CONFIRMATION
+    TaskState.INCONCLUSIVE, TaskState.PARTIALLY_COMPLETED -> ActionExecutionState.INCONCLUSIVE
+    TaskState.FAILED, TaskState.NOT_SUPPORTED, TaskState.BLOCKED_BY_ANDROID, TaskState.TIMED_OUT, TaskState.CANCELLED -> ActionExecutionState.FAILED
+    else -> ActionExecutionState.IN_PROGRESS
 }
 
 data class VerificationEvidence(
@@ -159,11 +201,12 @@ data class VerificationResult(
     val evidence: VerificationEvidence? = null
 ) {
     val isVerified: Boolean get() = status == VerificationStatus.VERIFIED
+    val executionState: ActionExecutionState get() = status.toActionExecutionState()
 }
 
 data class AgentAction(
     val actionId: String = UUID.randomUUID().toString(),
-    val taskId: String,
+    val taskId: String = "task-default",
     val actionType: ActionType,
     val target: String? = null,
     val parameters: Map<String, String> = emptyMap(),
@@ -457,7 +500,8 @@ fun TaskState.toUserFriendlyLabel(): String {
         TaskState.PLANNING -> "Planning Steps"
         TaskState.VALIDATING -> "Checking Safety & Permissions"
         TaskState.AWAITING_PERMISSION, TaskState.WAITING_FOR_PERMISSION -> "Needs Permission"
-        TaskState.AWAITING_CONFIRMATION, TaskState.WAITING_FOR_CONFIRMATION -> "Waiting for Confirmation"
+        TaskState.WAITING_FOR_DEVICE_UNLOCK -> "Waiting for Device Unlock"
+        TaskState.AWAITING_CONFIRMATION, TaskState.WAITING_FOR_CONFIRMATION, TaskState.WAITING_FOR_USER_CONFIRMATION -> "Waiting for Confirmation"
         TaskState.WAITING_FOR_USER_INPUT -> "Waiting for Input"
         TaskState.RUNNING, TaskState.EXECUTING -> "In Progress"
         TaskState.OBSERVING -> "Observing Screen"

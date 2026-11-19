@@ -107,6 +107,13 @@ fun AgentDashboardScreen(
                                 text = "Registered Tools: ${ToolRegistryManager.getAllTools().size} | Notifications Connected: $isNotifConnected (${notifications.size} buffered)",
                                 style = MaterialTheme.typography.bodySmall
                             )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = agentRuntime.getAgentDiagnosticsReport().formatAsNayroStatusBlock(),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag("nayro_agent_status_diagnostics")
+                            )
                         }
                         Button(
                             onClick = {

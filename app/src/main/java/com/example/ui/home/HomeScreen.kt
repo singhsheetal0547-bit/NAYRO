@@ -58,6 +58,9 @@ import com.example.core.agent.AgentState
 import com.example.core.agent.AgentTask
 import com.example.core.agent.toUserFriendlyDescription
 import com.example.core.agent.toUserFriendlyIntentLabel
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material3.LinearProgressIndicator
+import com.example.core.voice.VoiceState
 import com.example.data.local.entities.ConversationEntity
 import com.example.ui.components.AssistantOrb
 import com.example.ui.components.StatusBadge
@@ -72,6 +75,9 @@ data class QuickAction(val title: String, val subtitle: String, val icon: ImageV
 fun HomeScreen(
     assistantName: String = "Babu",
     agentState: AgentState = AgentState.Idle,
+    voiceState: VoiceState = VoiceState.DISABLED,
+    liveTranscript: String = "",
+    audioLevel: Float = 0f,
     currentTask: AgentTask? = null,
     recentConversations: List<ConversationEntity> = emptyList(),
     isForegroundActive: Boolean = false,
@@ -86,6 +92,11 @@ fun HomeScreen(
 ) {
     var textInput by remember { mutableStateOf("") }
     val scrollState = rememberScrollState()
+    val isVoiceCapturing = voiceState == VoiceState.LISTENING ||
+        voiceState == VoiceState.FOLLOW_UP_LISTENING ||
+        voiceState == VoiceState.TRANSCRIBING ||
+        agentState is AgentState.UserListening ||
+        agentState is AgentState.Transcribing
 
     val quickActions = listOf(
         QuickAction("Agent Control Center", "Autonomy levels, workflows, automations & Emergency Stop", Icons.Default.Tune, "action_dashboard"),
@@ -218,6 +229,67 @@ fun HomeScreen(
                     color = Coral
                 )
 
+                if (isVoiceCapturing || liveTranscript.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Card(
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+                        ),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("live_voice_transcript_banner")
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 14.dp, vertical = 10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = if (isVoiceCapturing) "Voice-to-Text Active" else "Last Spoken Command",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (isVoiceCapturing) Coral else ForestGreen
+                                )
+                                if (isVoiceCapturing) {
+                                    Text(
+                                        text = "Speak naturally in Hindi / English / Hinglish",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            if (liveTranscript.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "\"$liveTranscript\"",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.testTag("live_voice_transcript_text")
+                                )
+                            }
+                            if (isVoiceCapturing) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                LinearProgressIndicator(
+                                    progress = { audioLevel.coerceIn(0.08f, 1f) },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(4.dp)
+                                        .clip(RoundedCornerShape(2.dp)),
+                                    color = Coral,
+                                    trackColor = SoftSage
+                                )
+                            }
+                        }
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(16.dp))
 
                 // Text & Voice Composer Bar inside Hero Card
@@ -240,7 +312,22 @@ fun HomeScreen(
                         singleLine = true
                     )
                     Spacer(modifier = Modifier.width(8.dp))
+                    IconButton(
+                        onClick = onVoiceTap,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(if (isVoiceCapturing) MaterialTheme.colorScheme.error else Coral)
+                            .testTag("mic_button")
+                    ) {
+                        Icon(
+                            imageVector = if (isVoiceCapturing) Icons.Default.Stop else Icons.Default.Mic,
+                            contentDescription = if (isVoiceCapturing) "Stop voice recognition" else "Activate microphone",
+                            tint = MaterialTheme.colorScheme.onSecondary
+                        )
+                    }
                     if (textInput.isNotBlank()) {
+                        Spacer(modifier = Modifier.width(8.dp))
                         IconButton(
                             onClick = {
                                 onSendText(textInput)
@@ -256,21 +343,6 @@ fun HomeScreen(
                                 imageVector = Icons.AutoMirrored.Filled.Send,
                                 contentDescription = "Send prompt",
                                 tint = MaterialTheme.colorScheme.onPrimary
-                            )
-                        }
-                    } else {
-                        IconButton(
-                            onClick = onVoiceTap,
-                            modifier = Modifier
-                                .size(48.dp)
-                                .clip(CircleShape)
-                                .background(Coral)
-                                .testTag("mic_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Mic,
-                                contentDescription = "Activate microphone",
-                                tint = MaterialTheme.colorScheme.onSecondary
                             )
                         }
                     }

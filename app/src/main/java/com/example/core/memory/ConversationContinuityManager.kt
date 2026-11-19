@@ -22,6 +22,8 @@ data class ShortTermSessionContext(
     var lastStepOutput: String? = null,
     var lastExecutedInstruction: String? = null,
     var lastCalendarEventTitle: String? = null,
+    var lastDraftedOrSentMessage: String? = null,
+    var recentCandidateContacts: List<String> = emptyList(),
     var updatedAtMs: Long = System.currentTimeMillis()
 )
 
@@ -33,11 +35,12 @@ sealed class ContinuationResolution {
 }
 
 /**
- * Multi-Layer Conversation Continuity & Reference Resolution Manager (Part 9 & Phase 11).
+ * Multi-Layer Conversation Continuity & Reference Resolution Manager (Section 3, Part 9 & Phase 11).
  * Handles:
- * - Pending slot filling across turns (e.g. "Rahul ko WhatsApp message bhejna" -> "Kya message bhejna hai?" -> "Main busy hoon")
+ * - Pending slot filling across turns (e.g. "Hi Nairo, WhatsApp par Prakash ko message bhejo." -> "Usko bol do main 10 minute mein aa raha hoon.")
  * - Conversational Yes/No confirmation continuation
- * - Pronoun and reference resolution ("him", "her", "usko", "that file", "it")
+ * - Pronoun and reference resolution ("Usko", "Usse", "Wahi", "Pehle wala", "Dusra wala", "Abhi wala", "Usi chat mein", "Same contact", "Previous message")
+ * - Natural language corrections ("Nahi, message mein 10 minute ki jagah 20 minute likho.")
  * - Follow-up task references ("Do the same thing again", "Pichhla task continue karo", "Wahi event kal ke liye bana do", "Remind me after the meeting")
  * - Context expiration so stale conversations are never merged into unrelated requests.
  */
@@ -69,7 +72,9 @@ class ConversationContinuityManager {
         app: String? = null,
         stepOutput: String? = null,
         executedInstruction: String? = null,
-        calendarEventTitle: String? = null
+        calendarEventTitle: String? = null,
+        draftedOrSentMessage: String? = null,
+        candidateContacts: List<String>? = null
     ) {
         if (!contact.isNullOrBlank() && !contact.equals("Contact", ignoreCase = true)) {
             sessionContext.lastMentionedContact = contact.trim()
@@ -89,15 +94,22 @@ class ConversationContinuityManager {
         if (!calendarEventTitle.isNullOrBlank()) {
             sessionContext.lastCalendarEventTitle = calendarEventTitle.trim()
         }
+        if (!draftedOrSentMessage.isNullOrBlank()) {
+            sessionContext.lastDraftedOrSentMessage = draftedOrSentMessage.trim()
+        }
+        if (!candidateContacts.isNullOrEmpty()) {
+            sessionContext.recentCandidateContacts = candidateContacts.map { it.trim() }.filter { it.isNotEmpty() }
+        }
         sessionContext.updatedAtMs = System.currentTimeMillis()
     }
 
     fun getSessionContext(): ShortTermSessionContext = sessionContext.copy()
 
     /**
-     * Resolves pronouns ("him", "her", "usko", "usse", "that file") and contextual follow-up
-     * directives ("Do the same thing again", "Wahi event kal ke liye bana do", "Remind me after the meeting")
-     * in [rawPrompt] using recent session context.
+     * Resolves pronouns ("him", "her", "usko", "usse", "wahi", "pehle wala", "dusra wala",
+     * "abhi wala", "usi chat mein", "same contact", "previous message", "that file"),
+     * natural-language corrections ("Nahi, message mein 10 minute ki jagah 20 minute likho"),
+     * and contextual follow-up directives in [rawPrompt] using recent session context.
      */
     fun resolveReferencesInPrompt(rawPrompt: String): String {
         val trimmed = rawPrompt.trim()
@@ -119,25 +131,88 @@ class ConversationContinuityManager {
             }
         }
 
-        // 2. "Wahi event kal ke liye bana do"
+        // 2. Natural-language message correction (Section 3):
+        // "Nahi, message mein 10 minute ki jagah 20 minute likho." / "Replace 10 minute with 20 minute in the message"
+        val hindiCorrectionMatch = Regex(
+            "(?i)^(?:nahi[,\\s]+|no[,\\s]+)?(?:message|msg)\\s+mein\\s+(.+?)\\s+ki\\s+jagah\\s+(.+?)\\s+(?:likho|likh\\s+do|kar\\s+do|bhejo)\\.?$"
+        ).find(trimmed)
+        val englishCorrectionMatch = Regex(
+            "(?i)^(?:no[,\\s]+)?(?:in\\s+the\\s+message[,\\s]+)?replace\\s+(.+?)\\s+with\\s+(.+?)(?:\\s+in\\s+the\\s+message)?\\.?$"
+        ).find(trimmed)
+        val correctionPair: Pair<String, String>? = when {
+            hindiCorrectionMatch != null -> hindiCorrectionMatch.groupValues[1].trim() to hindiCorrectionMatch.groupValues[2].trim()
+            englishCorrectionMatch != null -> englishCorrectionMatch.groupValues[1].trim() to englishCorrectionMatch.groupValues[2].trim()
+            else -> null
+        }
+        if (correctionPair != null) {
+            val (oldFragment, newFragment) = correctionPair
+            val baseMsg = sessionContext.lastDraftedOrSentMessage ?: "main $oldFragment mein aa raha hoon"
+            val updatedMsg = if (baseMsg.contains(oldFragment, ignoreCase = true)) {
+                baseMsg.replace(Regex(Regex.escape(oldFragment), RegexOption.IGNORE_CASE), newFragment)
+            } else {
+                newFragment
+            }
+            val contact = sessionContext.lastMentionedContact ?: "Contact"
+            recordEntityContext(contact = contact, draftedOrSentMessage = updatedMsg)
+            return "Send WhatsApp message to $contact: $updatedMsg"
+        }
+
+        // 3. Inspect previous sent/drafted message (Section 3):
+        // "Jo message maine abhi bheja tha, woh mujhe dikhao." / "Show me the previous message" / "Abhi wala message dikhao"
+        if (Regex("(?i)(?:jo\\s+message\\s+maine\\s+abhi\\s+bheja\\s+tha|abhi\\s+wala\\s+message\\s+dikhao|previous\\s+message\\s+dikhao|show\\s+(?:me\\s+)?(?:the\\s+)?(?:previous|last)\\s+message)").containsMatchIn(trimmed)) {
+            val contact = sessionContext.lastMentionedContact ?: "Contact"
+            return "Read WhatsApp conversation with $contact"
+        }
+
+        // 4. "Wahi event kal ke liye bana do"
         if (lower.contains("wahi event") && (lower.contains("kal") || lower.contains("tomorrow"))) {
             val evTitle = sessionContext.lastCalendarEventTitle ?: "Scheduled Meeting"
             return "Create calendar event: $evTitle"
         }
 
-        // 3. "Remind me after the meeting"
+        // 5. "Remind me after the meeting"
         if (lower.startsWith("remind me after the meeting") || lower.contains("meeting ke baad yaad dilana")) {
             val evTitle = sessionContext.lastCalendarEventTitle ?: "the meeting"
             return "Remind me in 60 minutes to follow up after $evTitle"
         }
 
-        var resolved = rawPrompt
+        // 6. Ordinal candidate contact references: "Pehle wala" / "Dusra wala"
+        var resolved = trimmed
+        if (sessionContext.recentCandidateContacts.isNotEmpty()) {
+            val firstCandidate = sessionContext.recentCandidateContacts.getOrNull(0)
+            val secondCandidate = sessionContext.recentCandidateContacts.getOrNull(1)
+            if (firstCandidate != null && Regex("(?i)\\b(?:pehle\\s+wala|pehla\\s+wala|first\\s+one)\\b").containsMatchIn(resolved)) {
+                recordEntityContext(contact = firstCandidate)
+                resolved = resolved.replace(Regex("(?i)\\b(?:pehle\\s+wala|pehla\\s+wala|first\\s+one)\\b"), firstCandidate)
+            } else if (secondCandidate != null && Regex("(?i)\\b(?:dusre\\s+wala|dusra\\s+wala|second\\s+one)\\b").containsMatchIn(resolved)) {
+                recordEntityContext(contact = secondCandidate)
+                resolved = resolved.replace(Regex("(?i)\\b(?:dusre\\s+wala|dusra\\s+wala|second\\s+one)\\b"), secondCandidate)
+            }
+        }
+
         val lastContact = sessionContext.lastMentionedContact
         if (!lastContact.isNullOrBlank()) {
-            // 4. Contextual follow-up call without repeating contact name: "Ab call bhi karo", "Call bhi karo", "Ab call karo"
+            // 7. Follow-up message command: "Usko bol do main 10 minute mein aa raha hoon." / "Usi chat mein likho ..."
+            val uskoBolDoMatch = Regex(
+                "^(?i)(?:usko|usse|unhe|usi\\s+chat\\s+mein|same\\s+contact\\s+ko|wahi\\s+ko)\\s+(?:bol\\s+do|bata\\s+do|likho|likh\\s+do|message\\s+bhejo|message\\s+kar\\s+do)\\s+(?:ki\\s+|that\\s+)?(.+?)\\.?$"
+            ).find(resolved)
+            if (uskoBolDoMatch != null) {
+                val msgBody = uskoBolDoMatch.groupValues[1].trim()
+                recordEntityContext(contact = lastContact, draftedOrSentMessage = msgBody)
+                return "Send WhatsApp message to $lastContact: $msgBody"
+            }
+
+            // 8. Contextual follow-up call without repeating contact name:
+            // "Ab call bhi karo", "Ab usko call bhi kar do.", "Call bhi karo", "Ab call karo"
             if (lower in setOf(
                     "ab call bhi karo",
                     "ab call bhi karo.",
+                    "ab usko call bhi kar do",
+                    "ab usko call bhi kar do.",
+                    "ab usse call bhi kar do",
+                    "ab usse call bhi kar do.",
+                    "usko call bhi kar do",
+                    "usko call karo",
                     "call bhi karo",
                     "call bhi kar do",
                     "ab call karo",
@@ -149,8 +224,17 @@ class ConversationContinuityManager {
             }
 
             resolved = resolved
-                .replace(Regex("(?i)\\b(usko|usse|unhe|him|her)\\b"), lastContact)
+                .replace(Regex("(?i)\\b(usko|usse|unhe|him|her|same\\s+contact|wahi\\s+contact)\\b"), lastContact)
+                .replace(Regex("(?i)\\b(?:usi\\s+chat\\s+mein|in\\s+the\\s+same\\s+chat)\\b"), "to $lastContact on WhatsApp")
         }
+
+        // 9. Replace "previous message" / "abhi wala message" with lastDraftedOrSentMessage
+        val lastMsg = sessionContext.lastDraftedOrSentMessage
+        if (!lastMsg.isNullOrBlank()) {
+            resolved = resolved
+                .replace(Regex("(?i)\\b(previous\\s+message|abhi\\s+wala\\s+message|abhi\\s+wala)\\b"), lastMsg)
+        }
+
         val lastFile = sessionContext.lastMentionedFile
         if (!lastFile.isNullOrBlank()) {
             resolved = resolved
@@ -185,7 +269,7 @@ class ConversationContinuityManager {
         val activeSlot = getPendingSlot(nowMs) ?: return ContinuationResolution.NoPendingContinuation
 
         // If user explicitly cancels or switches to a completely different command
-        if (lower in setOf("cancel", "stop", "rehnde do", "chhodo")) {
+        if (lower in setOf("cancel", "stop", "rehnde do", "rehne do", "chhodo")) {
             clearPendingSlot()
             return ContinuationResolution.ConfirmationReply(approved = false)
         }
@@ -193,11 +277,15 @@ class ConversationContinuityManager {
         if (activeSlot.intentType == UserIntentType.MESSAGE_DRAFT && activeSlot.missingSlotName == "message") {
             val recipient = activeSlot.collectedEntities["recipient"] ?: sessionContext.lastMentionedContact ?: "Contact"
             val cleanedBody = trimmed
-                .replaceFirst(Regex("^(?i)(tell\\s+(him|her|them|${Regex.escape(recipient)})\\s*(that)?|say\\s*(that)?|bol\\s*do\\s*(ki)?)\\s*"), "")
+                .replaceFirst(
+                    Regex("^(?i)(?:(?:usko|usse|unhe)\\s+bol\\s+do\\s*(?:ki)?|tell\\s+(?:him|her|them|${Regex.escape(recipient)})\\s*(?:that)?|say\\s*(?:that)?|bol\\s*do\\s*(?:ki)?)\\s*"),
+                    ""
+                )
                 .trim()
                 .removeSuffix(".")
                 .ifBlank { trimmed }
             clearPendingSlot()
+            recordEntityContext(contact = recipient, draftedOrSentMessage = cleanedBody)
             return ContinuationResolution.SlotFilledResumeIntent(
                 taskId = activeSlot.taskId,
                 resolvedIntent = ResolvedIntent(
@@ -229,7 +317,7 @@ class ConversationContinuityManager {
                     question = nextSlot.promptToUser
                 )
             }
-            recordEntityContext(contact = trimmed)
+            recordEntityContext(contact = trimmed, draftedOrSentMessage = draftMsg)
             return ContinuationResolution.SlotFilledResumeIntent(
                 taskId = activeSlot.taskId,
                 resolvedIntent = ResolvedIntent(

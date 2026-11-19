@@ -32,8 +32,10 @@ enum class AudioSessionOwner {
 }
 
 data class VoiceConfiguration(
+    val assistantName: String = "Babu",
     val isWakeWordEnabled: Boolean = false,
     val wakePhrase: String = "Hey Babu",
+    val wakePhrases: List<String> = listOf("Hi Babu", "Hey Babu", "Hi Nayro"),
     val sensitivity: Float = 0.5f,
     val isTtsEnabled: Boolean = true,
     val speechRate: Float = 1.0f,

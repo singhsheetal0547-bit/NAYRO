@@ -271,9 +271,88 @@ class ScreenIntelligenceManager(private val context: Context) {
             return finalObs
         }
 
+        fun parseOrdinalIndex(query: String): Int? {
+            val lower = query.trim().lowercase()
+            if (lower.startsWith("ordinal:")) {
+                return lower.removePrefix("ordinal:").trim().toIntOrNull()?.takeIf { it >= 1 }
+            }
+            return when {
+                Regex("\\b(pehla|pehle|first|1st)\\b").containsMatchIn(lower) -> 1
+                Regex("\\b(dusra|dusre|doosra|second|2nd)\\b").containsMatchIn(lower) -> 2
+                Regex("\\b(teesra|teesre|tisra|third|3rd)\\b").containsMatchIn(lower) -> 3
+                Regex("\\b(chautha|chauthe|fourth|4th)\\b").containsMatchIn(lower) -> 4
+                Regex("\\b(paanchwa|fifth|5th)\\b").containsMatchIn(lower) -> 5
+                else -> null
+            }
+        }
+
+        fun locateOrdinalTargetInSnapshot(ordinalIndex: Int, snapshot: ScreenSnapshot?): VisualTargetMatch? {
+            if (ordinalIndex < 1 || snapshot == null) return null
+            val candidates = snapshot.interactiveElements.filter { it.isClickable }
+                .ifEmpty { snapshot.interactiveElements }
+            val matched = candidates.getOrNull(ordinalIndex - 1) ?: return null
+            return VisualTargetMatch(
+                label = matched.displayLabel,
+                centerX = matched.centerX,
+                centerY = matched.centerY,
+                confidence = 0.94f,
+                strategy = "ORDINAL_INDEX_$ordinalIndex"
+            )
+        }
+
+        fun findEditableFields(snapshot: ScreenSnapshot?): List<ScreenNodeInfo> {
+            return snapshot?.interactiveElements?.filter { it.isEditable }.orEmpty()
+        }
+
+        fun hasScrollableContainer(snapshot: ScreenSnapshot?): Boolean {
+            return snapshot?.interactiveElements?.any { it.isScrollable } == true
+        }
+
+        fun explainDialogOrScreen(snapshot: ScreenSnapshot?): String {
+            if (snapshot == null) return "No active screen snapshot is available."
+            if (isSecureOrAuthenticationScreen(snapshot)) {
+                return "Protected or authentication screen detected (${snapshot.packageName}). Sensitive credentials are not read or auto-submitted."
+            }
+            val labels = snapshot.visibleTexts.ifEmpty {
+                snapshot.interactiveElements.map { it.displayLabel }.filter { it.isNotBlank() }
+            }
+            val buttons = snapshot.interactiveElements.filter { it.isClickable }.map { it.displayLabel }.distinct()
+            return buildString {
+                append("Package: ${snapshot.packageName}. ")
+                if (labels.isNotEmpty()) {
+                    append("Visible content: ${labels.take(6).joinToString(" | ")}. ")
+                }
+                if (buttons.isNotEmpty()) {
+                    append("Available actions: ${buttons.take(5).joinToString(", ")}.")
+                }
+            }.trim()
+        }
+
+        fun isSecureOrAuthenticationScreen(snapshot: ScreenSnapshot?): Boolean {
+            if (snapshot == null) return false
+            if (snapshot.interactiveElements.isEmpty() && snapshot.visibleTexts.isEmpty()) {
+                return true // Restricted or FLAG_SECURE window where Accessibility tree is redacted
+            }
+            val combined = (snapshot.visibleTexts + snapshot.interactiveElements.map { it.displayLabel })
+                .joinToString(" ")
+                .lowercase()
+            return combined.contains("enter pin") ||
+                combined.contains("enter password") ||
+                combined.contains("biometric") ||
+                combined.contains("fingerprint") ||
+                combined.contains("verify it's you") ||
+                combined.contains("upi pin") ||
+                snapshot.interactiveElements.any { it.isPassword }
+        }
+
         fun locateTargetInSnapshot(query: String, snapshot: ScreenSnapshot?): VisualTargetMatch? {
             val cleanQuery = query.trim()
             if (cleanQuery.isEmpty() || snapshot == null) return null
+
+            // 0. Ordinal target resolution ("ordinal:3", "teesra option", "pehla", "second")
+            parseOrdinalIndex(cleanQuery)?.let { ordIdx ->
+                locateOrdinalTargetInSnapshot(ordIdx, snapshot)?.let { return it }
+            }
 
             // 1. Exact text or contentDescription match
             snapshot.interactiveElements.firstOrNull { node ->
@@ -319,6 +398,21 @@ class ScreenIntelligenceManager(private val context: Context) {
             return null
         }
     }
+
+    fun locateOrdinalTarget(ordinalIndex: Int, snapshot: ScreenSnapshot? = captureCurrentSnapshot()): VisualTargetMatch? =
+        locateOrdinalTargetInSnapshot(ordinalIndex, snapshot)
+
+    fun findEditableInputFields(snapshot: ScreenSnapshot? = captureCurrentSnapshot()): List<ScreenNodeInfo> =
+        findEditableFields(snapshot)
+
+    fun hasScrollableList(snapshot: ScreenSnapshot? = captureCurrentSnapshot()): Boolean =
+        hasScrollableContainer(snapshot)
+
+    fun explainCurrentDialog(snapshot: ScreenSnapshot? = captureCurrentSnapshot()): String =
+        explainDialogOrScreen(snapshot)
+
+    fun isCurrentScreenSecureOrAuth(snapshot: ScreenSnapshot? = captureCurrentSnapshot()): Boolean =
+        isSecureOrAuthenticationScreen(snapshot)
 }
 
 data class ScreenSemanticSignals(
@@ -326,5 +420,3 @@ data class ScreenSemanticSignals(
     val isLoadingState: Boolean,
     val isErrorScreen: Boolean
 )
-
-

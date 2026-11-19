@@ -52,6 +52,10 @@ import com.example.ui.memory.MemoryScreen
 import com.example.ui.navigation.Screen
 import com.example.ui.onboarding.OnboardingScreen
 import com.example.ui.permissions.PermissionAccessScreen
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import androidx.lifecycle.lifecycleScope
 import com.example.ui.settings.SettingsScreen
 import com.example.ui.theme.NayroTheme
 import kotlinx.coroutines.launch
@@ -71,14 +75,40 @@ class MainActivity : ComponentActivity() {
     // Holds pending prompt delivered from floating assistant
     private var pendingFloatingPrompt: String? = null
 
-    // Single permission request launcher
+    // Tracks the specific Android permission string requested so the callback only performs targeted handling
+    private var lastRequestedPermissionString: String? = null
+    private var pendingSpecialAccessPermissionType: PermissionType? = null
+
+    private var isUnlockReceiverRegistered = false
+    private val userPresentReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_USER_PRESENT && ::agentRuntime.isInitialized) {
+                lifecycleScope.launch {
+                    agentRuntime.onDeviceUnlocked()
+                }
+            }
+        }
+    }
+
+    // Phase 4 — Targeted Single Permission Request Launcher:
+    // Directly notifies AgentRuntime.onPermissionDecision(permission, isGranted) and persists the decision
+    // across process recreation. Strictly avoids calling refreshAllPermissions(), refreshReport(), or evaluateAll().
     @Suppress("InvalidFragmentVersionForActivityResult")
     private val requestSinglePermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { _ ->
-        permissionManager.refreshAllPermissions(this)
-        permissionSetupManager.refreshReport()
-        capabilityManager.evaluateAll()
+    ) { isGranted ->
+        val permStr = lastRequestedPermissionString
+            ?: agentRuntime.pendingRequiredPermission
+            ?: "ANDROID_PERMISSION"
+        if (::permissionManager.isInitialized) {
+            permissionManager.evaluateSinglePermissionTargeted(permStr, this)
+        }
+        if (::agentRuntime.isInitialized) {
+            agentRuntime.persistPendingPermissionDecision(permStr, isGranted)
+            lifecycleScope.launch {
+                agentRuntime.onPermissionDecision(permStr, isGranted)
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -101,6 +131,19 @@ class MainActivity : ComponentActivity() {
         voiceManager = app.voiceManager
         val notebookManager = app.notebookManager
 
+        val savedName = permissionSetupManager.getSavedAssistantName()
+        agentRuntime.setAssistantIdentity(savedName)
+        voiceManager.updateAssistantIdentity(savedName)
+
+        try {
+            registerReceiver(userPresentReceiver, IntentFilter(Intent.ACTION_USER_PRESENT))
+            isUnlockReceiverRegistered = true
+        } catch (_: Exception) {}
+
+        lifecycleScope.launch {
+            agentRuntime.consumePersistedPermissionDecision()
+        }
+
         setContent {
             NayroTheme {
                 NayroAppContent(
@@ -118,11 +161,21 @@ class MainActivity : ComponentActivity() {
                     onRequestRuntimePermission = { type ->
                         val item = PermissionRegistry.findByType(type)
                         item?.androidPermissionString?.let { permStr ->
-                            permissionManager.markRuntimePermissionRequested(permStr)
-                            requestSinglePermissionLauncher.launch(permStr)
+                            if (permissionManager.isPermissionGranted(permStr)) {
+                                // Reuse already-granted permission without re-prompting
+                                permissionManager.evaluateSinglePermissionTargeted(permStr, this)
+                                lifecycleScope.launch {
+                                    agentRuntime.onPermissionDecision(permStr, true)
+                                }
+                            } else {
+                                lastRequestedPermissionString = permStr
+                                permissionManager.markRuntimePermissionRequested(permStr)
+                                requestSinglePermissionLauncher.launch(permStr)
+                            }
                         }
                     },
                     onOpenPermissionSettings = { type ->
+                        pendingSpecialAccessPermissionType = type
                         permissionSetupManager.triggerSpecialAccessSettings(type, this)
                     },
                     onRefreshPermissions = {
@@ -163,12 +216,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        permissionManager.refreshAllPermissions(this)
-        permissionSetupManager.refreshReport()
-        capabilityManager.evaluateAll()
+        // Section 3: Strictly avoid global refreshAllPermissions(), refreshReport(), or evaluateAll() in onResume().
+        // Only perform a targeted single-permission check if returning from a special-access settings flow.
+        val specialType = pendingSpecialAccessPermissionType
+        if (specialType != null && ::permissionManager.isInitialized) {
+            pendingSpecialAccessPermissionType = null
+            val granted = permissionManager.evaluateSinglePermissionTargeted(specialType.name, this)
+            if (::agentRuntime.isInitialized) {
+                lifecycleScope.launch {
+                    agentRuntime.onPermissionDecision(specialType.name, granted)
+                }
+            }
+        }
     }
 
     override fun onDestroy() {
+        if (isUnlockReceiverRegistered) {
+            try {
+                unregisterReceiver(userPresentReceiver)
+            } catch (_: Exception) {}
+            isUnlockReceiverRegistered = false
+        }
         super.onDestroy()
         voiceManager.onActivityDestroyed()
     }
@@ -217,6 +285,8 @@ fun NayroAppContent(
     val activeProvider by providerManager.activeProvider.collectAsState()
     val voiceConfig by voiceManager.configuration.collectAsState()
     val voiceState by voiceManager.voiceState.collectAsState()
+    val transcribedText by voiceManager.transcribedText.collectAsState()
+    val audioLevel by voiceManager.normalizedAudioLevel.collectAsState()
 
     val foregroundStatus by ServiceStateRepository.foregroundServiceStatus.collectAsState()
     val floatingStatus by ServiceStateRepository.floatingServiceStatus.collectAsState()
@@ -238,20 +308,46 @@ fun NayroAppContent(
             )
             agentRuntime.setState(AgentState.Speaking(reply))
 
-            if (voiceConfig.isWakeWordEnabled || voiceState == VoiceState.SPEAKING) {
+            if (voiceConfig.isWakeWordEnabled || voiceState == VoiceState.SPEAKING || voiceConfig.isTtsEnabled) {
                 voiceManager.speak(reply)
             }
         }
     }
 
+    fun handleVoiceToggle() {
+        if (voiceState == VoiceState.LISTENING || voiceState == VoiceState.FOLLOW_UP_LISTENING) {
+            voiceManager.stopListening()
+        } else {
+            if (!permissionManager.isMicrophoneGranted()) {
+                onRequestRuntimePermission(PermissionType.MICROPHONE)
+            } else {
+                voiceManager.startListening()
+            }
+        }
+    }
+
+    LaunchedEffect(voiceState) {
+        when (voiceState) {
+            VoiceState.LISTENING, VoiceState.FOLLOW_UP_LISTENING -> {
+                agentRuntime.setState(AgentState.UserListening)
+            }
+            VoiceState.TRANSCRIBING -> {
+                agentRuntime.setState(AgentState.Transcribing)
+            }
+            else -> {}
+        }
+    }
+
     // Handle Speech Recognition callback
     LaunchedEffect(Unit) {
-        voiceManager.onSpeechRecognized = { recognizedText ->
-            processUserPrompt(recognizedText)
-        }
-        voiceManager.onSpeechError = { errorMsg ->
-            agentRuntime.setState(AgentState.Error(errorMsg))
-        }
+        voiceManager.attachUiListener(
+            onRecognized = { recognizedText ->
+                processUserPrompt(recognizedText)
+            },
+            onError = { errorMsg ->
+                agentRuntime.setState(AgentState.Error(errorMsg))
+            }
+        )
     }
 
     // Process Pending prompt from Floating Assistant
@@ -284,6 +380,8 @@ fun NayroAppContent(
                 val cleanName = name.trim().ifEmpty { "Babu" }
                 assistantName = cleanName
                 permissionSetupManager.markSetupCompleted(cleanName)
+                agentRuntime.setAssistantIdentity(cleanName)
+                voiceManager.updateAssistantIdentity(cleanName)
                 showOnboarding = false
                 currentScreen = Screen.Home
             }
@@ -314,21 +412,16 @@ fun NayroAppContent(
                     Screen.Home -> HomeScreen(
                         assistantName = assistantName,
                         agentState = agentState,
+                        voiceState = voiceState,
+                        liveTranscript = transcribedText,
+                        audioLevel = audioLevel,
                         currentTask = currentTask,
                         recentConversations = conversations,
                         isForegroundActive = foregroundStatus.state == ServiceLifecycleState.RUNNING,
                         isFloatingActive = floatingStatus.state == ServiceLifecycleState.RUNNING,
                         isAiReady = activeProvider != null,
                         onVoiceTap = {
-                            if (voiceState == VoiceState.LISTENING) {
-                                voiceManager.stopListening()
-                            } else {
-                                if (!permissionManager.isMicrophoneGranted()) {
-                                    onRequestRuntimePermission(PermissionType.MICROPHONE)
-                                } else {
-                                    voiceManager.startListening()
-                                }
-                            }
+                            handleVoiceToggle()
                         },
                         onSendText = { text ->
                             processUserPrompt(text)
@@ -425,7 +518,14 @@ fun NayroAppContent(
                     )
 
                     Screen.Chat -> ConversationScreen(
+                        assistantName = assistantName,
                         conversations = conversations,
+                        voiceState = voiceState,
+                        liveTranscript = transcribedText,
+                        audioLevel = audioLevel,
+                        onVoiceTap = {
+                            handleVoiceToggle()
+                        },
                         onSendMessage = { text ->
                             processUserPrompt(text)
                         },
@@ -465,64 +565,80 @@ fun NayroAppContent(
                         }
                     )
 
-                    Screen.Settings -> SettingsScreen(
-                        assistantName = assistantName,
-                        isWakeEnabled = voiceConfig.isWakeWordEnabled,
-                        providers = configuredProviders,
-                        activeProviderId = activeProvider?.id,
-                        onSaveApiKey = { providerId, apiKey ->
-                            encryptedStorageManager.saveApiKey(providerId, apiKey)
-                            providerManager.refreshActiveProvider()
-                            capabilityManager.evaluateAll()
-                            coroutineScope.launch {
-                                repository.logAuditAction(
-                                    actionType = "SECURITY_KEY_UPDATE",
-                                    target = providerId,
-                                    riskLevel = "R0",
-                                    outcome = "SUCCESS",
-                                    details = "API key securely stored in Android KeyStore."
+                    Screen.Settings -> {
+                        SettingsScreen(
+                            assistantName = assistantName,
+                            isWakeEnabled = voiceConfig.isWakeWordEnabled,
+                            providers = configuredProviders,
+                            activeProviderId = activeProvider?.id,
+                            onSaveApiKey = { providerId, apiKey ->
+                                encryptedStorageManager.saveApiKey(providerId, apiKey)
+                                providerManager.refreshActiveProvider()
+                                capabilityManager.evaluateAll()
+                                coroutineScope.launch {
+                                    repository.logAuditAction(
+                                        actionType = "SECURITY_KEY_UPDATE",
+                                        target = providerId,
+                                        riskLevel = "R0",
+                                        outcome = "SUCCESS",
+                                        details = "API key securely stored in Android KeyStore."
+                                    )
+                                }
+                            },
+                            onSaveCustomProvider = { id, name, url, model ->
+                                val customConfig = ProviderConfig(
+                                    id = id,
+                                    type = ProviderType.CUSTOM_OPENAI,
+                                    name = name,
+                                    baseUrl = url,
+                                    modelId = model,
+                                    priority = 5,
+                                    isEnabled = true
                                 )
-                            }
-                        },
-                        onSaveCustomProvider = { id, name, url, model ->
-                            val customConfig = ProviderConfig(
-                                id = id,
-                                type = ProviderType.CUSTOM_OPENAI,
-                                name = name,
-                                baseUrl = url,
-                                modelId = model,
-                                priority = 5,
-                                isEnabled = true
-                            )
-                            providerManager.updateProvider(customConfig)
-                            capabilityManager.evaluateAll()
-                        },
-                        onToggleWake = { enabled ->
-                            voiceManager.updateConfiguration(voiceConfig.copy(isWakeWordEnabled = enabled))
-                            capabilityManager.evaluateAll()
-                        },
-                        onTestProvider = { providerId ->
-                            coroutineScope.launch {
-                                val provider = configuredProviders.firstOrNull { it.id == providerId }
-                                if (provider != null) {
-                                    agentRuntime.setState(AgentState.Thinking)
-                                    val result = providerManager.sendRequest("Test connection from NAYRO")
-                                    if (result is AIResult.Success) {
-                                        agentRuntime.setState(AgentState.Completed("Connected successfully to ${provider.name}!"))
-                                    } else if (result is AIResult.Error) {
-                                        agentRuntime.setState(AgentState.Error(result.message))
+                                providerManager.updateProvider(customConfig)
+                                capabilityManager.evaluateAll()
+                            },
+                            onToggleWake = { enabled ->
+                                voiceManager.updateConfiguration(voiceConfig.copy(isWakeWordEnabled = enabled))
+                                capabilityManager.evaluateAll()
+                            },
+                            onTestProvider = { providerId ->
+                                coroutineScope.launch {
+                                    val provider = configuredProviders.firstOrNull { it.id == providerId }
+                                    if (provider != null) {
+                                        agentRuntime.setState(AgentState.Thinking)
+                                        val result = providerManager.sendRequest("Test connection from NAYRO")
+                                        if (result is AIResult.Success) {
+                                            agentRuntime.setState(AgentState.Completed("Connected successfully to ${provider.name}!"))
+                                        } else if (result is AIResult.Error) {
+                                            agentRuntime.setState(AgentState.Error(result.message))
+                                        }
                                     }
                                 }
+                            },
+                            wakeSensitivity = voiceManager.wakeWordEngine.getConfidenceThreshold(),
+                            onWakeSensitivityChange = { threshold ->
+                                voiceManager.wakeWordEngine.setSensitivity(1.0f - (threshold - 0.50f))
+                            },
+                            onEnrollWakePhrase = { phrase ->
+                                voiceManager.wakeWordEngine.recordOrEnrollPhraseFromUi(phrase)
+                            },
+                            onSaveAssistantName = { newName ->
+                                val cleanName = newName.trim().ifEmpty { "Babu" }
+                                assistantName = cleanName
+                                permissionSetupManager.saveAssistantName(cleanName)
+                                agentRuntime.setAssistantIdentity(cleanName)
+                                voiceManager.updateAssistantIdentity(cleanName)
+                            },
+                            onAddCustomWakePhrase = { customPhrase ->
+                                val cleanPhrase = customPhrase.trim()
+                                if (cleanPhrase.isNotBlank()) {
+                                    val updatedPhrases = (voiceConfig.wakePhrases + cleanPhrase).distinct()
+                                    voiceManager.updateConfiguration(voiceConfig.copy(wakePhrases = updatedPhrases))
+                                }
                             }
-                        },
-                        wakeSensitivity = voiceManager.wakeWordEngine.getConfidenceThreshold(),
-                        onWakeSensitivityChange = { threshold ->
-                            voiceManager.wakeWordEngine.setSensitivity(1.0f - (threshold - 0.50f))
-                        },
-                        onEnrollWakePhrase = { phrase ->
-                            voiceManager.wakeWordEngine.recordOrEnrollPhraseFromUi(phrase)
-                        }
-                    )
+                        )
+                    }
 
                     Screen.ToolsCatalog -> com.example.ui.tools.ToolsCatalogScreen()
 
@@ -572,6 +688,8 @@ fun NayroAppContent(
                             val cleanName = name.trim().ifEmpty { "Babu" }
                             assistantName = cleanName
                             permissionSetupManager.markSetupCompleted(cleanName)
+                            agentRuntime.setAssistantIdentity(cleanName)
+                            voiceManager.updateAssistantIdentity(cleanName)
                             currentScreen = Screen.Home
                         }
                     )

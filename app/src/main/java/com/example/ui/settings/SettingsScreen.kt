@@ -57,6 +57,8 @@ fun SettingsScreen(
     isWakeEnabled: Boolean = false,
     providers: List<ProviderConfig> = emptyList(),
     activeProviderId: String? = null,
+    onSaveAssistantName: (String) -> Unit = {},
+    onAddCustomWakePhrase: (String) -> Unit = {},
     onSaveApiKey: (String, String) -> Unit = { _, _ -> },
     onSaveCustomProvider: (String, String, String, String) -> Unit = { _, _, _, _ -> },
     onToggleWake: (Boolean) -> Unit = {},
@@ -67,6 +69,8 @@ fun SettingsScreen(
 ) {
     val scrollState = rememberScrollState()
 
+    var assistantNameDraft by remember(assistantName) { mutableStateOf(assistantName) }
+    var customWakePhraseDraft by remember { mutableStateOf("") }
     var geminiKeyInput by remember { mutableStateOf("") }
     var openaiKeyInput by remember { mutableStateOf("") }
     var grokKeyInput by remember { mutableStateOf("") }
@@ -76,6 +80,11 @@ fun SettingsScreen(
     var customApiKey by remember { mutableStateOf("") }
     var selectedSensitivity by remember(wakeSensitivity) { mutableStateOf(wakeSensitivity) }
     var enrolledSamplesStatus by remember { mutableStateOf("") }
+
+    val dynamicWakePhrases = remember(assistantName) {
+        val clean = assistantName.trim().ifEmpty { "Babu" }
+        listOf("Hi $clean", "Hey $clean", "Hi Nayro").distinct()
+    }
 
     Column(
         modifier = Modifier
@@ -97,17 +106,76 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // A. Assistant Identity Section
+        // A. Assistant Identity Section (Section 2: Custom Assistant Identity System)
         SettingsGroup(
             title = "A. Assistant Identity",
             icon = Icons.Default.SmartToy
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
-                Text("Assistant Persona: $assistantName", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    text = "Active Assistant Name: $assistantName",
+                    style = MaterialTheme.typography.titleLarge
+                )
                 Spacer(modifier = Modifier.height(4.dp))
-                Text("Wake Phrases: 'Hi Babu', 'Hey Babu', 'Hey Cutie', 'Hi Nayro'", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    text = "NAYRO is the permanent product identity. Customize your personal assistant's name below (e.g., Babu, Jarvis, Friday, Alex).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = assistantNameDraft,
+                        onValueChange = { assistantNameDraft = it },
+                        label = { Text("Assistant Name") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_assistant_name_input")
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            val clean = assistantNameDraft.trim().ifEmpty { "Babu" }
+                            assistantNameDraft = clean
+                            onSaveAssistantName(clean)
+                            enrolledSamplesStatus = "Assistant identity updated to '$clean'. Dynamic wake phrases: 'Hi $clean', 'Hey $clean'."
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
+                        modifier = Modifier.testTag("settings_save_assistant_name_button")
+                    ) {
+                        Text("Save")
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Babu", "Jarvis", "Friday", "Alex").forEach { preset ->
+                        OutlinedButton(
+                            onClick = {
+                                assistantNameDraft = preset
+                                onSaveAssistantName(preset)
+                                enrolledSamplesStatus = "Switched assistant name to '$preset'."
+                            },
+                            modifier = Modifier.testTag("preset_assistant_${preset.lowercase()}")
+                        ) {
+                            Text(preset, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "Configured Wake Phrases: ${dynamicWakePhrases.joinToString { "'$it'" }}",
+                    style = MaterialTheme.typography.bodyMedium
+                )
                 Spacer(modifier = Modifier.height(4.dp))
-                Text("Languages Supported: Hindi, English, Hinglish", style = MaterialTheme.typography.bodyMedium, color = Coral)
+                Text(
+                    text = "Languages Supported: Hindi, English, Hinglish",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Coral
+                )
             }
         }
 
@@ -123,7 +191,7 @@ fun SettingsScreen(
                     Column(modifier = Modifier.weight(1f)) {
                         Text("On-Device Wake-Word Detection", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            "Listens for 'Hey Babu' locally on-device using 13-MFCC + Sakoe-Chiba DTW. Standby audio is never uploaded to cloud servers.",
+                            "Listens for 'Hey $assistantName' locally on-device using 13-MFCC + Sakoe-Chiba DTW. Custom wake phrases require voice enrollment to activate acoustic DTW matching.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -163,7 +231,7 @@ fun SettingsScreen(
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Hi Babu", "Hey Babu", "Hi Nayro").forEach { phrase ->
+                    dynamicWakePhrases.forEach { phrase ->
                         OutlinedButton(
                             onClick = {
                                 onEnrollWakePhrase(phrase)
@@ -181,6 +249,37 @@ fun SettingsScreen(
                         }
                     }
                 }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = customWakePhraseDraft,
+                        onValueChange = { customWakePhraseDraft = it },
+                        label = { Text("Add Custom Wake Phrase") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_custom_wake_phrase_input")
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    OutlinedButton(
+                        onClick = {
+                            val cleanPhrase = customWakePhraseDraft.trim()
+                            if (cleanPhrase.length >= 3) {
+                                onAddCustomWakePhrase(cleanPhrase)
+                                customWakePhraseDraft = ""
+                                enrolledSamplesStatus = "Registered '$cleanPhrase'. Please enroll voice samples to enable acoustic DTW detection."
+                            }
+                        },
+                        modifier = Modifier.testTag("settings_add_wake_phrase_button")
+                    ) {
+                        Text("Add Phrase")
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(
@@ -204,7 +303,7 @@ fun SettingsScreen(
                         onClick = {
                             try {
                                 val eng = com.example.NayroApplication.instance.voiceManager.wakeWordEngine
-                                listOf("Hi Babu", "Hey Babu", "Hi Nayro").forEach { eng.clearEnrolledSamples(it) }
+                                dynamicWakePhrases.forEach { eng.clearEnrolledSamples(it) }
                             } catch (_: Exception) {}
                             enrolledSamplesStatus = "Cleared enrolled samples. Ready for fresh re-enrollment."
                         },

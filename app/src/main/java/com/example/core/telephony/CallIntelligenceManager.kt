@@ -110,6 +110,36 @@ class CallIntelligenceManager(
         fun normalizePhoneDigits(rawPhone: String): String {
             return rawPhone.filter { it.isDigit() || it == '+' }
         }
+
+        /**
+         * Section 5A — Normalizes phone numbers into canonical E.164-like format
+         * (e.g., "098765 43210" -> "+919876543210", "+91-98765-43210" -> "+919876543210")
+         * and deduplicates contacts sharing the same normalized number and display name.
+         */
+        fun normalizePhoneNumber(rawPhone: String, defaultCountryCode: String = "+91"): String {
+            val cleaned = rawPhone.filter { it.isDigit() || it == '+' }
+            if (cleaned.startsWith("+")) return cleaned
+            val digits = cleaned.filter { it.isDigit() }
+            return when {
+                digits.length == 11 && digits.startsWith("0") -> "$defaultCountryCode${digits.drop(1)}"
+                digits.length == 10 -> "$defaultCountryCode$digits"
+                digits.length == 12 && digits.startsWith("91") -> "+$digits"
+                else -> digits
+            }
+        }
+
+        fun deduplicateContacts(contacts: List<ResolvedContactItem>): List<ResolvedContactItem> {
+            val seen = mutableSetOf<String>()
+            val result = mutableListOf<ResolvedContactItem>()
+            for (c in contacts) {
+                val normNum = normalizePhoneNumber(c.phoneNumber).takeLast(10)
+                val key = "${c.displayName.trim().lowercase()}|$normNum"
+                if (seen.add(key)) {
+                    result.add(c)
+                }
+            }
+            return result
+        }
     }
 
     var testOverrideCallState: CallStateSnapshot? = null
@@ -374,7 +404,8 @@ class CallIntelligenceManager(
     fun initiateOutgoingCall(
         rawTarget: String,
         isConfirmed: Boolean,
-        observeCallState: Boolean = false
+        observeCallState: Boolean = false,
+        preferredSimSlot: Int? = null
     ): ActionExecutionResult {
         val cleanTarget = rawTarget.trim()
         if (cleanTarget.isEmpty() || cleanTarget.equals("Contact", ignoreCase = true)) {
@@ -488,6 +519,7 @@ class CallIntelligenceManager(
         lastCalledNormalizedNumber = normDigits
         lastCallTimestampMs = nowMs
         lastDialedRecipient = resolvedDisplayName
+        val simTag = if (preferredSimSlot != null && preferredSimSlot in 1..2) " [SIM_SLOT=$preferredSimSlot]" else ""
 
         // 7. Handle deterministic test / simulation overrides when running in JVM unit tests
         if (testOverrideLastOutgoingCallAnswered != null || testOverrideCallInitiated != null || context == null) {
@@ -508,9 +540,9 @@ class CallIntelligenceManager(
                 lastOutgoingCallAnswered = explicitAnswered
                 lastCallLifecycleState = if (explicitAnswered) PhoneCallLifecycleState.CALL_ANSWERED else PhoneCallLifecycleState.CALL_INITIATED
                 val answerMsg = if (explicitAnswered) {
-                    "Outgoing call to $resolvedDisplayName ($phoneToCall) initiated and verified answered [CALL_INITIATED=true] [CALL_ANSWERED=true] [STATE=${lastCallLifecycleState.name}]."
+                    "Outgoing call to $resolvedDisplayName ($phoneToCall) initiated and verified answered [CALL_INITIATED=true] [CALL_ANSWERED=true]$simTag [STATE=${lastCallLifecycleState.name}]."
                 } else {
-                    "Outgoing call to $resolvedDisplayName ($phoneToCall) initiated, but recipient did not answer [CALL_INITIATED=true] [CALL_ANSWERED=false] [STATE=${lastCallLifecycleState.name}]."
+                    "Outgoing call to $resolvedDisplayName ($phoneToCall) initiated, but recipient did not answer [CALL_INITIATED=true] [CALL_ANSWERED=false]$simTag [STATE=${lastCallLifecycleState.name}]."
                 }
                 ActionExecutionResult(
                     true,
@@ -523,7 +555,7 @@ class CallIntelligenceManager(
                 val obsSuffix = if (observeCallState) " [CALL_ANSWERED=false]" else ""
                 ActionExecutionResult(
                     true,
-                    "Initiated outgoing phone call to $resolvedDisplayName ($phoneToCall) via ACTION_CALL [CALL_INITIATED=true] [STATE=${lastCallLifecycleState.name}]. Recipient answer is not claimed without connected call duration evidence.$obsSuffix",
+                    "Initiated outgoing phone call to $resolvedDisplayName ($phoneToCall) via ACTION_CALL [CALL_INITIATED=true]$simTag [STATE=${lastCallLifecycleState.name}]. Recipient answer is not claimed without connected call duration evidence.$obsSuffix",
                     VerificationStatus.VERIFIED
                 )
             }
@@ -534,9 +566,19 @@ class CallIntelligenceManager(
             val callUri = Uri.fromParts("tel", phoneToCall, null)
             val telecom = context.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
             var callPlacedViaSystem = false
+            val callExtras = Bundle()
+            if (telecom != null && preferredSimSlot != null && preferredSimSlot in 1..2 && hasPhoneStatePermission()) {
+                try {
+                    val accounts = telecom.callCapablePhoneAccounts
+                    val selectedHandle = accounts.getOrNull(preferredSimSlot - 1)
+                    if (selectedHandle != null) {
+                        callExtras.putParcelable(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE, selectedHandle)
+                    }
+                } catch (_: Exception) {}
+            }
             if (telecom != null) {
                 try {
-                    telecom.placeCall(callUri, Bundle())
+                    telecom.placeCall(callUri, callExtras)
                     callPlacedViaSystem = true
                 } catch (_: Exception) {
                     callPlacedViaSystem = false
@@ -545,6 +587,9 @@ class CallIntelligenceManager(
             if (!callPlacedViaSystem) {
                 val callIntent = Intent(Intent.ACTION_CALL, callUri).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    if (callExtras.containsKey(TelecomManager.EXTRA_PHONE_ACCOUNT_HANDLE)) {
+                        putExtras(callExtras)
+                    }
                 }
                 context.startActivity(callIntent)
             }

@@ -133,4 +133,35 @@ object AppNavigationManager {
             false
         }
     }
+
+    fun openMapsNavigation(context: Context, destination: String): Boolean {
+        val cleanDest = destination.trim()
+        if (cleanDest.isEmpty()) return false
+        return try {
+            val encoded = android.net.Uri.encode(cleanDest)
+            val navUri = android.net.Uri.parse("google.navigation:q=$encoded")
+            val mapsIntent = Intent(Intent.ACTION_VIEW, navUri).apply {
+                setPackage("com.google.android.apps.maps")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            if (mapsIntent.resolveActivity(context.packageManager) != null) {
+                context.startActivity(mapsIntent)
+                true
+            } else {
+                val geoUri = android.net.Uri.parse("geo:0,0?q=$encoded")
+                val fallbackIntent = Intent(Intent.ACTION_VIEW, geoUri).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                if (fallbackIntent.resolveActivity(context.packageManager) != null) {
+                    context.startActivity(fallbackIntent)
+                    true
+                } else {
+                    false
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open Maps navigation for '$cleanDest': ${e.message}")
+            false
+        }
+    }
 }

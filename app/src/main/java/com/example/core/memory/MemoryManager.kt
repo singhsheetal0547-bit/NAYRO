@@ -96,4 +96,102 @@ class MemoryManager(private val repository: NayroRepository) {
             "- [${mem.category}/${mem.keyName}] ${mem.memoryValue}"
         }
     }
+
+    /**
+     * Section 7 — Ranks non-expired memories by keyword relevance and recency.
+     */
+    fun rankMemoriesForQuery(
+        query: String,
+        allMemories: List<MemoryEntity> = getCachedMemories(),
+        nowMs: Long = System.currentTimeMillis()
+    ): List<MemoryEntity> {
+        val valid = filterNonExpiredMemories(allMemories, nowMs)
+        val tokens = query.lowercase().split(Regex("\\s+")).filter { it.length >= 2 }
+        return valid.sortedByDescending { mem ->
+            val hay = "${mem.keyName} ${mem.memoryValue} ${mem.category}".lowercase()
+            val matchHits = tokens.count { tok -> hay.contains(tok) }
+            val tierBoost = if (mem.userConfirmed) 2 else 0
+            (matchHits * 100L) + (tierBoost * 10L) + (mem.createdAt / 1_000_000L)
+        }
+    }
+
+    /**
+     * Section 7 — Filters out expired short-term or temporary memories while keeping permanent user-approved memories.
+     */
+    fun filterNonExpiredMemories(
+        memories: List<MemoryEntity> = getCachedMemories(),
+        nowMs: Long = System.currentTimeMillis(),
+        shortTermTtlMs: Long = 3_600_000L // 1 hour default TTL for TEMPORARY_SESSION / SHORT_TERM_MEMORY
+    ): List<MemoryEntity> {
+        return memories.filter { mem ->
+            val isShortTerm = mem.category in setOf(
+                MemoryCategory.TEMPORARY_SESSION.name,
+                MemoryCategory.SHORT_TERM_MEMORY.name
+            )
+            if (isShortTerm) {
+                (nowMs - mem.createdAt) < shortTermTtlMs
+            } else {
+                true
+            }
+        }
+    }
+
+    /**
+     * Section 7 — Detects whether an identical key + normalized value memory already exists.
+     */
+    fun isDuplicateMemory(
+        key: String,
+        value: String,
+        memories: List<MemoryEntity> = getCachedMemories()
+    ): Boolean {
+        val normKey = key.trim().lowercase()
+        val normVal = value.trim().lowercase()
+        return memories.any {
+            it.keyName.trim().lowercase() == normKey &&
+                it.memoryValue.trim().lowercase() == normVal
+        }
+    }
+
+    /**
+     * Section 7 — Updates or corrects an existing memory entry by key name after validating privacy rules.
+     */
+    suspend fun correctMemoryValue(
+        key: String,
+        newValue: String,
+        category: MemoryCategory = MemoryCategory.USER_PREFERENCE
+    ): MemoryEntity? {
+        if (!MemoryPrivacyGuard.isAllowedToPersist(newValue)) return null
+        val sanitized = MemoryPrivacyGuard.sanitizeContent(newValue)
+        val updatedEntity = MemoryEntity(
+            category = category.name,
+            keyName = key.trim(),
+            memoryValue = sanitized,
+            userConfirmed = true,
+            createdAt = System.currentTimeMillis()
+        )
+        synchronized(cachedMemories) {
+            cachedMemories.removeAll { it.keyName.equals(key.trim(), ignoreCase = true) }
+            cachedMemories.add(0, updatedEntity)
+        }
+        try {
+            repository.addMemory(updatedEntity)
+        } catch (_: Exception) {}
+        return updatedEntity
+    }
+
+    /**
+     * Section 7 — Memory must NEVER override a direct, newer user instruction.
+     * If [directUserValue] is provided, it takes strict precedence over [storedMemoryValue].
+     */
+    fun resolveWithDirectInstructionPriority(
+        directUserValue: String?,
+        storedMemoryValue: String?
+    ): String? {
+        val cleanDirect = directUserValue?.trim()
+        if (!cleanDirect.isNullOrEmpty()) {
+            return cleanDirect
+        }
+        return storedMemoryValue?.trim()?.takeIf { it.isNotEmpty() }
+    }
 }
+

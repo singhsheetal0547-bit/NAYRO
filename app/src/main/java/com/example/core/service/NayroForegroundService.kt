@@ -39,9 +39,11 @@ class NayroForegroundService : Service() {
         const val ACTION_STOP = "com.example.nayro.action.STOP"
         const val ACTION_PAUSE = "com.example.nayro.action.PAUSE"
         const val ACTION_RESUME = "com.example.nayro.action.RESUME"
+        const val ACTION_EXECUTE_BACKGROUND_TASK = "com.example.nayro.action.EXECUTE_BACKGROUND_TASK"
 
         const val EXTRA_PAUSE_DURATION_MINUTES = "com.example.nayro.extra.PAUSE_DURATION_MINUTES"
         const val EXTRA_PAUSE_REASON = "com.example.nayro.extra.PAUSE_REASON"
+        const val EXTRA_USER_INSTRUCTION = "com.example.nayro.extra.USER_INSTRUCTION"
 
         val status: StateFlow<ServiceStatus> = ServiceStateRepository.foregroundServiceStatus
 
@@ -123,19 +125,93 @@ class NayroForegroundService : Service() {
                 ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
             }
         }
+
+        fun enqueueBackgroundTask(context: Context?, userInstruction: String) {
+            val clean = userInstruction.trim()
+            if (clean.isEmpty()) return
+            ServiceStateRepository.appendActivityLog("Background task queued: \"$clean\"")
+            if (context == null) return
+            val intent = Intent(context, NayroForegroundService::class.java).apply {
+                action = ACTION_EXECUTE_BACKGROUND_TASK
+                putExtra(EXTRA_USER_INSTRUCTION, clean)
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                ServiceStateRepository.appendActivityLog("Background task start failed: ${e.localizedMessage ?: e.javaClass.simpleName}")
+            }
+        }
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var pauseTimerJob: Job? = null
+    private var isScreenReceiverRegistered = false
+    @Volatile
+    private var isRunningInForeground = false
+
+    private val screenAndUnlockReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            try {
+                val app = NayroApplication.instance
+                when (intent?.action) {
+                    Intent.ACTION_SCREEN_OFF -> {
+                        app.agentRuntime.operatingStateManager.refreshDeviceOperatingState(
+                            isScreenInteractive = false,
+                            isKeyguardLocked = true
+                        )
+                        if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.LOCKED)
+                        }
+                    }
+                    Intent.ACTION_SCREEN_ON -> {
+                        app.agentRuntime.operatingStateManager.refreshDeviceOperatingState()
+                    }
+                    Intent.ACTION_USER_PRESENT -> {
+                        if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RECOVERING)
+                        }
+                        serviceScope.launch {
+                            app.agentRuntime.onDeviceUnlocked()
+                            if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun resolveAssistantName(): String {
+        return try {
+            NayroApplication.instance.permissionSetupManager.getSavedAssistantName()
+        } catch (_: Exception) {
+            "Babu"
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        try {
+            val filter = android.content.IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            registerReceiver(screenAndUnlockReceiver, filter)
+            isScreenReceiverRegistered = true
+        } catch (_: Exception) {}
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                isRunningInForeground = false
                 pauseTimerJob?.cancel()
                 ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
                 stopWakeWordEngine()
@@ -154,13 +230,34 @@ class NayroForegroundService : Service() {
                 handleResumeCommand()
                 return START_STICKY
             }
+            ACTION_EXECUTE_BACKGROUND_TASK -> {
+                val instruction = intent.getStringExtra(EXTRA_USER_INSTRUCTION)?.trim().orEmpty()
+                if (instruction.isNotEmpty() && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                    serviceScope.launch {
+                        try {
+                            val app = NayroApplication.instance
+                            app.agentRuntime.recordHeartbeat()
+                            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.PROCESSING)
+                            val response = app.agentRuntime.executeUserInstruction(instruction)
+                            app.repository.addConversationMessage(
+                                ConversationEntity(sender = "babu", content = response)
+                            )
+                            if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
+                            }
+                        } catch (_: Exception) {}
+                    }
+                }
+                return START_STICKY
+            }
         }
 
         try {
             pauseTimerJob?.cancel()
+            val personaName = resolveAssistantName()
             val notification = createNotification(
-                title = "NAYRO Agent Active",
-                content = "Babu background agent engine is ready. Tap to open.",
+                title = "NAYRO Agent Active ($personaName)",
+                content = "$personaName background agent engine is ready. Tap to open.",
                 isPaused = false
             )
 
@@ -175,12 +272,14 @@ class NayroForegroundService : Service() {
                 startForeground(NOTIFICATION_ID, notification)
             }
 
+            isRunningInForeground = true
             ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
 
             // Activate local wake-word listening in background if permission is available
             setupBackgroundVoicePipeline()
 
         } catch (e: Exception) {
+            isRunningInForeground = false
             ServiceStateRepository.updateForegroundStatus(
                 ServiceLifecycleState.FAILED,
                 "startForeground failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
@@ -242,12 +341,13 @@ class NayroForegroundService : Service() {
         setupBackgroundVoicePipeline()
 
         try {
+            val personaName = resolveAssistantName()
             val nm = getSystemService(NotificationManager::class.java)
             nm?.notify(
                 NOTIFICATION_ID,
                 createNotification(
-                    title = "NAYRO Agent Active",
-                    content = "Babu background agent resumed and listening locally.",
+                    title = "NAYRO Agent Active ($personaName)",
+                    content = "$personaName background agent resumed and listening locally.",
                     isPaused = false
                 )
             )
@@ -257,11 +357,18 @@ class NayroForegroundService : Service() {
     private fun setupBackgroundVoicePipeline() {
         try {
             val app = NayroApplication.instance
+            val personaName = resolveAssistantName()
+            app.agentRuntime.setAssistantIdentity(personaName)
+            app.voiceManager.updateAssistantIdentity(personaName)
             app.agentRuntime.recordHeartbeat()
             app.voiceManager.onVoiceExitCommand = {
                 app.agentRuntime.cancelCurrentTask()
             }
-            if (app.permissionManager.isMicrophoneGranted() && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+            if (!app.permissionManager.isMicrophoneGranted()) {
+                ServiceStateRepository.appendActivityLog("Background voice standby waiting for RECORD_AUDIO permission.")
+                return
+            }
+            if (!ServiceStateRepository.isBackgroundAgentPaused.value) {
                 val config = app.voiceManager.configuration.value.copy(isWakeWordEnabled = true)
                 app.voiceManager.updateConfiguration(config)
 
@@ -273,6 +380,7 @@ class NayroForegroundService : Service() {
                         }
                         serviceScope.launch {
                             app.agentRuntime.recordHeartbeat()
+                            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.PROCESSING)
                             ServiceStateRepository.appendActivityLog("Voice command received: \"$text\"")
                             app.repository.addConversationMessage(
                                 ConversationEntity(sender = "user", content = text)
@@ -281,6 +389,9 @@ class NayroForegroundService : Service() {
                             app.repository.addConversationMessage(
                                 ConversationEntity(sender = "babu", content = response)
                             )
+                            if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
+                            }
                             if (app.voiceManager.configuration.value.isTtsEnabled) {
                                 app.voiceManager.speak(response)
                             }
@@ -303,6 +414,13 @@ class NayroForegroundService : Service() {
     }
 
     override fun onDestroy() {
+        isRunningInForeground = false
+        if (isScreenReceiverRegistered) {
+            try {
+                unregisterReceiver(screenAndUnlockReceiver)
+            } catch (_: Exception) {}
+            isScreenReceiverRegistered = false
+        }
         super.onDestroy()
         pauseTimerJob?.cancel()
         stopWakeWordEngine()
@@ -310,8 +428,16 @@ class NayroForegroundService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
+        try {
+            super.onTaskRemoved(rootIntent)
+        } catch (_: Exception) {}
+        // Section 12 Fix: NayroForegroundService is a START_STICKY resident foreground service.
+        // Swiping the Activity from Recents must NOT mark the running foreground service as STOPPED!
+        if (isRunningInForeground || ServiceStateRepository.foregroundServiceStatus.value.state.isActiveOrRunning) {
+            ServiceStateRepository.appendActivityLog("UI task removed from Recents; resident foreground service remains RUNNING.")
+        } else if (ServiceStateRepository.foregroundServiceStatus.value.state != ServiceLifecycleState.PAUSED) {
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

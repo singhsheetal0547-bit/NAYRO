@@ -1,7 +1,9 @@
 package com.example.core.service
 
+import android.app.Activity
 import android.app.KeyguardManager
 import android.content.Context
+import android.os.Build
 import android.os.PowerManager
 import com.example.core.accessibility.AccessibilityConnectionManager
 import com.example.core.agent.ActionType
@@ -12,14 +14,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Section 3 — Distinct Android Operating States supported by NAYRO:
- * A. APPLICATION_OPEN
- * B. APPLICATION_IN_BACKGROUND
- * C. ANOTHER_APPLICATION_IN_FOREGROUND
- * D. SCREEN_OFF
- * E. DEVICE_LOCKED
- * F. DEVICE_RESTARTED
- * G. DEVICE_POWERED_OFF (documented state; restored into DEVICE_RESTARTED upon boot)
+ * Distinct Android Operating States supported by NAYRO (Section 3 & Phase 2 Lock-Aware Lifecycle):
+ * - APPLICATION_OPEN / SCREEN_ON_UNLOCKED
+ * - APPLICATION_IN_BACKGROUND / APP_BACKGROUND
+ * - ANOTHER_APPLICATION_IN_FOREGROUND
+ * - SCREEN_OFF
+ * - DEVICE_LOCKED
+ * - DEVICE_UNLOCKED
+ * - PROCESS_RECREATED
+ * - DEVICE_RESTARTED / DEVICE_REBOOTED
+ * - DEVICE_POWERED_OFF
  */
 enum class DeviceOperatingState(val code: String, val displayName: String) {
     APPLICATION_OPEN("A", "NAYRO Application Open"),
@@ -28,7 +32,12 @@ enum class DeviceOperatingState(val code: String, val displayName: String) {
     SCREEN_OFF("D", "Screen Off (Standby)"),
     DEVICE_LOCKED("E", "Device Locked (Keyguard Active)"),
     DEVICE_RESTARTED("F", "Device Restarted (Boot Recovery)"),
-    DEVICE_POWERED_OFF("G", "Device Powered Off (Inactive until Boot)")
+    DEVICE_POWERED_OFF("G", "Device Powered Off (Inactive until Boot)"),
+    SCREEN_ON_UNLOCKED("H", "Screen On & Unlocked"),
+    DEVICE_UNLOCKED("I", "Device Unlocked (User Present)"),
+    APP_BACKGROUND("J", "Application in Background"),
+    PROCESS_RECREATED("K", "Application Process Recreated"),
+    DEVICE_REBOOTED("L", "Device Rebooted")
 }
 
 sealed class LockScreenPolicyDecision {
@@ -37,14 +46,35 @@ sealed class LockScreenPolicyDecision {
 }
 
 /**
- * Manages real Android operating states (Screen Off, Keyguard Locked, App Foreground/Background, Boot Restart)
- * and enforces Lock-Screen execution security so NAYRO never bypasses Android lock-screen protection
- * or accesses protected user content while the device is locked.
+ * Manages real Android operating states (Screen Off, Keyguard Locked, Device Unlocked,
+ * App Foreground/Background, Process Recreated, Boot Restart) and enforces Lock-Screen
+ * execution security so NAYRO never bypasses Android lock-screen protection or collects
+ * user PIN/password/biometric credentials.
  */
 class DeviceOperatingStateManager(private val context: Context?) {
 
     private val _currentOperatingState = MutableStateFlow(DeviceOperatingState.APPLICATION_OPEN)
     val currentOperatingState: StateFlow<DeviceOperatingState> = _currentOperatingState.asStateFlow()
+    val operatingState: StateFlow<DeviceOperatingState> get() = currentOperatingState
+
+    fun refreshDeviceOperatingState(
+        isScreenInteractive: Boolean? = null,
+        isKeyguardLocked: Boolean? = null
+    ): DeviceOperatingState {
+        if (isScreenInteractive != null || isKeyguardLocked != null) {
+            screenInteractiveOverrideForTesting = isScreenInteractive
+            lockStateOverrideForTesting = isKeyguardLocked
+        }
+        val screenOn = isScreenInteractive()
+        val locked = isDeviceLocked()
+        val resolved = when {
+            !screenOn -> DeviceOperatingState.SCREEN_OFF
+            locked -> DeviceOperatingState.DEVICE_LOCKED
+            else -> DeviceOperatingState.SCREEN_ON_UNLOCKED
+        }
+        _currentOperatingState.value = resolved
+        return resolved
+    }
 
     @Volatile
     private var isAppInForeground: Boolean = true
@@ -82,6 +112,26 @@ class DeviceOperatingStateManager(private val context: Context?) {
         _currentOperatingState.value = DeviceOperatingState.DEVICE_RESTARTED
     }
 
+    fun onDeviceRebooted() {
+        _currentOperatingState.value = DeviceOperatingState.DEVICE_REBOOTED
+    }
+
+    fun onProcessRecreated() {
+        _currentOperatingState.value = DeviceOperatingState.PROCESS_RECREATED
+    }
+
+    fun onDeviceUnlocked() {
+        lockStateOverrideForTesting = false
+        screenInteractiveOverrideForTesting = true
+        _currentOperatingState.value = DeviceOperatingState.DEVICE_UNLOCKED
+    }
+
+    fun onScreenOnUnlocked() {
+        lockStateOverrideForTesting = false
+        screenInteractiveOverrideForTesting = true
+        _currentOperatingState.value = DeviceOperatingState.SCREEN_ON_UNLOCKED
+    }
+
     fun setTestingOverrides(isLocked: Boolean?, isScreenInteractive: Boolean?) {
         lockStateOverrideForTesting = isLocked
         screenInteractiveOverrideForTesting = isScreenInteractive
@@ -98,6 +148,45 @@ class DeviceOperatingStateManager(private val context: Context?) {
         lockStateOverrideForTesting?.let { return it }
         val km = context?.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
         return km?.isKeyguardLocked ?: false
+    }
+
+    /**
+     * Requests the standard Android system lock screen dismissal via [KeyguardManager.requestDismissKeyguard].
+     * NEVER collects, stores, or bypasses user PIN, password, pattern, or biometric credentials.
+     */
+    fun requestDismissKeyguardIfSupported(
+        activity: Activity?,
+        onDismissSucceeded: (() -> Unit)? = null,
+        onDismissCancelledOrError: (() -> Unit)? = null
+    ): Boolean {
+        if (activity == null) return false
+        val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager ?: return false
+        if (!km.isKeyguardLocked) {
+            onDeviceUnlocked()
+            onDismissSucceeded?.invoke()
+            return true
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            km.requestDismissKeyguard(
+                activity,
+                object : KeyguardManager.KeyguardDismissCallback() {
+                    override fun onDismissSucceeded() {
+                        onDeviceUnlocked()
+                        onDismissSucceeded?.invoke()
+                    }
+
+                    override fun onDismissCancelled() {
+                        onDismissCancelledOrError?.invoke()
+                    }
+
+                    override fun onDismissError() {
+                        onDismissCancelledOrError?.invoke()
+                    }
+                }
+            )
+            return true
+        }
+        return false
     }
 
     fun refreshOperatingState(): DeviceOperatingState {
@@ -143,3 +232,4 @@ class DeviceOperatingStateManager(private val context: Context?) {
         )
     }
 }
+

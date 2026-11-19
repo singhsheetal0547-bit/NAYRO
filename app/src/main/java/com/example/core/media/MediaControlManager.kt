@@ -33,6 +33,14 @@ enum class MediaOperation {
 }
 
 enum class MediaPlaybackVerificationState {
+    APP_OPENED,
+    SEARCH_OPENED,
+    COMMAND_DISPATCHED,
+    PLAYBACK_VERIFIED,
+    PAUSED_VERIFIED,
+    FAILED,
+    INCONCLUSIVE,
+    // Backwards-compatible aliases
     PLAYBACK_VERIFIED_ACTIVE,
     PLAYBACK_PAUSED_VERIFIED,
     MEDIA_KEY_DISPATCHED_INCONCLUSIVE,
@@ -45,17 +53,17 @@ data class MediaSessionState(
     var lastArtist: String? = null,
     var lastGenreOrMood: String? = null,
     var lastMediaAppPackage: String = "com.google.android.youtube",
-    var lastVerificationState: MediaPlaybackVerificationState = MediaPlaybackVerificationState.MEDIA_KEY_DISPATCHED_INCONCLUSIVE
+    var lastVerificationState: MediaPlaybackVerificationState = MediaPlaybackVerificationState.INCONCLUSIVE
 )
 
 /**
- * Phase 4 — Dedicated Media & Entertainment Intelligence Layer for NAYRO.
+ * Phase 4 & Section 11 — Dedicated Media & Entertainment Intelligence Layer for NAYRO.
  * Supports:
  * - Play music/videos on YouTube, YouTube Music, Spotify, or user's preferred music app
  * - Play specific song, play by artist, play by genre/mood, play user's favourite song from Memory
  * - Next track, previous track, pause, resume via Android AudioManager media key dispatch
- * - Playback status verification via AudioManager.isMusicActive and ScreenIntelligenceManager
- * - Contextual follow-up commands ("Mera favourite song chalao" -> "Next song" -> "Isse pause karo" -> "Ab sad songs chalao")
+ * - Strict playback status verification via AudioManager.isMusicActive, MediaSessionManager, and ScreenIntelligenceManager
+ * - Never claims verified playback merely because a search results page opened or a media key was dispatched!
  */
 class MediaControlManager(
     private val context: Context,
@@ -71,12 +79,27 @@ class MediaControlManager(
 
     private val sessionState = MediaSessionState()
 
+    /**
+     * Test hook for deterministic unit verification of active vs inactive media playback state.
+     */
+    var testOverridePlaybackActive: Boolean? = null
+
     fun getSessionState(): MediaSessionState = sessionState.copy()
 
     fun isAudioCurrentlyPlaying(): Boolean {
+        testOverridePlaybackActive?.let { return it }
         return try {
-            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
-            am.isMusicActive
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            if (am?.isMusicActive == true) return true
+            val msm = context.getSystemService(Context.MEDIA_SESSION_SERVICE) as? android.media.session.MediaSessionManager
+            val controllers = try {
+                msm?.getActiveSessions(null).orEmpty()
+            } catch (_: SecurityException) {
+                emptyList()
+            }
+            controllers.any { controller ->
+                controller.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING
+            }
         } catch (_: Exception) {
             false
         }
@@ -182,9 +205,11 @@ class MediaControlManager(
                 val active = isAudioCurrentlyPlaying()
                 val lastTrack = sessionState.lastPlayedQuery ?: "Unknown track"
                 val statusMsg = if (active) {
-                    "Media playback is currently ACTIVE (last requested: $lastTrack on ${sessionState.lastMediaAppPackage})."
+                    sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_VERIFIED
+                    "Media playback is currently ACTIVE (last requested: $lastTrack on ${sessionState.lastMediaAppPackage}) [STATE=PLAYBACK_VERIFIED]."
                 } else {
-                    "No active media playback detected by AudioManager (last requested: $lastTrack)."
+                    sessionState.lastVerificationState = MediaPlaybackVerificationState.PAUSED_VERIFIED
+                    "No active media playback detected by AudioManager (last requested: $lastTrack) [STATE=PAUSED_VERIFIED]."
                 }
                 ActionExecutionResult(
                     isSuccess = true,
@@ -292,7 +317,7 @@ class MediaControlManager(
             }
         }
 
-        // Also try Accessibility UI button fallback if connected and key event didn't toggle
+        // Also try Accessibility UI button fallback if connected
         if (NayroAccessibilityService.isConnected()) {
             when (keyCode) {
                 KeyEvent.KEYCODE_MEDIA_PAUSE -> AccessibilityActionController.performClick(targetText = "Pause")
@@ -306,33 +331,34 @@ class MediaControlManager(
         val musicActiveNow = isAudioCurrentlyPlaying()
         if (dispatched) {
             if (!expectMusicActiveAfter && !musicActiveNow) {
-                sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_PAUSED_VERIFIED
+                sessionState.lastVerificationState = MediaPlaybackVerificationState.PAUSED_VERIFIED
                 return ActionExecutionResult(
                     isSuccess = true,
-                    outputMessage = "$actionLabel executed and verified (audio stream is now paused/inactive).",
+                    outputMessage = "$actionLabel executed and verified (audio stream is now paused/inactive) [STATE=PAUSED_VERIFIED].",
                     status = VerificationStatus.VERIFIED
                 )
             }
             if (expectMusicActiveAfter && musicActiveNow) {
-                sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_VERIFIED_ACTIVE
+                sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_VERIFIED
                 return ActionExecutionResult(
                     isSuccess = true,
-                    outputMessage = "$actionLabel executed and verified (active audio playback confirmed).",
+                    outputMessage = "$actionLabel executed and verified (active audio playback confirmed) [STATE=PLAYBACK_VERIFIED].",
                     status = VerificationStatus.VERIFIED
                 )
             }
-            sessionState.lastVerificationState = MediaPlaybackVerificationState.MEDIA_KEY_DISPATCHED_INCONCLUSIVE
+            // Section 11: Dispatching a media key without verifying the expected playback state is COMMAND_DISPATCHED (INCONCLUSIVE), NOT VERIFIED!
+            sessionState.lastVerificationState = MediaPlaybackVerificationState.COMMAND_DISPATCHED
             return ActionExecutionResult(
-                isSuccess = true,
-                outputMessage = "$actionLabel media key dispatched to Android AudioManager (active playback state change unverified in current session).",
-                status = VerificationStatus.VERIFIED
+                isSuccess = false,
+                outputMessage = "$actionLabel media key dispatched to Android AudioManager, but active playback state change could not be verified [STATE=COMMAND_DISPATCHED].",
+                status = VerificationStatus.INCONCLUSIVE
             )
         }
 
-        sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_FAILED
+        sessionState.lastVerificationState = MediaPlaybackVerificationState.FAILED
         return ActionExecutionResult(
             isSuccess = false,
-            outputMessage = "Failed to dispatch media control command ($actionLabel): AudioManager unavailable.",
+            outputMessage = "Failed to dispatch media control command ($actionLabel): AudioManager unavailable [STATE=FAILED].",
             status = VerificationStatus.FAILED
         )
     }
@@ -343,6 +369,7 @@ class MediaControlManager(
         isFavouriteLookup: Boolean = false
     ): ActionExecutionResult {
         var intentDispatched = false
+        var directPlayIntentUsed = false
 
         // 1. Try MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH first for direct playback support
         try {
@@ -355,6 +382,7 @@ class MediaControlManager(
             if (playFromSearchIntent.resolveActivity(context.packageManager) != null) {
                 context.startActivity(playFromSearchIntent)
                 intentDispatched = true
+                directPlayIntentUsed = true
             }
         } catch (_: Exception) {}
 
@@ -388,38 +416,40 @@ class MediaControlManager(
         }
 
         // 3. If Accessibility Service is connected, attempt to tap the first video/song result to start playback
-        var clickedFirstTrack = false
         if (NayroAccessibilityService.isConnected()) {
             delay(350)
-            clickedFirstTrack = AccessibilityActionController.performClickWithCoordinateFallback(targetText = searchQuery) ||
+            AccessibilityActionController.performClickWithCoordinateFallback(targetText = searchQuery) ||
                 AccessibilityActionController.performClickWithCoordinateFallback(targetText = "Play")
+            delay(200)
         }
 
         val musicActive = isAudioCurrentlyPlaying()
         val favPrefix = if (isFavouriteLookup) "Favourite song resolved ('$searchQuery'). " else ""
 
         return when {
-            musicActive || clickedFirstTrack -> {
-                sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_VERIFIED_ACTIVE
+            musicActive -> {
+                sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_VERIFIED
                 ActionExecutionResult(
                     isSuccess = true,
-                    outputMessage = "${favPrefix}Playing '$searchQuery' on $targetPackage (playback active).",
+                    outputMessage = "${favPrefix}Playing '$searchQuery' on $targetPackage (playback active) [STATE=PLAYBACK_VERIFIED].",
                     status = VerificationStatus.VERIFIED
                 )
             }
             intentDispatched -> {
-                sessionState.lastVerificationState = MediaPlaybackVerificationState.APP_SEARCH_OPENED_INCONCLUSIVE
+                // Section 11: Opening a search page or media app without active audio playback is SEARCH_OPENED / APP_OPENED (INCONCLUSIVE), NEVER VERIFIED!
+                val state = if (directPlayIntentUsed) MediaPlaybackVerificationState.APP_OPENED else MediaPlaybackVerificationState.SEARCH_OPENED
+                sessionState.lastVerificationState = state
                 ActionExecutionResult(
-                    isSuccess = true,
-                    outputMessage = "${favPrefix}Opened '$searchQuery' in $targetPackage. Select a track or enable NAYRO Accessibility Service for automatic track selection.",
-                    status = VerificationStatus.VERIFIED
+                    isSuccess = false,
+                    outputMessage = "${favPrefix}Opened '$searchQuery' in $targetPackage, but playback is not yet verified active [STATE=${state.name}]. Select a track or enable NAYRO Accessibility Service for automatic track selection.",
+                    status = VerificationStatus.INCONCLUSIVE
                 )
             }
             else -> {
-                sessionState.lastVerificationState = MediaPlaybackVerificationState.PLAYBACK_FAILED
+                sessionState.lastVerificationState = MediaPlaybackVerificationState.FAILED
                 ActionExecutionResult(
                     isSuccess = false,
-                    outputMessage = "Could not launch media app ($targetPackage) for query '$searchQuery'.",
+                    outputMessage = "Could not launch media app ($targetPackage) for query '$searchQuery' [STATE=FAILED].",
                     status = VerificationStatus.FAILED
                 )
             }

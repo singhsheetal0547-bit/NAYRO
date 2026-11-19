@@ -821,6 +821,7 @@ class NayroFloatingService : Service() {
                             is AgentState.ExecutingAction -> "State: ${state.toolName.toUserFriendlyIntentLabel()}..."
                             is AgentState.WaitingForConfirmation -> "State: Waiting for Confirmation"
                             is AgentState.WaitingForPermission -> "State: Waiting for Permission (${state.permission})"
+                            is AgentState.WaitingForDeviceUnlock -> "State: Waiting for Device Unlock"
                             is AgentState.Speaking -> "State: Speaking Response"
                             is AgentState.Completed -> "State: Completed"
                             is AgentState.Cancelled -> "State: Cancelled (${state.reason.take(30)})"

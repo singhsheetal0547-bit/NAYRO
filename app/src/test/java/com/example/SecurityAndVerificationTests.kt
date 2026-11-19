@@ -1669,10 +1669,31 @@ class SecurityAndVerificationTests {
         val engine = LocalWakeWordEngine(null)
         assertTrue(engine.loadAcousticModel(allowEmbeddedFallbackInTests = true))
 
-        // Record/enroll 3 samples via UI helper
-        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu").first)
-        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu").first)
-        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu").first)
+        // Section 7: Calling recordOrEnrollPhraseFromUi with no microphone / no recorded PCM must NEVER succeed
+        val missingMicResult = engine.recordOrEnrollPhraseFromUi("Hi Babu")
+        assertFalse("Missing microphone audio must fail enrollment", missingMicResult.first)
+
+        // Section 7: Synthetic audio flag must be rejected
+        val validRecordedPcm = ShortArray(1600) { i ->
+            val f1 = kotlin.math.sin(2.0 * Math.PI * 235.0 * i / 16000.0)
+            val f2 = 0.55 * kotlin.math.sin(2.0 * Math.PI * 505.0 * i / 16000.0)
+            ((f1 + f2) * 2600.0).toInt().coerceIn(-32767, 32767).toShort()
+        }
+        val syntheticRejected = engine.recordOrEnrollPhraseFromUi("Hi Babu", recordedPcmOverride = validRecordedPcm, isSynthetic = true)
+        assertFalse("Synthetic audio must fail enrollment", syntheticRejected.first)
+
+        // Section 7: Short audio sample (< 800 samples) must be rejected
+        val shortSampleRejected = engine.recordOrEnrollPhraseFromUi("Hi Babu", recordedPcmOverride = ShortArray(400) { 2000 })
+        assertFalse("Short audio sample must fail enrollment", shortSampleRejected.first)
+
+        // Section 7: Silent audio sample must be rejected
+        val silentSampleRejected = engine.recordOrEnrollPhraseFromUi("Hi Babu", recordedPcmOverride = ShortArray(1600) { 0 })
+        assertFalse("Silent audio sample must fail enrollment", silentSampleRejected.first)
+
+        // Record/enroll 3 genuine recorded PCM samples
+        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu", recordedPcmOverride = validRecordedPcm).first)
+        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu", recordedPcmOverride = validRecordedPcm).first)
+        assertTrue(engine.recordOrEnrollPhraseFromUi("Hi Babu", recordedPcmOverride = validRecordedPcm).first)
         assertEquals(3, engine.getEnrolledSampleCount("Hi Babu"))
 
         // Validate enrollment quality
@@ -2805,6 +2826,948 @@ class SecurityAndVerificationTests {
         assertEquals(3, com.example.data.local.NayroDatabase.MIGRATION_2_3.endVersion)
     }
 
+    @Test
+    fun testSpeechRecognitionProviderLifecycleAndVoiceToTextPipeline() {
+        val voiceManager = VoiceManager(null)
+        val provider = voiceManager.speechRecognitionProvider
+
+        // 1. Verify RMS dB normalization bounds (-2..10 dB -> 0f..1f)
+        assertEquals(0f, provider.normalizeRmsDb(-5f), 0.001f)
+        assertEquals(0.5f, provider.normalizeRmsDb(4f), 0.001f)
+        assertEquals(1f, provider.normalizeRmsDb(14f), 0.001f)
+
+        // 2. Verify SpeechRecognizer error code mapping
+        assertEquals(
+            "Microphone permission missing.",
+            provider.mapSpeechRecognizerError(android.speech.SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS)
+        )
+        assertEquals(
+            "No speech detected.",
+            provider.mapSpeechRecognizerError(android.speech.SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+        )
+
+        // 3. Simulate partial + final voice-to-text lifecycle and dispatch to AgentBrain
+        val capturedPartials = mutableListOf<String>()
+        var capturedFinalCommand: String? = null
+        voiceManager.attachUiListener(onRecognized = { capturedFinalCommand = it })
+
+        val result = provider.simulateSpeechRecognitionLifecycleForTest(
+            partialHypotheses = listOf("YouTube", "YouTube kholo aur", "YouTube kholo aur Arijit Singh"),
+            finalTranscript = "YouTube kholo aur Arijit Singh ke songs chalao",
+            alternatives = listOf("YouTube open karo aur Arijit Singh songs play karo"),
+            confidence = 0.96f,
+            simulatedRmsDb = 7.0f,
+            languageTag = "hi-IN",
+            onPartial = { capturedPartials.add(it) },
+            onFinal = { finalRes -> voiceManager.dispatchRecognizedSpeech(finalRes.primaryText) }
+        )
+
+        assertEquals(3, capturedPartials.size)
+        assertEquals("YouTube kholo aur Arijit Singh ke songs chalao", result.primaryText)
+        assertEquals(0.96f, result.confidenceScore, 0.001f)
+        assertEquals("hi-IN", result.languageTag)
+        assertEquals("YouTube kholo aur Arijit Singh ke songs chalao", capturedFinalCommand)
+        assertEquals("YouTube kholo aur Arijit Singh ke songs chalao", voiceManager.partialTranscript.value)
+
+        // 4. Verify transcribed natural language command routes directly into AgentBrain task planning
+        val brain = createHeadlessBrain()
+        val task = brain.planTaskForInstruction(capturedFinalCommand!!)
+        assertEquals(com.example.core.agent.UserIntentType.MEDIA_CONTROL.name, task.resolvedIntent)
+        assertEquals(ActionType.CONTROL_MEDIA, task.actions.first().actionType)
+        assertEquals("PLAY_BY_ARTIST", task.actions.first().parameters["operation"])
+    }
+
+    @Test
+    fun testCustomAssistantIdentityAndHonestWakePhraseSupport() {
+        val voiceManager = VoiceManager(null)
+        val wakeEngine = voiceManager.wakeWordEngine
+
+        // 1. Default persona ("Babu") uses bundled acoustic templates
+        assertEquals(
+            com.example.core.voice.engine.WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE,
+            wakeEngine.getWakePhraseSupportStatus("Hi Babu")
+        )
+        assertEquals(
+            com.example.core.voice.engine.WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE,
+            wakeEngine.getWakePhraseSupportStatus("Hi Nayro")
+        )
+        assertTrue(wakeEngine.isWakePhraseAcousticallyActive("Hi Babu"))
+
+        // 2. Switch assistant identity to custom name "Jarvis"
+        voiceManager.updateAssistantIdentity("Jarvis")
+        assertEquals("Jarvis", voiceManager.configuration.value.assistantName)
+        assertEquals("Jarvis", wakeEngine.getConfiguredAssistantName())
+        assertTrue(voiceManager.configuration.value.wakePhrases.contains("Hi Jarvis"))
+        assertTrue(voiceManager.configuration.value.wakePhrases.contains("Hey Jarvis"))
+
+        // 3. Honest capability reporting: "Hi Jarvis" requires voice enrollment before claiming acoustic DTW readiness
+        assertEquals(
+            com.example.core.voice.engine.WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT,
+            wakeEngine.getWakePhraseSupportStatus("Hi Jarvis")
+        )
+        assertFalse(wakeEngine.isWakePhraseAcousticallyActive("Hi Jarvis"))
+
+        // 4. Enroll "Hi Jarvis" with a genuine recorded PCM sample (missing mic fails first, then real audio succeeds)
+        assertFalse(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis").first)
+        val recordedJarvisPcm = ShortArray(1600) { i ->
+            val f1 = kotlin.math.sin(2.0 * Math.PI * 240.0 * i / 16000.0)
+            val f2 = 0.55 * kotlin.math.sin(2.0 * Math.PI * 515.0 * i / 16000.0)
+            ((f1 + f2) * 2600.0).toInt().coerceIn(-32767, 32767).toShort()
+        }
+        assertTrue(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis", recordedPcmOverride = recordedJarvisPcm).first)
+        assertEquals(
+            com.example.core.voice.engine.WakePhraseSupportStatus.READY_USER_ENROLLED_DTW,
+            wakeEngine.getWakePhraseSupportStatus("Hi Jarvis")
+        )
+        assertTrue(wakeEngine.isWakePhraseAcousticallyActive("Hi Jarvis"))
+
+        // 5. Verify dynamic voice exit commands work with custom assistant name ("Jarvis")
+        assertTrue(wakeEngine.isVoiceExitCommand("Stop Jarvis"))
+        assertTrue(wakeEngine.isVoiceExitCommand("Cancel Jarvis"))
+        assertTrue(wakeEngine.isVoiceExitCommand("Bye Jarvis"))
+
+        // 6. Verify switching to another custom name ("Friday") updates wake phrases and exit commands dynamically
+        voiceManager.updateAssistantIdentity("Friday")
+        assertEquals("Friday", voiceManager.configuration.value.assistantName)
+        assertTrue(wakeEngine.isVoiceExitCommand("Stop Friday"))
+    }
+
+    @Test
+    fun testTargetedPermissionDecisionCallbackWithoutGlobalRefreshAndProcessDeathSafety() = kotlinx.coroutines.runBlocking {
+        val runtime = createHeadlessRuntime()
+        runtime.setAssistantIdentity("Jarvis")
+        assertEquals("Jarvis", runtime.assistantName)
+
+        // 1. Create a task blocked waiting for CALL_PHONE permission
+        val callTask = com.example.core.agent.AgentTask(
+            taskId = "perm-task-101",
+            userInstruction = "Call Rahul",
+            resolvedIntent = com.example.core.agent.UserIntentType.PHONE_CALL.name,
+            actions = listOf(
+                com.example.core.agent.AgentAction(
+                    actionId = "step-call-1",
+                    actionType = ActionType.MAKE_PHONE_CALL,
+                    target = "Rahul",
+                    requiredPermission = android.Manifest.permission.CALL_PHONE,
+                    riskLevel = com.example.core.agent.RiskLevel.R3_EXTERNAL_COMMUNICATION,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            ),
+            state = com.example.core.agent.TaskState.WAITING_FOR_PERMISSION
+        )
+        runtime.recordPermissionBlockedTask(callTask, android.Manifest.permission.CALL_PHONE)
+
+        // 2. Grant permission via onPermissionDecision and verify automatic resume without global refresh
+        val grantSummary = runtime.onPermissionDecision(
+            permission = android.Manifest.permission.CALL_PHONE,
+            granted = true
+        ) { resumedTask ->
+            com.example.core.agent.AgentExecutionSummary(
+                task = resumedTask.apply { state = com.example.core.agent.TaskState.COMPLETED },
+                isSuccess = true,
+                message = "Resumed and placed call to Rahul.",
+                verificationStatus = VerificationStatus.VERIFIED
+            )
+        }
+        assertNotNull(grantSummary)
+        assertTrue(grantSummary!!.isSuccess)
+        assertEquals(com.example.core.agent.TaskState.COMPLETED, grantSummary.task.state)
+        assertEquals(1, runtime.permissionDecisionInvocationCount)
+        assertFalse(runtime.globalRefreshCalledDuringPermissionDecision)
+
+        // 3. Test permission denial transitions cleanly to BLOCKED_BY_ANDROID
+        val deniedTask = callTask.copy(
+            taskId = "perm-task-102",
+            state = com.example.core.agent.TaskState.WAITING_FOR_PERMISSION
+        )
+        runtime.recordPermissionBlockedTask(deniedTask, android.Manifest.permission.CALL_PHONE)
+        val denySummary = runtime.onPermissionDecision(
+            permission = android.Manifest.permission.CALL_PHONE,
+            granted = false
+        )
+        assertNotNull(denySummary)
+        assertFalse(denySummary!!.isSuccess)
+        assertEquals(com.example.core.agent.TaskState.BLOCKED_BY_ANDROID, denySummary.task.state)
+        assertEquals(VerificationStatus.REQUIRES_PERMISSION, denySummary.verificationStatus)
+
+        // 4. Test persisted permission decision survives process recreation when callback fires before task restoration
+        runtime.onPermissionDecision(
+            permission = android.Manifest.permission.SEND_SMS,
+            granted = true
+        )
+        val recoveredTask = callTask.copy(
+            taskId = "perm-task-103",
+            state = com.example.core.agent.TaskState.WAITING_FOR_PERMISSION
+        )
+        runtime.recordPermissionBlockedTask(recoveredTask, android.Manifest.permission.SEND_SMS)
+        val consumedSummary = runtime.consumePersistedPermissionDecision { taskAfterProcessRecreate ->
+            com.example.core.agent.AgentExecutionSummary(
+                task = taskAfterProcessRecreate.apply { state = com.example.core.agent.TaskState.COMPLETED },
+                isSuccess = true,
+                message = "Recovered after process death and resumed task.",
+                verificationStatus = VerificationStatus.VERIFIED
+            )
+        }
+        assertNotNull(consumedSummary)
+        assertTrue(consumedSummary!!.isSuccess)
+        assertEquals(com.example.core.agent.TaskState.COMPLETED, consumedSummary.task.state)
+    }
+
+    @Test
+    fun testLockAwareExecutionCheckpointPauseAndAutomaticResumeOnDeviceUnlock() = kotlinx.coroutines.runBlocking {
+        val runtime = createHeadlessRuntime()
+        val stateMgr = runtime.operatingStateManager
+
+        // 1. Verify operating state transitions (SCREEN_ON_UNLOCKED, SCREEN_OFF, DEVICE_LOCKED, DEVICE_UNLOCKED)
+        stateMgr.refreshDeviceOperatingState(isScreenInteractive = true, isKeyguardLocked = false)
+        assertEquals(com.example.core.service.DeviceOperatingState.SCREEN_ON_UNLOCKED, stateMgr.operatingState.value)
+
+        stateMgr.refreshDeviceOperatingState(isScreenInteractive = false, isKeyguardLocked = true)
+        assertEquals(com.example.core.service.DeviceOperatingState.SCREEN_OFF, stateMgr.operatingState.value)
+
+        stateMgr.refreshDeviceOperatingState(isScreenInteractive = true, isKeyguardLocked = true)
+        assertEquals(com.example.core.service.DeviceOperatingState.DEVICE_LOCKED, stateMgr.operatingState.value)
+
+        // 2. While DEVICE_LOCKED, lock-safe background actions are allowed, but UI-dependent actions require unlock
+        val lockSafeAction = com.example.core.agent.AgentAction(
+            actionId = "step-1-battery-state",
+            actionType = ActionType.GET_BATTERY_STATE,
+            riskLevel = com.example.core.agent.RiskLevel.R0_LOCAL_READONLY
+        )
+        val uiDependentAction = com.example.core.agent.AgentAction(
+            actionId = "step-2-whatsapp-send",
+            actionType = ActionType.MESSAGE_DRAFT_SEND,
+            target = "Rahul",
+            parameters = mapOf("recipient" to "Rahul", "message" to "Reaching in 10 mins"),
+            riskLevel = com.example.core.agent.RiskLevel.R3_EXTERNAL_COMMUNICATION,
+            idempotencyClassification = "NON_IDEMPOTENT"
+        )
+        assertTrue(stateMgr.evaluateLockScreenPolicy(lockSafeAction) is com.example.core.service.LockScreenPolicyDecision.AllowedWhileLocked)
+        val unlockDecision = stateMgr.evaluateLockScreenPolicy(uiDependentAction)
+        assertTrue(unlockDecision is com.example.core.service.LockScreenPolicyDecision.RequireDeviceUnlock)
+
+        // 3. Simulate multi-step task pausing at step index 1 in WAITING_FOR_DEVICE_UNLOCK
+        val multiStepTask = com.example.core.agent.AgentTask(
+            taskId = "lock-task-201",
+            userInstruction = "Read notifications and message Rahul on WhatsApp",
+            resolvedIntent = "MULTI_STEP_COMPOUND_TASK",
+            actions = listOf(lockSafeAction, uiDependentAction),
+            state = com.example.core.agent.TaskState.WAITING_FOR_DEVICE_UNLOCK,
+            currentActionIndex = 1
+        )
+        runtime.markSideEffectExecuted(multiStepTask.taskId, lockSafeAction.actionId)
+        runtime.recordUnlockBlockedTask(multiStepTask, (unlockDecision as com.example.core.service.LockScreenPolicyDecision.RequireDeviceUnlock).reason)
+
+        // 4. Trigger onDeviceUnlocked() and verify state transitions to DEVICE_UNLOCKED and task resumes from step index 1
+        var resumedFromStepIndex = -1
+        val unlockResumeSummary = runtime.onDeviceUnlocked { resumedTask ->
+            resumedFromStepIndex = resumedTask.currentActionIndex
+            com.example.core.agent.AgentExecutionSummary(
+                task = resumedTask.apply { state = com.example.core.agent.TaskState.COMPLETED },
+                isSuccess = true,
+                message = "Device unlocked; completed step ${resumedTask.currentActionIndex + 1}.",
+                verificationStatus = VerificationStatus.VERIFIED
+            )
+        }
+        assertEquals(com.example.core.service.DeviceOperatingState.DEVICE_UNLOCKED, stateMgr.operatingState.value)
+        assertNotNull(unlockResumeSummary)
+        assertTrue(unlockResumeSummary!!.isSuccess)
+        assertEquals(1, resumedFromStepIndex)
+        assertEquals(com.example.core.agent.TaskState.COMPLETED, unlockResumeSummary.task.state)
+    }
+
+    @Test
+    fun testDurableTaskCheckpointSerializationAndUncertainExternalActionGuard() {
+        val runtime = createHeadlessRuntime()
+
+        val step1 = com.example.core.agent.AgentAction(
+            actionId = "act-101",
+            actionType = ActionType.LAUNCH_APP,
+            target = "WhatsApp",
+            parameters = mapOf("appName" to "WhatsApp"),
+            riskLevel = com.example.core.agent.RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+            idempotencyClassification = "IDEMPOTENT"
+        )
+        val step2 = com.example.core.agent.AgentAction(
+            actionId = "act-102",
+            actionType = ActionType.MESSAGE_DRAFT_SEND,
+            target = "Rahul",
+            parameters = mapOf("recipient" to "Rahul", "message" to "Hello from Nayro"),
+            riskLevel = com.example.core.agent.RiskLevel.R3_EXTERNAL_COMMUNICATION,
+            idempotencyClassification = "NON_IDEMPOTENT"
+        )
+        val originalTask = com.example.core.agent.AgentTask(
+            taskId = "durable-task-301",
+            userInstruction = "Open WhatsApp and send Hello from Nayro to Rahul",
+            resolvedIntent = com.example.core.agent.UserIntentType.MESSAGE_DRAFT.name,
+            actions = listOf(step1, step2),
+            state = com.example.core.agent.TaskState.WAITING_FOR_DEVICE_UNLOCK,
+            currentActionIndex = 1
+        )
+
+        // 1. Export checkpoint JSON and restore into a fresh runtime instance
+        val checkpointJson = runtime.exportTaskCheckpointJson(originalTask, completedStepIds = listOf("act-101"))
+        assertTrue(checkpointJson.contains("taskId=durable-task-301"))
+        assertTrue(checkpointJson.contains("currentActionIndex=1"))
+
+        val freshRuntime = createHeadlessRuntime()
+        val restoredTask = freshRuntime.restoreTaskFromCheckpointJson(checkpointJson)
+        assertNotNull(restoredTask)
+        assertEquals("durable-task-301", restoredTask!!.taskId)
+        assertEquals(1, restoredTask.currentActionIndex)
+        assertEquals(2, restoredTask.actions.size)
+        assertEquals(ActionType.MESSAGE_DRAFT_SEND, restoredTask.actions[1].actionType)
+        assertEquals("Rahul", restoredTask.actions[1].parameters["recipient"])
+        assertTrue(freshRuntime.hasSideEffectAlreadyExecuted("durable-task-301", "act-101"))
+
+        // 2. Verify Uncertain External Action Guard prevents automatic duplicate send without confirmation
+        assertFalse(freshRuntime.hasUncertainExternalAction("durable-task-301", "act-102"))
+        freshRuntime.markExternalActionUncertain("durable-task-301", "act-102")
+        assertTrue(freshRuntime.hasUncertainExternalAction("durable-task-301", "act-102"))
+
+        // 3. Verify WhatsAppMessageLifecycleState includes all required Phase 8 & Section 9 states
+        val lifecycleStates = com.example.core.communication.WhatsAppMessageLifecycleState.values().map { it.name }.toSet()
+        assertTrue(
+            lifecycleStates.containsAll(
+                listOf(
+                    "CONTACT_RESOLVED",
+                    "CHAT_OPENED",
+                    "MESSAGE_DRAFTED",
+                    "COMPOSED",
+                    "SEND_REQUESTED",
+                    "SENT",
+                    "DELIVERED",
+                    "READ",
+                    "FAILED",
+                    "UNKNOWN"
+                )
+            )
+        )
+    }
+
+    @Test
+    fun testSections3To21FinalAcceptanceCriteriaSuite() = runBlocking {
+        // 1. Section 3: Verify MainActivity.kt does NOT call refreshAllPermissions, refreshReport, or evaluateAll inside onResume()
+        val mainActivityFile = java.io.File("src/main/java/com/example/MainActivity.kt").takeIf { it.exists() }
+            ?: java.io.File("app/src/main/java/com/example/MainActivity.kt")
+        assertTrue("MainActivity.kt must exist", mainActivityFile.exists())
+        val mainActivitySource = mainActivityFile.readText()
+        val onResumeBlock = mainActivitySource.substringAfter("override fun onResume()").substringBefore("override fun onDestroy()")
+        assertFalse(
+            "onResume() must NOT call permissionManager.refreshAllPermissions",
+            onResumeBlock.contains("permissionManager.refreshAllPermissions(")
+        )
+        assertFalse(
+            "onResume() must NOT call permissionSetupManager.refreshReport",
+            onResumeBlock.contains("permissionSetupManager.refreshReport(")
+        )
+        assertFalse(
+            "onResume() must NOT call capabilityManager.evaluateAll",
+            onResumeBlock.contains("capabilityManager.evaluateAll(")
+        )
+
+        // 2. Section 6 & 7: Verify Hi Nairo / Hey Nairo wake phrase support and TaskClassifier stripping
+        val wakeEngine = LocalWakeWordEngine(null)
+        wakeEngine.loadAcousticModel(allowEmbeddedFallbackInTests = true)
+        assertTrue(wakeEngine.isWakePhraseAcousticallyActive("Hi Nairo"))
+        assertTrue(wakeEngine.isWakePhraseAcousticallyActive("Hey Nairo"))
+        assertTrue(wakeEngine.isWakePhraseAcousticallyActive("Hi Babu"))
+        assertTrue(wakeEngine.isWakePhraseAcousticallyActive("Hey Babu"))
+        val classifiedNairo = com.example.core.agent.TaskClassifier.classify("Hi Nairo, turn on the flashlight")
+        assertEquals(com.example.core.agent.UserIntentType.FLASHLIGHT_CONTROL, classifiedNairo.type)
+
+        // 3. Section 9: Verify WhatsApp Call contact resolution, call type ambiguity, and call state reporting
+        val callMgr = com.example.core.telephony.CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(
+                    com.example.core.telephony.ResolvedContactItem("Prakash Kumar", "+919876543219")
+                )
+            }
+        )
+        val waMgr = com.example.core.communication.WhatsAppAutomationManager(
+            context = null,
+            callIntelligenceManager = callMgr,
+            screenIntelligenceManager = null
+        ).apply {
+            testOverrideInstalled = true
+        }
+        val ambiguousCallTypeRes = waMgr.initiateWhatsAppCall(
+            rawRecipient = "Prakash",
+            isVideoCall = false,
+            isConfirmed = true,
+            isAmbiguousCallType = true
+        )
+        assertFalse(ambiguousCallTypeRes.isSuccess)
+        assertEquals(VerificationStatus.REQUIRES_CONFIRMATION, ambiguousCallTypeRes.status)
+        assertEquals(
+            com.example.core.communication.WhatsAppCallLifecycleState.CALL_TYPE_AMBIGUOUS,
+            waMgr.lastCallLifecycleState
+        )
+
+        waMgr.testOverrideCallState = com.example.core.communication.WhatsAppCallLifecycleState.RINGING
+        val ringingCallRes = waMgr.initiateWhatsAppCall(
+            rawRecipient = "Prakash",
+            isVideoCall = false,
+            isConfirmed = true,
+            isAmbiguousCallType = false
+        )
+        assertTrue(ringingCallRes.isSuccess)
+        assertEquals(VerificationStatus.VERIFIED, ringingCallRes.status)
+        assertTrue(ringingCallRes.outputMessage.contains("Prakash Kumar"))
+        assertTrue(ringingCallRes.outputMessage.contains("CALL_STATE=RINGING"))
+
+        // 4. Section 11: Verify MediaControlManager and ActionVerifier never claim verified playback for SEARCH_OPENED or COMMAND_DISPATCHED
+        val mediaStates = com.example.core.media.MediaPlaybackVerificationState.values().map { it.name }.toSet()
+        assertTrue(
+            mediaStates.containsAll(
+                listOf(
+                    "APP_OPENED",
+                    "SEARCH_OPENED",
+                    "COMMAND_DISPATCHED",
+                    "PLAYBACK_VERIFIED",
+                    "PAUSED_VERIFIED",
+                    "FAILED",
+                    "INCONCLUSIVE"
+                )
+            )
+        )
+        val verifier = ActionVerifier(
+            UnsafeTestHelper.allocateWithoutInit(com.example.core.screen.ScreenIntelligenceManager::class.java)
+        )
+        val mediaAction = AgentAction(
+            actionType = ActionType.CONTROL_MEDIA,
+            target = "YouTube",
+            parameters = mapOf("operation" to "PLAY_QUERY", "query" to "Arijit Singh")
+        )
+        val searchOpenedExec = ActionExecutionResult(
+            isSuccess = false,
+            outputMessage = "Opened 'Arijit Singh' in com.google.android.youtube, but playback is not yet verified active [STATE=SEARCH_OPENED].",
+            status = VerificationStatus.INCONCLUSIVE
+        )
+        val searchVerified = verifier.verifyAction(mediaAction, searchOpenedExec, preStateSummary = null)
+        assertEquals(VerificationStatus.INCONCLUSIVE, searchVerified.status)
+
+        val playbackActiveExec = ActionExecutionResult(
+            isSuccess = true,
+            outputMessage = "Playing 'Arijit Singh' on com.google.android.youtube (playback active) [STATE=PLAYBACK_VERIFIED].",
+            status = VerificationStatus.VERIFIED
+        )
+        val activeVerified = verifier.verifyAction(mediaAction, playbackActiveExec, preStateSummary = null)
+        assertEquals(VerificationStatus.VERIFIED, activeVerified.status)
+
+        // 5. Section 12: Verify ServiceLifecycleState includes all required states and onTaskRemoved preserves RUNNING state
+        val fgsStates = com.example.core.service.ServiceLifecycleState.values().map { it.name }.toSet()
+        assertTrue(
+            fgsStates.containsAll(
+                listOf(
+                    "STARTING",
+                    "ACTIVE",
+                    "LISTENING",
+                    "PROCESSING",
+                    "PAUSED",
+                    "LOCKED",
+                    "WAITING_FOR_PERMISSION",
+                    "RECOVERING",
+                    "STOPPING",
+                    "STOPPED",
+                    "ERROR"
+                )
+            )
+        )
+        com.example.core.service.ServiceStateRepository.updateForegroundStatus(com.example.core.service.ServiceLifecycleState.RUNNING)
+        val serviceInstance = com.example.core.service.NayroForegroundService()
+        serviceInstance.onTaskRemoved(null)
+        assertEquals(
+            "onTaskRemoved must NOT mark a running foreground service as STOPPED",
+            com.example.core.service.ServiceLifecycleState.RUNNING,
+            com.example.core.service.ServiceStateRepository.foregroundServiceStatus.value.state
+        )
+
+        // 6. Section 13: Verify English, Hindi, and Hinglish natural time expressions
+        val autoEngine = AutomationEngine()
+        val refNow = 1_760_000_000_000L
+        assertEquals(refNow + 30L * 60_000L, autoEngine.parseReminderTimeMillis("30 minute baad", refNow))
+        assertEquals(refNow + 10L * 60_000L, autoEngine.parseReminderTimeMillis("in 10 minutes", refNow))
+        assertEquals(refNow + 3_600_000L, autoEngine.parseReminderTimeMillis("after one hour", refNow))
+        assertEquals(refNow + 3_600_000L, autoEngine.parseReminderTimeMillis("1 ghante baad", refNow))
+        assertTrue(autoEngine.parseReminderTimeMillis("aaj raat 9 baje", refNow) > refNow)
+        assertTrue(autoEngine.parseReminderTimeMillis("kal subah 6 baje", refNow) > refNow)
+        assertTrue(autoEngine.parseReminderTimeMillis("agle hafte", refNow) >= refNow + 6L * 24L * 3_600_000L)
+        assertTrue(autoEngine.parseReminderTimeMillis("har somwar subah 8 baje", refNow) > refNow)
+    }
+
+    // =========================================================================================
+    // PHASE 2 COMPREHENSIVE VALIDATION SUITE (Categories A–H, Sections 3–18)
+    // =========================================================================================
+
+    @Test
+    fun phase2CategoryA_NaturalLanguageIntelligence_Pronouns_Corrections_MultiTurn_Ordinals() {
+        val continuity = com.example.core.memory.ConversationContinuityManager()
+        val brain = createHeadlessBrain()
+
+        // 1. Multi-turn conversation with pronoun resolution & natural language correction (Section 3):
+        // Turn 1: "Hi Nairo, WhatsApp par Prakash ko message bhejo."
+        val turn1Intent = TaskClassifier.classify("Hi Nairo, WhatsApp par Prakash ko message bhejo.")
+        assertEquals(UserIntentType.MESSAGE_DRAFT, turn1Intent.type)
+        assertEquals("Prakash", turn1Intent.recipient)
+        assertEquals("", turn1Intent.searchQueryOrContent)
+        continuity.recordEntityContext(
+            contact = "Prakash",
+            candidateContacts = listOf("Prakash Sharma", "Prakash Verma")
+        )
+
+        // Turn 2: "Usko bol do main 10 minute mein aa raha hoon."
+        val turn2Resolved = continuity.resolveReferencesInPrompt("Usko bol do main 10 minute mein aa raha hoon.")
+        assertEquals("Send WhatsApp message to Prakash: main 10 minute mein aa raha hoon", turn2Resolved)
+
+        // Turn 3: Natural language correction: "Nahi, message mein 10 minute ki jagah 20 minute likho."
+        val turn3Corrected = continuity.resolveReferencesInPrompt("Nahi, message mein 10 minute ki jagah 20 minute likho.")
+        assertEquals("Send WhatsApp message to Prakash: main 20 minute mein aa raha hoon", turn3Corrected)
+        assertEquals("main 20 minute mein aa raha hoon", continuity.getSessionContext().lastDraftedOrSentMessage)
+
+        // Turn 4: Inspect previous message: "Jo message maine abhi bheja tha, woh mujhe dikhao."
+        val turn4Inspect = continuity.resolveReferencesInPrompt("Jo message maine abhi bheja tha, woh mujhe dikhao.")
+        assertEquals("Read WhatsApp conversation with Prakash", turn4Inspect)
+        val turn4Intent = TaskClassifier.classify(turn4Inspect)
+        assertEquals(UserIntentType.WHATSAPP_READ, turn4Intent.type)
+        assertEquals("Prakash", turn4Intent.searchQueryOrContent)
+
+        // Turn 5: Follow-up call: "Ab usko call bhi kar do."
+        val turn5Call = continuity.resolveReferencesInPrompt("Ab usko call bhi kar do.")
+        assertEquals("Call Prakash", turn5Call)
+        val turn5Intent = TaskClassifier.classify(turn5Call)
+        assertEquals(UserIntentType.PHONE_CALL, turn5Intent.type)
+        assertEquals("Prakash", turn5Intent.recipient)
+
+        // 2. Ordinal candidate contact references ("Pehle wala", "Dusra wala")
+        val firstResolved = continuity.resolveReferencesInPrompt("Call pehle wala")
+        assertEquals("Call Prakash Sharma", firstResolved)
+        val secondResolved = continuity.resolveReferencesInPrompt("Call dusra wala")
+        assertEquals("Call Prakash Verma", secondResolved)
+
+        // 3. Alarm scheduling: "Kal subah 6 baje alarm laga do."
+        val alarmTask = brain.planTaskForInstruction("Kal subah 6 baje alarm laga do.")
+        assertEquals(ActionType.SCHEDULE_ALARM, alarmTask.actions.first().actionType)
+        assertEquals("6", alarmTask.actions.first().parameters["hour"])
+
+        // 4. Brightness control: "Phone ki brightness thodi kam kar do."
+        val brightnessTask = brain.planTaskForInstruction("Phone ki brightness thodi kam kar do.")
+        assertEquals(ActionType.OPEN_SETTINGS_SECTION, brightnessTask.actions.first().actionType)
+        assertEquals("display", brightnessTask.actions.first().target)
+        assertEquals("brightness_down", brightnessTask.actions.first().parameters["adjustment"])
+
+        // 5. Ordinal screen option selection: "Is screen par teesra option open karo." & "Is screen par teesra option select karo."
+        val openThirdTask = brain.planTaskForInstruction("Is screen par teesra option open karo.")
+        assertEquals(ActionType.CLICK_ELEMENT, openThirdTask.actions.first().actionType)
+        assertEquals("ordinal:3", openThirdTask.actions.first().target)
+        assertEquals("3", openThirdTask.actions.first().parameters["ordinalIndex"])
+
+        val selectThirdTask = brain.planTaskForInstruction("Is screen par teesra option select karo.")
+        assertEquals(ActionType.CLICK_ELEMENT, selectThirdTask.actions.first().actionType)
+        assertEquals("ordinal:3", selectThirdTask.actions.first().target)
+
+        // 6. Form filling: "Search box mein NAYRO likho"
+        val formFillTask = brain.planTaskForInstruction("Search box mein NAYRO likho")
+        assertEquals(ActionType.SET_TEXT, formFillTask.actions.first().actionType)
+        assertEquals("Search", formFillTask.actions.first().target)
+        assertEquals("NAYRO", formFillTask.actions.first().parameters["text"])
+
+        // 7. Multi-step WhatsApp send + read status verification (Section 8):
+        // "Prakash ko WhatsApp par message bhejo aur phir mujhe batao ki message read hua ya nahi."
+        val multiStepWaTask = brain.planTaskForInstruction(
+            "Prakash ko WhatsApp par message bhejo aur phir mujhe batao ki message read hua ya nahi."
+        )
+        assertTrue(multiStepWaTask.actions.any { it.actionType == ActionType.LAUNCH_APP && it.target == "com.whatsapp" })
+        assertTrue(
+            multiStepWaTask.actions.any {
+                it.actionType == ActionType.WHATSAPP_READ_CONVERSATION &&
+                    it.parameters["checkReadReceipt"] == "true"
+            }
+        )
+    }
+
+    @Test
+    fun phase2CategoryB_D_Communication_WhatsAppLifecycle_ContactNormalization_ScreenIntelligence() {
+        // 1. Verify all Phase 2 Section 5B WhatsAppMessageLifecycleState values exist
+        val waMsgStates = com.example.core.communication.WhatsAppMessageLifecycleState.values().map { it.name }.toSet()
+        assertTrue(
+            waMsgStates.containsAll(
+                listOf(
+                    "CONTACT_RESOLVED",
+                    "CHAT_OPENED",
+                    "CHAT_VERIFIED",
+                    "MESSAGE_DRAFTED",
+                    "WAITING_FOR_CONFIRMATION",
+                    "SEND_REQUESTED",
+                    "MESSAGE_BUBBLE_VERIFIED",
+                    "SENT",
+                    "DELIVERED",
+                    "READ",
+                    "FAILED",
+                    "UNKNOWN",
+                    "INCONCLUSIVE"
+                )
+            )
+        )
+
+        // 2. Verify phone number normalization and duplicate contact deduplication (Section 5A)
+        assertEquals(
+            "+919876543210",
+            com.example.core.telephony.CallIntelligenceManager.normalizePhoneNumber("098765 43210")
+        )
+        assertEquals(
+            "+919876543210",
+            com.example.core.telephony.CallIntelligenceManager.normalizePhoneNumber("+91-98765-43210")
+        )
+        val rawContacts = listOf(
+            com.example.core.telephony.ResolvedContactItem("Prakash", "098765 43210"),
+            com.example.core.telephony.ResolvedContactItem("Prakash", "+91-98765-43210"),
+            com.example.core.telephony.ResolvedContactItem("Rahul", "+919811122233")
+        )
+        val deduped = com.example.core.telephony.CallIntelligenceManager.deduplicateContacts(rawContacts)
+        assertEquals(2, deduped.size)
+
+        // 3. Verify ordinal screen element resolution, editable field discovery, scrollable container detection, and FLAG_SECURE/auth detection (Section 6)
+        val snapshot = com.example.core.screen.ScreenSnapshot(
+            packageName = "com.example.settings",
+            visibleTexts = listOf("Settings", "Wi-Fi", "Bluetooth", "Display & Brightness"),
+            interactiveElements = listOf(
+                com.example.core.screen.ScreenNodeInfo(
+                    text = "Wi-Fi",
+                    contentDescription = null,
+                    className = "android.widget.TextView",
+                    viewId = "id_opt_1",
+                    isClickable = true,
+                    isEditable = false,
+                    isScrollable = false,
+                    boundsLeft = 0,
+                    boundsTop = 100,
+                    boundsRight = 400,
+                    boundsBottom = 180
+                ),
+                com.example.core.screen.ScreenNodeInfo(
+                    text = "Bluetooth",
+                    contentDescription = null,
+                    className = "android.widget.TextView",
+                    viewId = "id_opt_2",
+                    isClickable = true,
+                    isEditable = false,
+                    isScrollable = false,
+                    boundsLeft = 0,
+                    boundsTop = 200,
+                    boundsRight = 400,
+                    boundsBottom = 280
+                ),
+                com.example.core.screen.ScreenNodeInfo(
+                    text = "Display & Brightness",
+                    contentDescription = null,
+                    className = "android.widget.TextView",
+                    viewId = "id_opt_3",
+                    isClickable = true,
+                    isEditable = false,
+                    isScrollable = false,
+                    boundsLeft = 0,
+                    boundsTop = 300,
+                    boundsRight = 400,
+                    boundsBottom = 380
+                ),
+                com.example.core.screen.ScreenNodeInfo(
+                    text = "",
+                    contentDescription = "Search settings",
+                    className = "android.widget.EditText",
+                    viewId = "search_src_text",
+                    isClickable = true,
+                    isEditable = true,
+                    isScrollable = false,
+                    boundsLeft = 20,
+                    boundsTop = 20,
+                    boundsRight = 380,
+                    boundsBottom = 80
+                ),
+                com.example.core.screen.ScreenNodeInfo(
+                    text = null,
+                    contentDescription = null,
+                    className = "androidx.recyclerview.widget.RecyclerView",
+                    viewId = "list_container",
+                    isClickable = false,
+                    isEditable = false,
+                    isScrollable = true,
+                    boundsLeft = 0,
+                    boundsTop = 100,
+                    boundsRight = 400,
+                    boundsBottom = 800
+                )
+            ),
+            totalNodeCount = 9
+        )
+
+        val thirdMatch = com.example.core.screen.ScreenIntelligenceManager.locateTargetInSnapshot("ordinal:3", snapshot)
+        assertNotNull(thirdMatch)
+        assertEquals("Display & Brightness", thirdMatch?.label)
+        assertEquals("ORDINAL_INDEX_3", thirdMatch?.strategy)
+
+        val hindiThirdMatch = com.example.core.screen.ScreenIntelligenceManager.locateTargetInSnapshot("teesra option", snapshot)
+        assertEquals("Display & Brightness", hindiThirdMatch?.label)
+
+        val editableFields = com.example.core.screen.ScreenIntelligenceManager.findEditableFields(snapshot)
+        assertEquals(1, editableFields.size)
+        assertTrue(com.example.core.screen.ScreenIntelligenceManager.hasScrollableContainer(snapshot))
+        assertFalse(com.example.core.screen.ScreenIntelligenceManager.isSecureOrAuthenticationScreen(snapshot))
+
+        val dialogExplanation = com.example.core.screen.ScreenIntelligenceManager.explainDialogOrScreen(snapshot)
+        assertTrue(dialogExplanation.contains("Display & Brightness"))
+
+        // Verify empty FLAG_SECURE / auth screen detection
+        val secureSnapshot = com.example.core.screen.ScreenSnapshot(
+            packageName = "com.bank.secure",
+            visibleTexts = emptyList(),
+            interactiveElements = emptyList(),
+            totalNodeCount = 0
+        )
+        assertTrue(com.example.core.screen.ScreenIntelligenceManager.isSecureOrAuthenticationScreen(secureSnapshot))
+    }
+
+    @Test
+    fun phase2CategoryE_F_G_H_MemoryTiers_SchedulingTimezone_VoiceBargeIn_DiagnosticsAndErrorRecovery() = kotlinx.coroutines.runBlocking {
+        // 1. Section 7: Memory tiers, ranking, expiration, correction, duplicate detection, and direct-instruction priority
+        val tiers = com.example.core.memory.MemoryTier.values().map { it.name }.toSet()
+        assertTrue(tiers.containsAll(listOf("SHORT_TERM", "LONG_TERM_USER_APPROVED", "TASK_MEMORY")))
+
+        val dummyRepo = UnsafeTestHelper.allocateWithoutInit(com.example.data.repository.NayroRepository::class.java)
+        val memMgr = com.example.core.memory.MemoryManager(dummyRepo)
+        val cachedField = com.example.core.memory.MemoryManager::class.java.getDeclaredField("cachedMemories")
+        cachedField.isAccessible = true
+        cachedField.set(memMgr, java.util.Collections.synchronizedList(mutableListOf<com.example.data.local.entities.MemoryEntity>()))
+
+        val nowMs = 1_760_000_000_000L
+        val expiredShortTerm = com.example.data.local.entities.MemoryEntity(
+            category = com.example.core.memory.MemoryCategory.SHORT_TERM_MEMORY.name,
+            keyName = "temp_topic",
+            memoryValue = "Old short term note",
+            userConfirmed = false,
+            createdAt = nowMs - 7_200_000L // 2 hours ago (> 1h TTL)
+        )
+        val permanentPref = com.example.data.local.entities.MemoryEntity(
+            category = com.example.core.memory.MemoryCategory.USER_PREFERENCE.name,
+            keyName = "preferred_language",
+            memoryValue = "Hinglish",
+            userConfirmed = true,
+            createdAt = nowMs - 86_400_000L
+        )
+        val validMemories = memMgr.filterNonExpiredMemories(listOf(expiredShortTerm, permanentPref), nowMs = nowMs)
+        assertEquals(1, validMemories.size)
+        assertEquals("preferred_language", validMemories.first().keyName)
+
+        assertTrue(memMgr.isDuplicateMemory("preferred_language", "Hinglish", validMemories))
+        assertFalse(memMgr.isDuplicateMemory("preferred_language", "Hindi", validMemories))
+
+        val corrected = memMgr.correctMemoryValue("preferred_language", "Hindi and English")
+        assertNotNull(corrected)
+        assertEquals("Hindi and English", corrected?.memoryValue)
+
+        // Direct instruction must ALWAYS override stored memory
+        assertEquals(
+            "Formal English",
+            memMgr.resolveWithDirectInstructionPriority(
+                directUserValue = "Formal English",
+                storedMemoryValue = "Hinglish"
+            )
+        )
+
+        // 2. Section 9: Duplicate schedule prevention, timezone rescheduling, and missed schedule recovery
+        val autoEngine = AutomationEngine()
+        val r1 = autoEngine.createRule(
+            name = "Daily Standup Reminder",
+            triggerType = com.example.core.automation.AutomationTriggerType.TIME_SCHEDULE,
+            triggerConditionValue = "09:30",
+            actionInstruction = "Create note: Standup at 9:30"
+        )
+        val rDup = autoEngine.createRule(
+            name = "Daily Standup Reminder",
+            triggerType = com.example.core.automation.AutomationTriggerType.TIME_SCHEDULE,
+            triggerConditionValue = "09:30",
+            actionInstruction = "Create note: Standup at 9:30"
+        )
+        assertEquals("Duplicate rule creation must return existing rule", r1.ruleId, rDup.ruleId)
+        assertTrue(
+            autoEngine.isDuplicateSchedule(
+                "Daily Standup Reminder",
+                com.example.core.automation.AutomationTriggerType.TIME_SCHEDULE,
+                "09:30",
+                "Create note: Standup at 9:30"
+            )
+        )
+
+        val rescheduledCount = autoEngine.onTimezoneOrClockChanged(null)
+        assertTrue(rescheduledCount >= 1)
+
+        val calAt945 = java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 9)
+            set(java.util.Calendar.MINUTE, 45)
+            set(java.util.Calendar.SECOND, 0)
+        }
+        val missed = autoEngine.recoverMissedSchedules(nowMs = calAt945.timeInMillis, missedWindowMinutes = 60)
+        assertTrue(missed.any { it.ruleId == r1.ruleId })
+
+        // 3. Section 4: Voice transcript normalization, deduplication, and language selection
+        val voiceMgr = com.example.core.voice.VoiceManager(null)
+        assertEquals("Hi Babu call Prakash", voiceMgr.normalizeTranscript("  Hi   Babu   call  Prakash "))
+        voiceMgr.resetVoiceCommandDeduplication()
+        assertFalse(voiceMgr.isDuplicateVoiceCommand("Call Prakash", nowMs = 10_000L))
+        assertTrue(voiceMgr.isDuplicateVoiceCommand("call prakash", nowMs = 10_500L))
+        assertFalse(voiceMgr.isDuplicateVoiceCommand("call prakash", nowMs = 15_000L))
+        voiceMgr.setRecognitionLanguage("hi-IN")
+        assertEquals("hi-IN", voiceMgr.configuration.value.languageTag)
+
+        // 4. Section 14 & Section 16: Structured error categories, safe retry policy, and NAYRO AGENT STATUS diagnostics
+        val runtime = createHeadlessRuntime()
+        assertEquals(
+            com.example.core.agent.AgentErrorCategory.PERMISSION_PERMANENTLY_DENIED,
+            runtime.classifyErrorCategory("CALL_PHONE permission permanently denied by user.")
+        )
+        assertEquals(
+            com.example.core.agent.AgentErrorCategory.ACCESSIBILITY_SERVICE_DISABLED,
+            runtime.classifyErrorCategory("Accessibility service is disabled.")
+        )
+        assertEquals(
+            com.example.core.agent.AgentErrorCategory.DEVICE_LOCKED,
+            runtime.classifyErrorCategory("Device is locked; unlock required.")
+        )
+        assertEquals(
+            com.example.core.agent.AgentErrorCategory.GEMINI_QUOTA_EXCEEDED,
+            runtime.classifyErrorCategory("HTTP 429 quota exceeded.")
+        )
+
+        val idempotentReadAction = AgentAction(
+            actionType = ActionType.READ_SCREEN,
+            idempotencyClassification = "IDEMPOTENT"
+        )
+        val nonIdempotentSendAction = AgentAction(
+            actionType = ActionType.SEND_SMS,
+            idempotencyClassification = "NON_IDEMPOTENT"
+        )
+        assertTrue(
+            runtime.isSafeToRetryAutomatically(
+                idempotentReadAction,
+                com.example.core.agent.AgentErrorCategory.SCREEN_ELEMENT_NOT_FOUND
+            )
+        )
+        assertFalse(
+            "Non-idempotent external communication actions must NEVER be automatically retried",
+            runtime.isSafeToRetryAutomatically(
+                nonIdempotentSendAction,
+                com.example.core.agent.AgentErrorCategory.NETWORK_UNAVAILABLE
+            )
+        )
+
+        val diag = runtime.getAgentDiagnosticsReport()
+        val statusBlock = diag.formatAsNayroStatusBlock()
+        assertTrue(statusBlock.contains("NAYRO AGENT STATUS"))
+        assertTrue(statusBlock.contains("Agent: ACTIVE"))
+        assertTrue(statusBlock.contains("Wake Word: LISTENING_FOR_WAKE"))
+    }
+
+    @Test
+    fun testActionExecutionStatesLoopGuardMapsAndDualSim() = runBlocking {
+        // 1. Section 10: ActionExecutionState coverage
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.SUCCESS,
+            VerificationStatus.VERIFIED.toActionExecutionState()
+        )
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.FAILED,
+            VerificationStatus.FAILED.toActionExecutionState()
+        )
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.WAITING_FOR_PERMISSION,
+            VerificationStatus.REQUIRES_PERMISSION.toActionExecutionState()
+        )
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.WAITING_FOR_UNLOCK,
+            VerificationStatus.WAITING_FOR_UNLOCK.toActionExecutionState()
+        )
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.WAITING_FOR_CONFIRMATION,
+            VerificationStatus.REQUIRES_CONFIRMATION.toActionExecutionState()
+        )
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.INCONCLUSIVE,
+            VerificationStatus.INCONCLUSIVE.toActionExecutionState()
+        )
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.IN_PROGRESS,
+            TaskState.EXECUTING.toActionExecutionState()
+        )
+        assertEquals(
+            com.example.core.agent.ActionExecutionState.WAITING_FOR_UNLOCK,
+            TaskState.WAITING_FOR_DEVICE_UNLOCK.toActionExecutionState()
+        )
+
+        // 2. Section 1: Infinite loop prevention for repeated identical tool calls
+        val brain = createHeadlessBrain()
+        val repeatedAct = AgentAction(
+            taskId = "t-loop",
+            actionType = ActionType.READ_SCREEN,
+            target = "main"
+        )
+        assertTrue(
+            brain.hasRepeatedToolCallLoop(
+                history = listOf(repeatedAct, repeatedAct),
+                candidate = repeatedAct,
+                maxConsecutiveRepeats = 2
+            )
+        )
+        val loopTask = AgentTask(
+            taskId = "t-loop",
+            userInstruction = "Loop test",
+            resolvedIntent = "LOOP_TEST",
+            actions = listOf(repeatedAct, repeatedAct, repeatedAct)
+        )
+        val outcome = brain.executeTaskIterative(loopTask) { _, _ ->
+            ActionExecutionResult(true, "Screen read ok", VerificationStatus.VERIFIED) to VerificationStatus.VERIFIED
+        }
+        assertFalse(outcome.isFullyVerified)
+        assertEquals(VerificationStatus.PARTIALLY_COMPLETED, outcome.overallStatus)
+        assertEquals(3, outcome.stepsExecuted.size)
+        assertEquals(VerificationStatus.FAILED, outcome.stepsExecuted.last().verificationStatus)
+
+        // 3. Section 4: Google Maps & navigation planning
+        val mapsTask = brain.planTaskForInstruction("Google Maps par Connaught Place ka rasta dikhao")
+        assertEquals(ActionType.LAUNCH_APP, mapsTask.actions.first().actionType)
+        assertEquals("Google Maps", mapsTask.actions.first().target)
+        assertEquals("Connaught Place", mapsTask.actions.first().parameters["navigationDestination"])
+
+        // 4. Section 6: Dual-SIM outgoing call support
+        val callMgr = CallIntelligenceManager(
+            context = null,
+            contactDirectoryProvider = {
+                listOf(com.example.core.telephony.ResolvedContactItem("Rahul Sharma", "+919876543210"))
+            }
+        )
+        callMgr.testOverrideCallPhonePermission = true
+        callMgr.testOverrideSimReady = true
+        callMgr.testOverrideCallInitiated = true
+        callMgr.resetDuplicateCallGuard()
+        val simCallRes = callMgr.initiateOutgoingCall(
+            rawTarget = "Rahul Sharma",
+            isConfirmed = true,
+            observeCallState = true,
+            preferredSimSlot = 2
+        )
+        assertTrue(simCallRes.isSuccess)
+        assertTrue(simCallRes.outputMessage.contains("[SIM_SLOT=2]"))
+
+        // 5. ForegroundService background task queueing & AccessibilityService safe tree read when disconnected
+        com.example.core.service.NayroForegroundService.enqueueBackgroundTask(
+            context = null,
+            userInstruction = "Babu, battery check karo"
+        )
+        val recentLogs = com.example.core.service.ServiceStateRepository.backgroundActivityLog.value
+        assertTrue(recentLogs.any { it.contains("Background task queued: \"Babu, battery check karo\"") })
+        assertFalse(com.example.core.accessibility.NayroAccessibilityService.isConnected())
+    }
+
     private fun createHeadlessBrain(): AgentBrain {
         val dummyExecutor = UnsafeTestHelper.allocateWithoutInit(ActionExecutor::class.java)
         val dummyProvider = UnsafeTestHelper.allocateWithoutInit(com.example.core.provider.AIProviderManager::class.java)
@@ -2829,6 +3792,24 @@ class SecurityAndVerificationTests {
             instance,
             kotlinx.coroutines.flow.MutableStateFlow<com.example.core.agent.AgentState>(com.example.core.agent.AgentState.Idle)
         )
+        val currentTaskField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("_currentTask")
+        currentTaskField.isAccessible = true
+        currentTaskField.set(
+            instance,
+            kotlinx.coroutines.flow.MutableStateFlow<com.example.core.agent.AgentTask?>(null)
+        )
+        val sideEffectsField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("completedSideEffectSignatures")
+        sideEffectsField.isAccessible = true
+        sideEffectsField.set(instance, java.util.Collections.synchronizedSet(mutableSetOf<String>()))
+        val uncertainField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("uncertainExternalActionSignatures")
+        uncertainField.isAccessible = true
+        uncertainField.set(instance, java.util.Collections.synchronizedSet(mutableSetOf<String>()))
+        val assistantNameField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("assistantName")
+        assistantNameField.isAccessible = true
+        assistantNameField.set(instance, "Babu")
+        val opStateField = com.example.core.agent.AgentRuntime::class.java.getDeclaredField("operatingStateManager")
+        opStateField.isAccessible = true
+        opStateField.set(instance, com.example.core.service.DeviceOperatingStateManager(null))
         return instance
     }
 }
@@ -2844,4 +3825,5 @@ private object UnsafeTestHelper {
         return allocateInstance.invoke(unsafe, clazz) as T
     }
 }
+
 

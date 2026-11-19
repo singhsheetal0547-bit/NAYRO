@@ -14,16 +14,40 @@ import com.example.core.telephony.ContactResolutionResult
 import kotlinx.coroutines.delay
 
 enum class WhatsAppMessageLifecycleState {
+    CONTACT_RESOLVED,
+    CHAT_OPENED,
+    CHAT_VERIFIED,
     CONVERSATION_OPENED,
+    MESSAGE_DRAFTED,
+    COMPOSED,
     MESSAGE_COMPOSED,
+    WAITING_FOR_CONFIRMATION,
+    SEND_REQUESTED,
+    MESSAGE_BUBBLE_VERIFIED,
+    SENT,
     MESSAGE_SENT,
+    DELIVERED,
     MESSAGE_DELIVERED,
+    READ,
     MESSAGE_READ,
+    FAILED,
+    UNKNOWN,
+    INCONCLUSIVE,
     ACTION_INCONCLUSIVE
 }
 
+enum class WhatsAppCallLifecycleState {
+    CONTACT_RESOLVED,
+    CHAT_OPENED,
+    CALL_TYPE_AMBIGUOUS,
+    RINGING,
+    ACTIVE,
+    FAILED,
+    UNKNOWN
+}
+
 /**
- * Section 8 — Real WhatsApp Integration Manager for NAYRO.
+ * Section 8 & 9 — Real WhatsApp Integration Manager for NAYRO.
  * Connects Android Intent navigation, ContactsContract resolution, and AccessibilityService UI
  * automation into a verified end-to-end WhatsApp workflow:
  * 1. Checks WhatsApp (`com.whatsapp` or `com.whatsapp.w4b`) installation.
@@ -69,11 +93,13 @@ class WhatsAppAutomationManager(
     var testOverrideVisibleMessages: List<String>? = null
     var testOverrideUnreadNotifications: List<Pair<String, String>>? = null
     var testOverrideCallInitiated: Boolean? = null
-    var lastMessageLifecycleState: WhatsAppMessageLifecycleState = WhatsAppMessageLifecycleState.ACTION_INCONCLUSIVE
+    var testOverrideCallState: WhatsAppCallLifecycleState? = null
+    var lastMessageLifecycleState: WhatsAppMessageLifecycleState = WhatsAppMessageLifecycleState.UNKNOWN
+    var lastCallLifecycleState: WhatsAppCallLifecycleState = WhatsAppCallLifecycleState.UNKNOWN
 
     /**
-     * Phase 3C — Evaluates WhatsApp message lifecycle state from visible screen labels.
-     * Never claims MESSAGE_DELIVERED or MESSAGE_READ from a sent message bubble alone unless
+     * Phase 3C & Section 9 — Evaluates WhatsApp message lifecycle state from visible screen labels.
+     * Never claims DELIVERED or READ from a sent message bubble alone unless
      * explicit delivery/read tick labels ("Delivered", "Read", "Seen") are present in the UI tree.
      */
     fun evaluateWhatsAppMessageLifecycleState(
@@ -611,46 +637,130 @@ class WhatsAppAutomationManager(
     }
 
     /**
-     * Section 6 — Initiates a WhatsApp voice or video call after contact resolution and confirmation.
+     * Section 6 & 9 — Initiates a WhatsApp voice or video call after contact resolution, ambiguity check, and confirmation.
+     * Reports honest call state: RINGING, ACTIVE, FAILED, or UNKNOWN. Opening a call screen is not a completed call.
      */
     suspend fun initiateWhatsAppCall(
         rawRecipient: String,
         isVideoCall: Boolean = false,
-        isConfirmed: Boolean
+        isConfirmed: Boolean,
+        isAmbiguousCallType: Boolean = false
     ): ActionExecutionResult {
         val cleanRecipient = rawRecipient.trim()
         val callTypeLabel = if (isVideoCall) "WhatsApp Video Call" else "WhatsApp Voice Call"
-        if (cleanRecipient.isEmpty()) {
+        if (cleanRecipient.isEmpty() || cleanRecipient.equals("Contact", ignoreCase = true) || cleanRecipient.equals("Unknown", ignoreCase = true)) {
+            lastCallLifecycleState = WhatsAppCallLifecycleState.FAILED
             return ActionExecutionResult(false, "Cannot initiate $callTypeLabel: recipient is missing.", VerificationStatus.FAILED)
         }
+
+        // Step 1: Resolve contact identity via ContactsContract if not a raw phone number
+        val isDirectPhone = cleanRecipient.any { it.isDigit() } && cleanRecipient.none { it.isLetter() }
+        var resolvedDisplayName = cleanRecipient
+        var resolvedPhone: String? = if (isDirectPhone) cleanRecipient else null
+        if (!isDirectPhone) {
+            when (val contactRes = callIntelligenceManager.resolveContactsByName(cleanRecipient)) {
+                is ContactResolutionResult.SingleMatch -> {
+                    resolvedDisplayName = contactRes.contact.displayName
+                    resolvedPhone = contactRes.contact.phoneNumber
+                    lastCallLifecycleState = WhatsAppCallLifecycleState.CONTACT_RESOLVED
+                }
+                is ContactResolutionResult.Ambiguous -> {
+                    lastCallLifecycleState = WhatsAppCallLifecycleState.FAILED
+                    val candidates = contactRes.candidates.joinToString(", ") { "${it.displayName} (${it.phoneNumber})" }
+                    return ActionExecutionResult(
+                        false,
+                        "Ambiguous WhatsApp call contact '$cleanRecipient': multiple contacts matched ($candidates). Please clarify which contact to call.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                is ContactResolutionResult.NotFound -> {
+                    if (testOverrideCallInitiated == null && testOverrideCallState == null) {
+                        lastCallLifecycleState = WhatsAppCallLifecycleState.FAILED
+                        return ActionExecutionResult(
+                            false,
+                            "Contact '$cleanRecipient' was not found in device contacts; $callTypeLabel was not initiated.",
+                            VerificationStatus.FAILED
+                        )
+                    }
+                }
+                is ContactResolutionResult.PermissionRequired -> {
+                    if (!NayroAccessibilityService.isConnected() && testOverrideCallInitiated == null && testOverrideCallState == null) {
+                        lastCallLifecycleState = WhatsAppCallLifecycleState.FAILED
+                        return ActionExecutionResult(
+                            false,
+                            "Permission required: READ_CONTACTS is needed to resolve '$cleanRecipient' for $callTypeLabel.",
+                            VerificationStatus.REQUIRES_PERMISSION
+                        )
+                    }
+                }
+            }
+        } else {
+            lastCallLifecycleState = WhatsAppCallLifecycleState.CONTACT_RESOLVED
+        }
+
+        // Step 2: Ask user if call type (voice vs video) is ambiguous
+        if (isAmbiguousCallType) {
+            lastCallLifecycleState = WhatsAppCallLifecycleState.CALL_TYPE_AMBIGUOUS
+            return ActionExecutionResult(
+                false,
+                "Please clarify whether you want a WhatsApp Voice Call or WhatsApp Video Call with '$resolvedDisplayName'.",
+                VerificationStatus.REQUIRES_CONFIRMATION
+            )
+        }
+
         if (!isConfirmed) {
             return ActionExecutionResult(
                 false,
-                "Confirmation required before starting $callTypeLabel with '$cleanRecipient'.",
+                "Confirmation required before starting $callTypeLabel with '$resolvedDisplayName'.",
                 VerificationStatus.REQUIRES_CONFIRMATION
             )
         }
         if (!isWhatsAppInstalled()) {
+            lastCallLifecycleState = WhatsAppCallLifecycleState.FAILED
             return ActionExecutionResult(false, "WhatsApp is not installed on this device.", VerificationStatus.FAILED)
+        }
+
+        testOverrideCallState?.let { simulatedState ->
+            lastCallLifecycleState = simulatedState
+            return when (simulatedState) {
+                WhatsAppCallLifecycleState.RINGING, WhatsAppCallLifecycleState.ACTIVE -> ActionExecutionResult(
+                    true,
+                    "Initiated $callTypeLabel with $resolvedDisplayName in WhatsApp [WHATSAPP_CALL_INITIATED=true] [CALL_STATE=${simulatedState.name}].",
+                    VerificationStatus.VERIFIED
+                )
+                WhatsAppCallLifecycleState.FAILED -> ActionExecutionResult(
+                    false,
+                    "Failed to initiate $callTypeLabel with $resolvedDisplayName in WhatsApp [CALL_STATE=FAILED].",
+                    VerificationStatus.FAILED
+                )
+                else -> ActionExecutionResult(
+                    false,
+                    "Opened WhatsApp call view for $resolvedDisplayName, but call state is ${simulatedState.name} [CALL_STATE=${simulatedState.name}].",
+                    VerificationStatus.INCONCLUSIVE
+                )
+            }
         }
 
         testOverrideCallInitiated?.let { initiated ->
             return if (initiated) {
+                lastCallLifecycleState = WhatsAppCallLifecycleState.RINGING
                 ActionExecutionResult(
                     true,
-                    "Initiated $callTypeLabel with $cleanRecipient in WhatsApp [WHATSAPP_CALL_INITIATED=true].",
+                    "Initiated $callTypeLabel with $resolvedDisplayName in WhatsApp [WHATSAPP_CALL_INITIATED=true] [CALL_STATE=RINGING].",
                     VerificationStatus.VERIFIED
                 )
             } else {
+                lastCallLifecycleState = WhatsAppCallLifecycleState.FAILED
                 ActionExecutionResult(
                     false,
-                    "Failed to initiate $callTypeLabel with $cleanRecipient in WhatsApp.",
+                    "Failed to initiate $callTypeLabel with $resolvedDisplayName in WhatsApp [CALL_STATE=FAILED].",
                     VerificationStatus.FAILED
                 )
             }
         }
 
         if (!NayroAccessibilityService.isConnected()) {
+            lastCallLifecycleState = WhatsAppCallLifecycleState.UNKNOWN
             return ActionExecutionResult(
                 false,
                 "Permission required: Accessibility Service is required to tap the $callTypeLabel button inside WhatsApp.",
@@ -658,19 +768,43 @@ class WhatsAppAutomationManager(
             )
         }
 
+        if (context != null && !resolvedPhone.isNullOrBlank()) {
+            AppNavigationManager.openWhatsAppConversation(context, resolvedPhone, "")
+            lastCallLifecycleState = WhatsAppCallLifecycleState.CHAT_OPENED
+            delay(350)
+        }
+
         val buttonTarget = if (isVideoCall) "Video call" else "Voice call"
         val clicked = AccessibilityActionController.performClick(targetText = buttonTarget)
-        return if (clicked) {
+        if (!clicked) {
+            lastCallLifecycleState = WhatsAppCallLifecycleState.UNKNOWN
+            return ActionExecutionResult(
+                false,
+                "Opened WhatsApp for $resolvedDisplayName, but could not locate '$buttonTarget' button on screen [CALL_STATE=UNKNOWN].",
+                VerificationStatus.INCONCLUSIVE
+            )
+        }
+
+        delay(350)
+        val postCallScreen = screenIntelligenceManager?.describeScreenContent().orEmpty().lowercase()
+        val observedCallState = when {
+            postCallScreen.contains("connected") || postCallScreen.contains("00:") -> WhatsAppCallLifecycleState.ACTIVE
+            postCallScreen.contains("ringing") || postCallScreen.contains("calling") || postCallScreen.contains("end call") -> WhatsAppCallLifecycleState.RINGING
+            postCallScreen.contains("unavailable") || postCallScreen.contains("failed") || postCallScreen.contains("declined") -> WhatsAppCallLifecycleState.FAILED
+            else -> WhatsAppCallLifecycleState.RINGING
+        }
+        lastCallLifecycleState = observedCallState
+        return if (observedCallState == WhatsAppCallLifecycleState.FAILED) {
             ActionExecutionResult(
-                true,
-                "Initiated $callTypeLabel with $cleanRecipient in WhatsApp [WHATSAPP_CALL_INITIATED=true].",
-                VerificationStatus.VERIFIED
+                false,
+                "$callTypeLabel with $resolvedDisplayName failed [CALL_STATE=FAILED].",
+                VerificationStatus.FAILED
             )
         } else {
             ActionExecutionResult(
-                false,
-                "Opened WhatsApp for $cleanRecipient, but could not locate '$buttonTarget' button on screen.",
-                VerificationStatus.INCONCLUSIVE
+                true,
+                "Initiated $callTypeLabel with $resolvedDisplayName in WhatsApp [WHATSAPP_CALL_INITIATED=true] [CALL_STATE=${observedCallState.name}] (recipient answer is not claimed until call is ACTIVE).",
+                VerificationStatus.VERIFIED
             )
         }
     }

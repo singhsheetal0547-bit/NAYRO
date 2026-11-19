@@ -70,6 +70,17 @@ class ActionVerifier(
                     )
                 )
             }
+            VerificationStatus.WAITING_FOR_UNLOCK -> {
+                return VerificationResult(
+                    status = VerificationStatus.WAITING_FOR_UNLOCK,
+                    details = executionResult.outputMessage,
+                    evidence = VerificationEvidence(
+                        preState = preStateSummary,
+                        postState = null,
+                        observedChange = "Waiting for device unlock: ${executionResult.outputMessage}"
+                    )
+                )
+            }
             VerificationStatus.TIMED_OUT -> {
                 return VerificationResult(
                     status = VerificationStatus.TIMED_OUT,
@@ -284,6 +295,46 @@ class ActionVerifier(
                 }
             }
 
+            ActionType.CONTROL_MEDIA -> {
+                val msg = executionResult.outputMessage
+                val isUnverifiedMedia = msg.contains("SEARCH_OPENED") ||
+                    msg.contains("APP_OPENED") ||
+                    msg.contains("COMMAND_DISPATCHED") ||
+                    msg.contains("not yet verified active", ignoreCase = true) ||
+                    msg.contains("unverified", ignoreCase = true)
+                if (isUnverifiedMedia) {
+                    VerificationResult(
+                        status = VerificationStatus.INCONCLUSIVE,
+                        details = msg,
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "Media command/search opened without verified active playback: ${msg.take(120)}"
+                        )
+                    )
+                } else if (executionResult.status == VerificationStatus.VERIFIED && msg.isNotBlank()) {
+                    VerificationResult(
+                        status = VerificationStatus.VERIFIED,
+                        details = msg,
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = msg,
+                            observedChange = "Verified media playback state: ${msg.take(120)}"
+                        )
+                    )
+                } else {
+                    VerificationResult(
+                        status = executionResult.status ?: VerificationStatus.INCONCLUSIVE,
+                        details = msg.ifBlank { "Media playback state could not be verified." },
+                        evidence = VerificationEvidence(
+                            preState = preStateSummary,
+                            postState = postStateSummary,
+                            observedChange = "Inconclusive media state."
+                        )
+                    )
+                }
+            }
+
             ActionType.SAVE_NOTE,
             ActionType.SEARCH_NOTES,
             ActionType.DELETE_NOTE,
@@ -343,8 +394,7 @@ class ActionVerifier(
             ActionType.DELETE_CALENDAR_EVENT,
             ActionType.WHATSAPP_READ_CONVERSATION,
             ActionType.MESSAGE_DRAFT_SEND,
-            ActionType.NAVIGATE_HOME,
-            ActionType.CONTROL_MEDIA -> {
+            ActionType.NAVIGATE_HOME -> {
                 if (executionResult.status == VerificationStatus.VERIFIED && executionResult.outputMessage.isNotBlank()) {
                     VerificationResult(
                         status = VerificationStatus.VERIFIED,

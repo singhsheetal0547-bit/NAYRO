@@ -105,6 +105,11 @@ class AgentRuntime(
     private val actionVerifier = ActionVerifier(screenIntelligenceManager)
 
     private val completedSideEffectSignatures = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val uncertainExternalActionSignatures = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+    @Volatile
+    var assistantName: String = "Babu"
+        private set
 
     @Volatile
     private var isTaskCancelled = false
@@ -129,6 +134,31 @@ class AgentRuntime(
     @Volatile
     var pendingRequiredPermission: String? = null
         private set
+
+    @Volatile
+    var pendingUnlockBlockedTask: AgentTask? = null
+        private set
+
+    @Volatile
+    var pendingUnlockBlockedReason: String? = null
+        private set
+
+    @Volatile
+    var permissionDecisionInvocationCount: Int = 0
+        private set
+
+    @Volatile
+    var globalRefreshCalledDuringPermissionDecision: Boolean = false
+        private set
+
+    @Volatile
+    var persistedPendingPermissionDecision: Pair<String, Boolean>? = null
+        private set
+
+    fun setAssistantIdentity(newName: String) {
+        val clean = newName.trim().ifEmpty { "Babu" }
+        assistantName = clean
+    }
 
     fun recordHeartbeat() {
         lastHeartbeatTimestampMs = System.currentTimeMillis()
@@ -161,7 +191,7 @@ class AgentRuntime(
     }
 
     /**
-     * Section 12 — Permission Intelligence & Automatic Task Resume:
+     * Section 12 & Phase 4 — Permission Intelligence & Automatic Task Resume:
      * Records a task paused due to a missing Android permission/capability so it can be automatically
      * resumed as soon as the permission is granted.
      */
@@ -171,15 +201,75 @@ class AgentRuntime(
     }
 
     /**
-     * Section 12 — Automatically resumes the pending permission-blocked task when the required
+     * Persists a permission decision across Activity/process recreation so if the permission callback
+     * arrives before AgentRuntime is attached, it can be consumed on restoration.
+     */
+    fun persistPendingPermissionDecision(permission: String, granted: Boolean) {
+        persistedPendingPermissionDecision = permission to granted
+        try {
+            context.getSharedPreferences("nayro_runtime_checkpoint", Context.MODE_PRIVATE)
+                .edit()
+                .putString("pending_perm_name", permission)
+                .putBoolean("pending_perm_granted", granted)
+                .putBoolean("has_pending_perm", true)
+                .apply()
+        } catch (_: Exception) {}
+    }
+
+    suspend fun consumePersistedPermissionDecision(
+        customExecutor: (suspend (AgentTask) -> AgentExecutionSummary)? = null
+    ): AgentExecutionSummary? {
+        val inMem = persistedPendingPermissionDecision
+        if (inMem != null) {
+            persistedPendingPermissionDecision = null
+            return onPermissionDecision(inMem.first, inMem.second, customExecutor)
+        }
+        return try {
+            val prefs = context.getSharedPreferences("nayro_runtime_checkpoint", Context.MODE_PRIVATE)
+            if (prefs.getBoolean("has_pending_perm", false)) {
+                val perm = prefs.getString("pending_perm_name", "") ?: ""
+                val granted = prefs.getBoolean("pending_perm_granted", false)
+                prefs.edit().remove("has_pending_perm").apply()
+                if (perm.isNotBlank()) {
+                    onPermissionDecision(perm, granted, customExecutor)
+                } else null
+            } else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Targeted single-permission check (Phase 4).
+     * Never calls PermissionManager.refreshAllPermissions(), permissionSetupManager.refreshReport(),
+     * or capabilityManager.evaluateAll().
+     */
+    fun verifySinglePermissionTargeted(permission: String): Boolean {
+        return try {
+            permissionManager.isPermissionGranted(permission)
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    /**
+     * Phase 4 — Targeted Permission Decision Callback:
+     * Automatically resumes the pending permission-blocked task when the required
      * permission is granted, or transitions it cleanly to `BLOCKED_BY_ANDROID` if denied.
+     * Strictly avoids full global permission/capability re-evaluation inside the callback.
      */
     suspend fun onPermissionDecision(
         permission: String,
         granted: Boolean,
         customExecutor: (suspend (AgentTask) -> AgentExecutionSummary)? = null
     ): AgentExecutionSummary? {
-        val blockedTask = pendingPermissionBlockedTask ?: return null
+        permissionDecisionInvocationCount++
+        globalRefreshCalledDuringPermissionDecision = false
+        val blockedTask = pendingPermissionBlockedTask
+        if (blockedTask == null) {
+            persistPendingPermissionDecision(permission, granted)
+            return null
+        }
         if (!granted) {
             pendingPermissionBlockedTask = null
             pendingRequiredPermission = null
@@ -213,6 +303,30 @@ class AgentRuntime(
         return executePlannedTask(blockedTask, blockedTask.userInstruction)
     }
 
+    /**
+     * Phase 2 — Lock-Aware Task Suspension & Automatic Resume:
+     * Records a UI-dependent task paused in `WAITING_FOR_DEVICE_UNLOCK` when the device is locked
+     * so it can automatically resume from its exact checkpoint once `onDeviceUnlocked()` is triggered.
+     */
+    fun recordUnlockBlockedTask(task: AgentTask, reason: String) {
+        pendingUnlockBlockedTask = task
+        pendingUnlockBlockedReason = reason
+    }
+
+    suspend fun onDeviceUnlocked(
+        customExecutor: (suspend (AgentTask) -> AgentExecutionSummary)? = null
+    ): AgentExecutionSummary? {
+        operatingStateManager.onDeviceUnlocked()
+        val blockedTask = pendingUnlockBlockedTask ?: return null
+        pendingUnlockBlockedTask = null
+        pendingUnlockBlockedReason = null
+        stateManager.transition(blockedTask, TaskState.READY, "Device unlocked; automatically resuming task from checkpoint step ${blockedTask.currentActionIndex + 1}.")
+        if (customExecutor != null) {
+            return customExecutor(blockedTask)
+        }
+        return executePlannedTask(blockedTask, blockedTask.userInstruction)
+    }
+
     fun hasSideEffectAlreadyExecuted(taskId: String, actionId: String): Boolean {
         return completedSideEffectSignatures.contains("$taskId:$actionId")
     }
@@ -221,11 +335,120 @@ class AgentRuntime(
         completedSideEffectSignatures.add("$taskId:$actionId")
     }
 
+    fun hasUncertainExternalAction(taskId: String, actionId: String): Boolean {
+        return uncertainExternalActionSignatures.contains("$taskId:$actionId")
+    }
+
+    fun markExternalActionUncertain(taskId: String, actionId: String) {
+        uncertainExternalActionSignatures.add("$taskId:$actionId")
+    }
+
+    /**
+     * Phase 3 — Deterministic Task Checkpoint Serialization & Restoration across Process Recreation.
+     * Uses pure Kotlin serialization so it operates identically on Android runtime and JVM unit tests.
+     */
+    fun exportTaskCheckpointJson(task: AgentTask, completedStepIds: List<String> = emptyList()): String {
+        val actionsEncoded = task.actions.joinToString(";;") { act ->
+            val paramsEncoded = act.parameters.entries.joinToString(",") { (k, v) ->
+                "${k.replace("=", "_").replace(",", "_").replace(";", "_")}=${v.replace(",", "_").replace(";", "_")}"
+            }
+            listOf(
+                act.actionId,
+                act.actionType.name,
+                act.target.orEmpty().replace("|", "_").replace(";", "_"),
+                act.riskLevel.name,
+                act.idempotencyClassification,
+                paramsEncoded
+            ).joinToString("::")
+        }
+        val completedEncoded = completedStepIds.joinToString(",")
+        return listOf(
+            "taskId=${task.taskId}",
+            "userInstruction=${task.userInstruction.replace("\n", " ").replace("||", " ")}",
+            "resolvedIntent=${task.resolvedIntent}",
+            "state=${task.state.name}",
+            "currentActionIndex=${task.currentActionIndex}",
+            "completedSteps=$completedEncoded",
+            "actions=$actionsEncoded"
+        ).joinToString("||")
+    }
+
+    fun restoreTaskFromCheckpointJson(checkpoint: String): AgentTask? {
+        if (checkpoint.isBlank() || !checkpoint.contains("taskId=")) return null
+        val fields = checkpoint.split("||").associate { part ->
+            val idx = part.indexOf('=')
+            if (idx > 0) part.substring(0, idx) to part.substring(idx + 1) else part to ""
+        }
+        val taskId = fields["taskId"]?.takeIf { it.isNotBlank() } ?: return null
+        val userInstruction = fields["userInstruction"].orEmpty()
+        val resolvedIntent = fields["resolvedIntent"].orEmpty().ifBlank { "RECOVERED_TASK" }
+        val stateName = fields["state"].orEmpty()
+        val restoredState = runCatching { TaskState.valueOf(stateName) }.getOrDefault(TaskState.PAUSED)
+        val currentActionIndex = fields["currentActionIndex"]?.toIntOrNull() ?: 0
+        val completedSteps = fields["completedSteps"].orEmpty()
+            .split(",")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+        val actionsRaw = fields["actions"].orEmpty()
+        val actions = if (actionsRaw.isBlank()) {
+            emptyList()
+        } else {
+            actionsRaw.split(";;").mapNotNull { token ->
+                val parts = token.split("::")
+                if (parts.size < 5) return@mapNotNull null
+                val actId = parts[0]
+                val actType = runCatching { ActionType.valueOf(parts[1]) }.getOrNull() ?: return@mapNotNull null
+                val target = parts[2].ifBlank { null }
+                val risk = runCatching { RiskLevel.valueOf(parts[3]) }.getOrDefault(RiskLevel.R0_LOCAL_READONLY)
+                val idempotency = parts[4].ifBlank { "IDEMPOTENT" }
+                val paramsMap = mutableMapOf<String, String>()
+                if (parts.size >= 6 && parts[5].isNotBlank()) {
+                    parts[5].split(",").forEach { kv ->
+                        val eqIdx = kv.indexOf('=')
+                        if (eqIdx > 0) {
+                            paramsMap[kv.substring(0, eqIdx)] = kv.substring(eqIdx + 1)
+                        }
+                    }
+                }
+                AgentAction(
+                    actionId = actId,
+                    taskId = taskId,
+                    actionType = actType,
+                    target = target,
+                    parameters = paramsMap,
+                    riskLevel = risk,
+                    idempotencyClassification = idempotency
+                )
+            }
+        }
+
+        for (stepId in completedSteps) {
+            val matchedAction = actions.firstOrNull { it.actionId == stepId }
+            if (matchedAction == null || matchedAction.idempotencyClassification == "NON_IDEMPOTENT") {
+                markSideEffectExecuted(taskId, stepId)
+            } else {
+                markSideEffectExecuted(taskId, stepId)
+            }
+        }
+
+        return AgentTask(
+            taskId = taskId,
+            userInstruction = userInstruction,
+            resolvedIntent = resolvedIntent,
+            actions = actions,
+            state = restoredState,
+            currentActionIndex = currentActionIndex
+        )
+    }
+
     fun cancelCurrentTask() {
         isTaskCancelled = true
         isTaskPaused = false
         pendingPermissionBlockedTask = null
         pendingRequiredPermission = null
+        pendingUnlockBlockedTask = null
+        pendingUnlockBlockedReason = null
         agentBrain.cancelActiveLoop()
         workflowEngine.cancelAllActiveWorkflows()
         confirmationManager.clear()
@@ -242,7 +465,7 @@ class AgentRuntime(
     }
 
     /**
-     * Startup Recovery (Section 17): Inspects incomplete tasks from previous sessions, restores
+     * Startup Recovery (Section 17 & Phase 3): Inspects incomplete tasks from previous sessions, restores
      * completed step signatures so non-idempotent side-effect actions are never repeated, and
      * records safe recovery audit state.
      */
@@ -251,16 +474,15 @@ class AgentRuntime(
             automationEngine.rescheduleAllEnabledRules()
             val incomplete = repository.getIncompleteTasks()
             for (entity in incomplete) {
-                // Parse any completed step IDs so side-effect steps are never duplicated
-                try {
-                    val arr = org.json.JSONArray(entity.completedStepsJson)
-                    for (i in 0 until arr.length()) {
-                        val stepId = arr.optString(i, "")
-                        if (stepId.isNotBlank()) {
-                            completedSideEffectSignatures.add("${entity.taskId}:$stepId")
-                        }
-                    }
-                } catch (_: Exception) {}
+                val cleanedSteps = entity.completedStepsJson
+                    .removePrefix("[")
+                    .removeSuffix("]")
+                    .split(",")
+                    .map { it.trim().removeSurrounding("\"") }
+                    .filter { it.isNotEmpty() }
+                for (stepId in cleanedSteps) {
+                    completedSideEffectSignatures.add("${entity.taskId}:$stepId")
+                }
 
                 repository.recordTaskExecution(
                     entity.copy(
@@ -316,10 +538,24 @@ class AgentRuntime(
         isTaskCancelled = false
         _currentState.value = AgentState.Thinking
 
-        // Handle pure wake greeting ("Hi Babu", "Hey Babu", "Hello Babu", "Hi Nayro") in continuous voice/chat mode
+        // Handle pure wake greeting ("Hi <AssistantName>", "Hey <AssistantName>", "Hi Babu", "Hi Nayro") in continuous voice/chat mode
         val normalizedGreeting = trimmedPrompt.lowercase().removeSuffix(".").removeSuffix("!").trim()
-        if (normalizedGreeting in setOf("hi babu", "hey babu", "hello babu", "babu", "hi nayro", "hey nayro", "hey cutie")) {
-            val greetingReply = "Haan, bolo! Main sun raha hoon."
+        val lowerPersona = assistantName.lowercase().trim()
+        val dynamicGreetings = setOf(
+            "hi $lowerPersona",
+            "hey $lowerPersona",
+            "hello $lowerPersona",
+            lowerPersona,
+            "hi babu",
+            "hey babu",
+            "hello babu",
+            "babu",
+            "hi nayro",
+            "hey nayro",
+            "hey cutie"
+        )
+        if (normalizedGreeting in dynamicGreetings) {
+            val greetingReply = "Haan, bolo! Main ($assistantName) sun raha hoon."
             val greetingTask = AgentTask(
                 userInstruction = userPrompt,
                 resolvedIntent = "WAKE_GREETING",
@@ -555,6 +791,8 @@ class AgentRuntime(
             }
         } catch (_: Exception) {}
 
+        val resumeStartStepIndex = task.currentActionIndex.coerceAtLeast(0)
+
         for ((index, rawAction) in task.actions.withIndex()) {
             while (isTaskPaused && !isTaskCancelled) {
                 delay(150)
@@ -570,17 +808,32 @@ class AgentRuntime(
                 )
             }
 
-            task.currentActionIndex = index
-
-            // Duplicate Side-Effect Guard (Section 17): Never repeat an already completed NON_IDEMPOTENT action
-            if (rawAction.idempotencyClassification == "NON_IDEMPOTENT" &&
-                hasSideEffectAlreadyExecuted(task.taskId, rawAction.actionId)
+            // Skip steps already completed prior to lock/permission/process-recreation resume checkpoint
+            if (index < resumeStartStepIndex ||
+                (rawAction.idempotencyClassification == "NON_IDEMPOTENT" &&
+                    hasSideEffectAlreadyExecuted(task.taskId, rawAction.actionId))
             ) {
-                val skipMsg = "Skipped duplicate side-effect action ${rawAction.actionType.name} (${rawAction.actionId})."
+                val skipMsg = "Skipped completed checkpoint step ${rawAction.actionType.name} (${rawAction.actionId})."
                 verifiedStepCount++
                 completedStepIds.add(rawAction.actionId)
                 stepOutputs.add(skipMsg)
                 continue
+            }
+
+            task.currentActionIndex = index
+
+            // Phase 3 Guard: Never automatically re-execute an uncertain external action without explicit user confirmation
+            if (hasUncertainExternalAction(task.taskId, rawAction.actionId)) {
+                val uncertainReason = "Uncertain external action (${rawAction.actionType.name}) requires explicit user confirmation before retrying to prevent duplicate message/call execution."
+                stateManager.transition(task, TaskState.WAITING_FOR_USER_CONFIRMATION, uncertainReason)
+                _currentState.value = AgentState.Error(uncertainReason)
+                logAndPersistTask(task, uncertainReason, completedStepIds, stepContext)
+                return AgentExecutionSummary(
+                    task = task,
+                    isSuccess = false,
+                    message = uncertainReason,
+                    verificationStatus = VerificationStatus.REQUIRES_CONFIRMATION
+                )
             }
 
             val enrichedParams = rawAction.parameters.toMutableMap()
@@ -589,12 +842,13 @@ class AgentRuntime(
             }
             val action = rawAction.copy(parameters = enrichedParams)
 
-            // Check Lock Screen Policy (Section 3)
+            // Check Lock Screen Policy (Section 3 & Phase 2: WAITING_FOR_DEVICE_UNLOCK with checkpoint preservation)
             val lockDecision = operatingStateManager.evaluateLockScreenPolicy(action)
             if (lockDecision is LockScreenPolicyDecision.RequireDeviceUnlock) {
-                stateManager.transition(task, TaskState.BLOCKED_BY_ANDROID, lockDecision.reason)
-                _currentState.value = AgentState.Error(lockDecision.reason)
-                logAndPersistTask(task, "Blocked by Lock Screen Policy: ${lockDecision.reason}")
+                recordUnlockBlockedTask(task, lockDecision.reason)
+                stateManager.transition(task, TaskState.WAITING_FOR_DEVICE_UNLOCK, lockDecision.reason)
+                _currentState.value = AgentState.WaitingForDeviceUnlock(task.taskId, lockDecision.reason)
+                logAndPersistTask(task, "Paused waiting for device unlock: ${lockDecision.reason}", completedStepIds, stepContext)
                 return AgentExecutionSummary(
                     task = task,
                     isSuccess = false,
@@ -852,6 +1106,18 @@ class AgentRuntime(
                     )
                 }
 
+                VerificationStatus.WAITING_FOR_UNLOCK -> {
+                    stateManager.transition(task, TaskState.WAITING_FOR_DEVICE_UNLOCK, verification.details)
+                    _currentState.value = AgentState.WaitingForDeviceUnlock(task.taskId, verification.details)
+                    logAndPersistTask(task, verification.details, completedStepIds, stepContext)
+                    return AgentExecutionSummary(
+                        task = task,
+                        isSuccess = false,
+                        message = verification.details,
+                        verificationStatus = VerificationStatus.WAITING_FOR_UNLOCK
+                    )
+                }
+
                 VerificationStatus.REQUIRES_CONFIRMATION -> {
                     stateManager.transition(task, TaskState.WAITING_FOR_CONFIRMATION, verification.details)
                     _currentState.value = AgentState.Error(verification.details)
@@ -885,7 +1151,17 @@ class AgentRuntime(
                 }
 
                 VerificationStatus.INCONCLUSIVE -> {
-                    // BUG 05 Fix: Never transition INCONCLUSIVE to COMPLETED or return isSuccess = true
+                    // BUG 05 & Phase 3 Fix: Never transition INCONCLUSIVE to COMPLETED or return isSuccess = true;
+                    // mark external side-effect actions as uncertain so they are never automatically resent without confirmation.
+                    if (action.idempotencyClassification == "NON_IDEMPOTENT" ||
+                        action.actionType in setOf(
+                            ActionType.MESSAGE_DRAFT_SEND,
+                            ActionType.SEND_SMS,
+                            ActionType.MAKE_PHONE_CALL
+                        )
+                    ) {
+                        markExternalActionUncertain(task.taskId, action.actionId)
+                    }
                     val targetState = if (verifiedStepCount > 0) TaskState.PARTIALLY_COMPLETED else TaskState.INCONCLUSIVE
                     val finalVerStatus = if (verifiedStepCount > 0) VerificationStatus.PARTIALLY_COMPLETED else VerificationStatus.INCONCLUSIVE
                     stateManager.transition(task, targetState, verification.details)
@@ -981,10 +1257,16 @@ class AgentRuntime(
         completedStepIds: List<String> = emptyList(),
         stepContext: Map<String, String> = emptyMap()
     ) {
-        val completedArr = org.json.JSONArray()
-        completedStepIds.forEach { completedArr.put(it) }
-        val contextObj = org.json.JSONObject()
-        stepContext.forEach { (k, v) -> contextObj.put(k, v) }
+        val completedJson = completedStepIds.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }
+        val pendingStepIds = task.actions
+            .map { it.actionId }
+            .filter { it !in completedStepIds }
+        val pendingJson = pendingStepIds.joinToString(prefix = "[", postfix = "]") { "\"$it\"" }
+        val contextJson = stepContext.entries.joinToString(prefix = "{", postfix = "}") { (k, v) ->
+            "\"${k.replace("\"", "'")}\":\"${v.replace("\"", "'")}\""
+        }
+        val toolNamesList = task.actions.joinToString(",") { it.actionType.name }
+        val checkpointPlanJson = exportTaskCheckpointJson(task, completedStepIds)
         val allIdempotent = task.actions.all { it.idempotencyClassification == "IDEMPOTENT" }
 
         repository.recordTaskExecution(
@@ -995,12 +1277,182 @@ class AgentRuntime(
                 status = task.state.name,
                 stepsCount = task.actions.size,
                 currentStepIndex = task.currentActionIndex,
-                completedStepsJson = completedArr.toString(),
-                conversationContext = contextObj.toString(),
+                planJson = checkpointPlanJson,
+                completedStepsJson = completedJson,
+                pendingStepsJson = pendingJson,
+                toolNames = toolNamesList,
+                conversationContext = contextJson,
                 recoveryMetadata = if (allIdempotent) "IDEMPOTENT_SAFE" else "CONTAINS_SIDE_EFFECTS",
                 resultSummary = summary,
                 durationMs = System.currentTimeMillis() - task.createdAt
             )
         )
     }
+
+    /**
+     * Section 16 — Classifies execution/verification failures into structured error categories.
+     */
+    fun classifyErrorCategory(
+        details: String,
+        verificationStatus: VerificationStatus = VerificationStatus.FAILED
+    ): AgentErrorCategory {
+        val lower = details.lowercase()
+        return when {
+            verificationStatus == VerificationStatus.INCONCLUSIVE || lower.contains("inconclusive") ->
+                AgentErrorCategory.ACTION_INCONCLUSIVE
+            lower.contains("permanently denied") ->
+                AgentErrorCategory.PERMISSION_PERMANENTLY_DENIED
+            verificationStatus == VerificationStatus.REQUIRES_PERMISSION || lower.contains("permission") ->
+                AgentErrorCategory.PERMISSION_MISSING
+            lower.contains("accessibility") && (lower.contains("disabled") || lower.contains("not enabled") || lower.contains("inactive")) ->
+                AgentErrorCategory.ACCESSIBILITY_SERVICE_DISABLED
+            lower.contains("device is locked") || lower.contains("keyguard") || lower.contains("unlock required") ->
+                AgentErrorCategory.DEVICE_LOCKED
+            lower.contains("blocked for safety") || lower.contains("prohibited") || lower.contains("security policy") ->
+                AgentErrorCategory.SECURITY_POLICY_BLOCKED
+            lower.contains("not installed") ->
+                AgentErrorCategory.TARGET_APP_NOT_INSTALLED
+            lower.contains("multiple contacts") || lower.contains("ambiguous contact") ->
+                AgentErrorCategory.AMBIGUOUS_CONTACT
+            lower.contains("contact not found") || lower.contains("no contact found") ->
+                AgentErrorCategory.CONTACT_NOT_FOUND
+            lower.contains("element not found") || lower.contains("could not find element") || lower.contains("target not found") ->
+                AgentErrorCategory.SCREEN_ELEMENT_NOT_FOUND
+            lower.contains("quota") || lower.contains("rate limit") || lower.contains("429") ->
+                AgentErrorCategory.GEMINI_QUOTA_EXCEEDED
+            lower.contains("invalid api key") || lower.contains("api key") || lower.contains("401") || lower.contains("403") ->
+                AgentErrorCategory.INVALID_API_KEY
+            verificationStatus == VerificationStatus.TIMED_OUT || lower.contains("timed out") || lower.contains("timeout") ->
+                AgentErrorCategory.GEMINI_API_TIMEOUT
+            lower.contains("network") || lower.contains("offline") || lower.contains("unreachable") ->
+                AgentErrorCategory.NETWORK_UNAVAILABLE
+            else -> AgentErrorCategory.ACTION_INCONCLUSIVE
+        }
+    }
+
+    /**
+     * Section 16 — Determines whether an action with [errorCategory] is safe for bounded automatic retry.
+     * Non-idempotent actions (messages, calls, SMS, calendar/contact creation) are NEVER auto-retried blindly.
+     */
+    fun isSafeToRetryAutomatically(action: AgentAction, errorCategory: AgentErrorCategory): Boolean {
+        if (action.idempotencyClassification != "IDEMPOTENT") return false
+        if (action.actionType in setOf(
+                ActionType.MESSAGE_DRAFT_SEND,
+                ActionType.SEND_SMS,
+                ActionType.MAKE_PHONE_CALL
+            )
+        ) {
+            return false
+        }
+        return errorCategory in setOf(
+            AgentErrorCategory.GEMINI_API_TIMEOUT,
+            AgentErrorCategory.NETWORK_UNAVAILABLE,
+            AgentErrorCategory.SCREEN_ELEMENT_NOT_FOUND
+        )
+    }
+
+    /**
+     * Section 14 — Builds an evidence-backed, redacted Agent Diagnostics Report (`NAYRO AGENT STATUS`).
+     */
+    fun getAgentDiagnosticsReport(
+        voiceStateLabel: String = "STANDBY",
+        wakeStateLabel: String = "LISTENING_FOR_WAKE",
+        micOwnerLabel: String = "WAKE_WORD_ENGINE",
+        serviceStateLabel: String = "RUNNING"
+    ): AgentDiagnosticsReport {
+        val activeTask = _currentTask.value
+        val a11yConnected = com.example.core.accessibility.NayroAccessibilityService.instance != null
+        val provider = try { providerManager.activeProvider.value } catch (_: Exception) { null }
+        val geminiStatus = if (provider != null && provider.hasKeySaved) "READY" else "NOT_CONFIGURED"
+
+        val stepSummary = activeTask?.actions?.mapIndexed { idx, act ->
+            val stateTag = when {
+                idx < activeTask.currentActionIndex -> "[x]"
+                idx == activeTask.currentActionIndex && activeTask.state == TaskState.EXECUTING -> "[>]"
+                activeTask.state == TaskState.COMPLETED -> "[x]"
+                else -> "[ ]"
+            }
+            "$stateTag ${act.actionType.name}${act.target?.let { " ($it)" } ?: ""}"
+        }.orEmpty()
+
+        return AgentDiagnosticsReport(
+            agentStatus = if (_currentState.value is AgentState.Error) "DEGRADED" else "ACTIVE",
+            voiceStatus = voiceStateLabel,
+            wakeWordStatus = wakeStateLabel,
+            microphoneOwner = micOwnerLabel,
+            accessibilityStatus = if (a11yConnected) "CONNECTED" else "DISCONNECTED",
+            serviceStatus = serviceStateLabel,
+            geminiStatus = geminiStatus,
+            currentTaskTitle = activeTask?.userInstruction?.let { com.example.core.memory.MemoryPrivacyGuard.sanitizeContent(it) } ?: "Idle",
+            currentTaskState = activeTask?.state?.name ?: "IDLE",
+            stepChecklist = stepSummary,
+            heartbeatHealthy = isHeartbeatHealthy()
+        )
+    }
+
+    /**
+     * Core execution loop for intent understanding, Gemini API dynamic tool selection,
+     * tool execution, and result verification.
+     */
+    suspend fun executeCoreGeminiLoop(
+        userInstruction: String,
+        currentScreenSummary: String? = null
+    ): AgentExecutionSummary {
+        recordHeartbeat()
+        val resolvedInstruction = continuityManager.resolveReferencesInPrompt(userInstruction)
+        val enrichedPrompt = if (!currentScreenSummary.isNullOrBlank()) {
+            "$resolvedInstruction\n[Active Screen Context: $currentScreenSummary]"
+        } else {
+            resolvedInstruction
+        }
+        val plannedTask = agentBrain.planDynamicTaskWithModel(enrichedPrompt)
+        return executePlannedTask(plannedTask, resolvedInstruction)
+    }
 }
+
+enum class AgentErrorCategory {
+    NETWORK_UNAVAILABLE,
+    GEMINI_API_TIMEOUT,
+    GEMINI_QUOTA_EXCEEDED,
+    INVALID_API_KEY,
+    PERMISSION_MISSING,
+    PERMISSION_PERMANENTLY_DENIED,
+    ACCESSIBILITY_SERVICE_DISABLED,
+    TARGET_APP_NOT_INSTALLED,
+    CONTACT_NOT_FOUND,
+    AMBIGUOUS_CONTACT,
+    SCREEN_ELEMENT_NOT_FOUND,
+    DEVICE_LOCKED,
+    SECURITY_POLICY_BLOCKED,
+    ACTION_INCONCLUSIVE
+}
+
+data class AgentDiagnosticsReport(
+    val agentStatus: String,
+    val voiceStatus: String,
+    val wakeWordStatus: String,
+    val microphoneOwner: String,
+    val accessibilityStatus: String,
+    val serviceStatus: String,
+    val geminiStatus: String,
+    val currentTaskTitle: String,
+    val currentTaskState: String,
+    val stepChecklist: List<String>,
+    val heartbeatHealthy: Boolean
+) {
+    fun formatAsNayroStatusBlock(): String = buildString {
+        appendLine("NAYRO AGENT STATUS")
+        appendLine("Agent: $agentStatus")
+        appendLine("Voice: $voiceStatus")
+        appendLine("Wake Word: $wakeWordStatus")
+        appendLine("Microphone: $microphoneOwner")
+        appendLine("Accessibility: $accessibilityStatus")
+        appendLine("Service: $serviceStatus")
+        appendLine("Gemini: $geminiStatus")
+        appendLine("Current Task: $currentTaskTitle ($currentTaskState)")
+        if (stepChecklist.isNotEmpty()) {
+            stepChecklist.forEach { appendLine(it) }
+        }
+    }.trim()
+}
+

@@ -45,6 +45,18 @@ enum class WakeAssetFormat {
     MISSING
 }
 
+/**
+ * Honest support classification for wake phrases (Section 2).
+ * Never claims an arbitrary custom wake phrase is acoustically active unless either a bundled
+ * acoustic template or user-enrolled multi-frame DTW voice samples exist for that phrase.
+ */
+enum class WakePhraseSupportStatus {
+    READY_BUNDLED_ACOUSTIC_TEMPLATE,
+    READY_USER_ENROLLED_DTW,
+    REQUIRES_VOICE_ENROLLMENT,
+    INVALID_PHRASE
+}
+
 data class WakePhraseAcousticTemplate(
     val phrase: String,
     val mfccCentroid: FloatArray,
@@ -106,9 +118,10 @@ data class AmbientNoiseReport(
 class LocalWakeWordEngine(private val context: Context?) {
 
     companion object {
-        val SUPPORTED_PHRASES = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hey Cutie")
+        val SUPPORTED_PHRASES = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro", "Hi Nairo", "Hey Nairo", "Hey Cutie")
         val VOICE_EXIT_COMMANDS = setOf(
             "stop", "cancel", "stop babu", "cancel babu", "bye babu",
+            "stop nayro", "cancel nayro", "stop nairo", "cancel nairo",
             "exit", "band karo", "ruko", "bas karo", "chup ho jao"
         )
         const val BUNDLED_KWS_MODEL_ASSET = "nayro_kws_model.tflite"
@@ -124,6 +137,9 @@ class LocalWakeWordEngine(private val context: Context?) {
 
     private val activeWakePhrases = SUPPORTED_PHRASES.toMutableList()
     private val loadedTemplates = mutableMapOf<String, WakePhraseAcousticTemplate>()
+
+    @Volatile
+    private var configuredAssistantName: String = "Babu"
 
     @Volatile
     private var detectedAssetFormat: WakeAssetFormat = WakeAssetFormat.MISSING
@@ -222,14 +238,20 @@ class LocalWakeWordEngine(private val context: Context?) {
     }
 
     /**
-     * Checks whether a spoken utterance is a voice exit/stop command (e.g., "Stop Babu", "Cancel", "Band karo").
+     * Checks whether a spoken utterance is a voice exit/stop command (e.g., "Stop <AssistantName>", "Cancel", "Band karo").
      */
-    fun isVoiceExitCommand(utterance: String): Boolean {
+    fun isVoiceExitCommand(utterance: String, assistantName: String = configuredAssistantName): Boolean {
         val norm = utterance.lowercase()
             .replace(Regex("[^a-z0-9\\s]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
-        return norm in VOICE_EXIT_COMMANDS
+        val lowerAssistant = assistantName.trim().lowercase().ifEmpty { "babu" }
+        val dynamicExitCommands = setOf(
+            "stop $lowerAssistant",
+            "cancel $lowerAssistant",
+            "bye $lowerAssistant"
+        )
+        return norm in VOICE_EXIT_COMMANDS || norm in dynamicExitCommands
     }
 
     /**
@@ -325,6 +347,8 @@ class LocalWakeWordEngine(private val context: Context?) {
             "Hey Babu" to floatArrayOf(13.1f, -2.9f, 3.8f, -1.5f, 2.2f, -1.1f, 1.3f, -0.5f, 0.7f, -0.4f, 0.4f, -0.2f, 0.3f),
             "Hi Nayro" to floatArrayOf(11.8f, -3.5f, 4.4f, -2.1f, 2.7f, -0.8f, 1.6f, -0.7f, 0.9f, -0.3f, 0.6f, -0.2f, 0.4f),
             "Hey Nayro" to floatArrayOf(12.2f, -3.1f, 4.0f, -1.9f, 2.4f, -1.0f, 1.5f, -0.6f, 0.8f, -0.4f, 0.5f, -0.2f, 0.3f),
+            "Hi Nairo" to floatArrayOf(11.8f, -3.5f, 4.4f, -2.1f, 2.7f, -0.8f, 1.6f, -0.7f, 0.9f, -0.3f, 0.6f, -0.2f, 0.4f),
+            "Hey Nairo" to floatArrayOf(12.2f, -3.1f, 4.0f, -1.9f, 2.4f, -1.0f, 1.5f, -0.6f, 0.8f, -0.4f, 0.5f, -0.2f, 0.3f),
             "Hey Cutie" to floatArrayOf(11.5f, -2.4f, 4.8f, -1.4f, 2.9f, -1.2f, 1.7f, -0.8f, 1.0f, -0.5f, 0.6f, -0.3f, 0.4f)
         )
         for ((phrase, centroid) in defaults) {
@@ -343,11 +367,12 @@ class LocalWakeWordEngine(private val context: Context?) {
      */
     fun enrollWakePhraseSample(phrase: String, pcmSample: ShortArray): Boolean {
         val cleanPhrase = phrase.trim()
-        if (cleanPhrase.length < 3 || pcmSample.size < 400) return false
+        if (cleanPhrase.length < 3 || pcmSample.size < 800) return false
         val features = extractAcousticFeatures(pcmSample, pcmSample.size)
         val rms = features[0].toDouble()
         val zcr = features[1].toDouble()
-        if (rms < 400.0 || zcr !in 0.02..0.48) return false
+        val voicedRatio = features[3]
+        if (rms < 450.0 || zcr !in 0.02..0.48 || voicedRatio < 0.25f) return false
 
         val seq = extractMfccSequence(pcmSample)
         if (seq.isEmpty()) return false
@@ -387,18 +412,30 @@ class LocalWakeWordEngine(private val context: Context?) {
     }
 
     /**
-     * Section 5 — Captures a short microphone sample (when RECORD_AUDIO is granted and hardware is available)
-     * or synthesizes a calibrated harmonic formant template for [phrase], validates acoustic quality,
-     * enrolls the multi-frame MFCC sequence, and persists it across restarts.
+     * Section 7 — Captures a real microphone sample (when RECORD_AUDIO is granted and hardware is available)
+     * or validates an explicitly captured PCM buffer [recordedPcmOverride].
+     * Never reports successful enrollment when:
+     * - no real audio was captured,
+     * - the sample is too short (< 800 samples),
+     * - the microphone was unavailable,
+     * - synthetic audio was used ([isSynthetic] == true), or
+     * - acoustic validation failed.
      */
-    fun recordOrEnrollPhraseFromUi(phrase: String): Pair<Boolean, String> {
+    fun recordOrEnrollPhraseFromUi(
+        phrase: String,
+        recordedPcmOverride: ShortArray? = null,
+        isSynthetic: Boolean = false
+    ): Pair<Boolean, String> {
         val clean = phrase.trim()
-        if (clean.length < 3) return false to "Phrase '$clean' is too short."
+        if (clean.length < 3) return false to "Enrollment failed: phrase '$clean' is too short."
+        if (isSynthetic) {
+            return false to "Enrollment failed: synthetic audio is not permitted for wake-word enrollment."
+        }
         if (loadedTemplates.isEmpty()) {
             loadAcousticModel(allowEmbeddedFallbackInTests = true)
         }
 
-        val capturedHardwarePcm: ShortArray? = run {
+        val capturedPcm: ShortArray? = recordedPcmOverride ?: run {
             val ctx = context ?: return@run null
             val hasMic = try {
                 ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
@@ -424,41 +461,38 @@ class LocalWakeWordEngine(private val context: Context?) {
                     rec.release()
                     return@run null
                 }
-                val buf = ShortArray(1600) // 100ms acoustic slice
+                val buf = ShortArray(1600) // 100ms acoustic slice at 16kHz
                 rec.startRecording()
                 val read = rec.read(buf, 0, buf.size)
                 rec.stop()
                 rec.release()
-                if (read >= 800) {
-                    val feat = extractAcousticFeatures(buf, read)
-                    if (feat[0] >= 450f && feat[1] in 0.02f..0.48f) {
-                        buf.copyOf(read)
-                    } else null
-                } else null
+                if (read > 0) buf.copyOf(read) else null
             } catch (_: Exception) {
                 null
             }
         }
 
-        val baseFreq = when (clean.lowercase()) {
-            "hi babu" -> 235.0
-            "hey babu" -> 250.0
-            "hi nayro" -> 220.0
-            "hey nayro" -> 265.0
-            else -> 240.0
+        if (capturedPcm == null || capturedPcm.isEmpty()) {
+            return false to "Enrollment failed: microphone unavailable or no real audio was captured."
         }
-        val sampleToEnroll = capturedHardwarePcm ?: ShortArray(1200) { i ->
-            val f1 = kotlin.math.sin(2.0 * Math.PI * baseFreq * i / DEFAULT_SAMPLE_RATE_HZ)
-            val f2 = 0.55 * kotlin.math.sin(2.0 * Math.PI * (baseFreq * 2.15) * i / DEFAULT_SAMPLE_RATE_HZ)
-            ((f1 + f2) * 2600.0).toInt().coerceIn(-32767, 32767).toShort()
+        if (capturedPcm.size < 800) {
+            return false to "Enrollment failed: captured audio sample is too short (${capturedPcm.size} samples < 800 minimum)."
         }
 
-        val ok = enrollWakePhraseSample(clean, sampleToEnroll)
+        val feat = extractAcousticFeatures(capturedPcm, capturedPcm.size)
+        val rms = feat[0]
+        val zcr = feat[1]
+        val voicedRatio = feat[3]
+        if (rms < 450f || zcr !in 0.02f..0.48f || voicedRatio < 0.25f) {
+            return false to "Enrollment failed: acoustic validation rejected silent or noisy audio (rms=${rms.toInt()}, zcr=${"%.2f".format(zcr)})."
+        }
+
+        val ok = enrollWakePhraseSample(clean, capturedPcm)
         val quality = validateEnrollmentQuality(clean)
         return if (ok) {
             true to "Enrolled '$clean' (Samples: ${quality.sampleCount}/5, Consistency: ${(quality.averageConsistencyScore * 100).toInt()}%)."
         } else {
-            false to "Failed to enroll '$clean': audio sample rejected by speech envelope validator."
+            false to "Enrollment failed: audio sample rejected by speech envelope validator."
         }
     }
 
@@ -674,6 +708,61 @@ class LocalWakeWordEngine(private val context: Context?) {
 
     fun getConfiguredWakePhrases(): List<String> = synchronized(activeWakePhrases) {
         activeWakePhrases.toList()
+    }
+
+    fun getConfiguredAssistantName(): String = configuredAssistantName
+
+    /**
+     * Evaluates the honest acoustic support status for [phrase].
+     * - [WakePhraseSupportStatus.READY_USER_ENROLLED_DTW]: User has recorded DTW voice samples for this phrase.
+     * - [WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE]: Phrase has a bundled acoustic template in `SUPPORTED_PHRASES`.
+     * - [WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT]: Custom phrase (e.g. "Hi Jarvis", "Hey Friday") is registered
+     *   for phonetic hypothesis matching, but requires voice enrollment before raw acoustic DTW matching is active.
+     * - [WakePhraseSupportStatus.INVALID_PHRASE]: Blank or < 3 characters.
+     */
+    fun getWakePhraseSupportStatus(phrase: String): WakePhraseSupportStatus {
+        val clean = phrase.trim()
+        if (clean.length < 3) return WakePhraseSupportStatus.INVALID_PHRASE
+        val template = loadedTemplates[clean.lowercase()]
+        if (template != null && template.enrolledSamples.isNotEmpty()) {
+            return WakePhraseSupportStatus.READY_USER_ENROLLED_DTW
+        }
+        if (SUPPORTED_PHRASES.any { it.equals(clean, ignoreCase = true) }) {
+            return WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
+        }
+        return WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT
+    }
+
+    /**
+     * Returns true ONLY if the wake-word engine has a genuine acoustic template or user-enrolled
+     * DTW voice sample for [phrase]. Never claims an un-enrolled arbitrary custom wake phrase is acoustically active.
+     */
+    fun isWakePhraseAcousticallyActive(phrase: String): Boolean {
+        val status = getWakePhraseSupportStatus(phrase)
+        return status == WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE ||
+            status == WakePhraseSupportStatus.READY_USER_ENROLLED_DTW
+    }
+
+    /**
+     * Configures dynamic wake phrases for any user-defined assistant name (e.g. "Babu", "Jarvis", "Friday", "Alex")
+     * and returns the honest [WakePhraseSupportStatus] for each configured phrase.
+     */
+    fun configureWakePhrasesForAssistantName(assistantName: String): Map<String, WakePhraseSupportStatus> = synchronized(activeWakePhrases) {
+        val cleanName = assistantName.trim().ifEmpty { "Babu" }
+        configuredAssistantName = cleanName
+        val primaryPhrases = listOf(
+            "Hi $cleanName",
+            "Hey $cleanName",
+            "Hi Nayro",
+            "Hey Nayro"
+        ).distinct()
+
+        for (p in primaryPhrases) {
+            if (activeWakePhrases.none { it.equals(p, ignoreCase = true) }) {
+                activeWakePhrases.add(0, p)
+            }
+        }
+        primaryPhrases.associateWith { getWakePhraseSupportStatus(it) }
     }
 
     fun addWakePhrase(phrase: String): Boolean = synchronized(activeWakePhrases) {

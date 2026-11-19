@@ -70,12 +70,16 @@ object TaskPlanner {
             }
 
             UserIntentType.SETTINGS_NAVIGATE -> {
+                val params = mutableMapOf("section" to (intent.section ?: "general"))
+                if (!intent.searchQueryOrContent.isNullOrBlank()) {
+                    params["adjustment"] = intent.searchQueryOrContent
+                }
                 actions.add(
                     AgentAction(
                         taskId = taskId,
                         actionType = ActionType.OPEN_SETTINGS_SECTION,
                         target = intent.section ?: "general",
-                        parameters = mapOf("section" to (intent.section ?: "general")),
+                        parameters = params,
                         riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
                         idempotencyClassification = "IDEMPOTENT"
                     )
@@ -305,17 +309,41 @@ object TaskPlanner {
             }
 
             UserIntentType.REMINDER_CREATE -> {
-                val title = intent.searchQueryOrContent ?: "Reminder"
-                actions.add(
-                    AgentAction(
-                        taskId = taskId,
-                        actionType = ActionType.CREATE_REMINDER,
-                        target = title,
-                        parameters = mapOf("title" to title, "time" to "Tomorrow 09:00 AM"),
-                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
-                        idempotencyClassification = "NON_IDEMPOTENT"
+                val lowerRaw = intent.rawPrompt.lowercase()
+                if (lowerRaw.contains("alarm") && (lowerRaw.contains("laga") || lowerRaw.contains("set") || lowerRaw.contains("baje") || lowerRaw.contains("schedule"))) {
+                    val hourMatch = Regex("(\\d{1,2})\\s*(?:baje|am|pm|:)").find(lowerRaw)
+                        ?: Regex("(\\d{1,2})").find(lowerRaw)
+                    var hour = hourMatch?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 6
+                    if ((lowerRaw.contains("pm") || lowerRaw.contains("shaam") || lowerRaw.contains("raat")) && hour in 1..11) {
+                        hour += 12
+                    }
+                    actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.SCHEDULE_ALARM,
+                            target = "NAYRO Alarm",
+                            parameters = mapOf(
+                                "hour" to hour.coerceIn(0, 23).toString(),
+                                "minutes" to "0",
+                                "message" to "NAYRO Alarm"
+                            ),
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
                     )
-                )
+                } else {
+                    val title = intent.searchQueryOrContent ?: "Reminder"
+                    actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.CREATE_REMINDER,
+                            target = title,
+                            parameters = mapOf("title" to title, "time" to "Tomorrow 09:00 AM"),
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                }
             }
 
             UserIntentType.NOTE_CREATE -> {

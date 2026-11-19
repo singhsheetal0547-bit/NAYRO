@@ -641,19 +641,80 @@ class AgentBrain(
             return actions
         }
 
-        // Unread WhatsApp messages ("WhatsApp par unread messages batao", "check unread WhatsApp messages")
-        if (lower.contains("whatsapp") && lower.contains("unread")) {
+        // Unread WhatsApp messages or Read-Receipt Verification ("WhatsApp par unread messages batao", "mujhe batao ki message read hua ya nahi")
+        if ((lower.contains("whatsapp") && lower.contains("unread")) ||
+            lower.contains("message read hua") ||
+            lower.contains("read hua ya nahi") ||
+            (lower.contains("message") && lower.contains("read") && (lower.contains("batao") || lower.contains("check")))
+        ) {
+            val isReadReceiptCheck = lower.contains("read hua") || (lower.contains("read") && !lower.contains("unread"))
+            val targetMode = if (isReadReceiptCheck) "read_status" else "unread"
             actions.add(
                 AgentAction(
                     taskId = taskId,
                     actionType = ActionType.WHATSAPP_READ_CONVERSATION,
-                    target = "unread",
+                    target = targetMode,
                     parameters = mapOf(
-                        "query" to "unread",
-                        "unreadOnly" to "true"
+                        "query" to targetMode,
+                        "unreadOnly" to (!isReadReceiptCheck).toString(),
+                        "checkReadReceipt" to isReadReceiptCheck.toString()
                     ),
                     riskLevel = RiskLevel.R0_LOCAL_READONLY,
                     idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+
+        // Ordinal Screen Option Selection (Section 3 & Section 6: "Is screen par teesra option open karo", "Is screen par teesra option select karo", "Pehla option click karo")
+        val ordinalIndex: Int? = when {
+            Regex("(?i)\\b(pehla|pehle|first|1st)\\b").containsMatchIn(lower) && (lower.contains("option") || lower.contains("item") || lower.contains("result")) -> 1
+            Regex("(?i)\\b(dusra|dusre|doosra|second|2nd)\\b").containsMatchIn(lower) && (lower.contains("option") || lower.contains("item") || lower.contains("result")) -> 2
+            Regex("(?i)\\b(teesra|teesre|tisra|third|3rd)\\b").containsMatchIn(lower) && (lower.contains("option") || lower.contains("item") || lower.contains("result")) -> 3
+            Regex("(?i)\\b(chautha|chauthe|fourth|4th)\\b").containsMatchIn(lower) && (lower.contains("option") || lower.contains("item") || lower.contains("result")) -> 4
+            else -> null
+        }
+        if (ordinalIndex != null && (lower.contains("open") || lower.contains("select") || lower.contains("click") || lower.contains("tap") || lower.contains("kholo") || lower.contains("karo") || lower.contains("dabao"))) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.CLICK_ELEMENT,
+                    target = "ordinal:$ordinalIndex",
+                    parameters = mapOf(
+                        "target" to "ordinal:$ordinalIndex",
+                        "ordinalIndex" to ordinalIndex.toString()
+                    ),
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+
+        // Form / Search Box Input (Section 6: "Search box mein NAYRO likho", "Type NAYRO in the search box")
+        val hindiFormFillMatch = Regex("(?i)^(?:([a-zA-Z0-9_\\s]+?)\\s+(?:box|field|input)\\s+mein\\s+)(.+?)\\s+(?:likho|likh\\s+do|type\\s+karo|daalo)\\.?$").find(instruction.trim())
+        val engFormFillMatch = Regex("(?i)^(?:type|enter|write)\\s+(.+?)\\s+(?:in|into)\\s+(?:the\\s+)?([a-zA-Z0-9_\\s]+?)\\s+(?:box|field|input)\\.?$").find(instruction.trim())
+        if (hindiFormFillMatch != null || engFormFillMatch != null) {
+            val fieldTarget = hindiFormFillMatch?.groupValues?.getOrNull(1)?.trim()
+                ?: engFormFillMatch?.groupValues?.getOrNull(2)?.trim()
+                ?: "Search"
+            val textToType = hindiFormFillMatch?.groupValues?.getOrNull(2)?.trim()
+                ?: engFormFillMatch?.groupValues?.getOrNull(1)?.trim()
+                ?: ""
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.SET_TEXT,
+                    target = fieldTarget,
+                    parameters = mapOf(
+                        "target" to fieldTarget,
+                        "text" to textToType,
+                        "query" to textToType
+                    ),
+                    requiredCapability = com.example.core.capability.CapabilityId.ACCESSIBILITY,
+                    riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
                 )
             )
             return actions
@@ -930,7 +991,51 @@ class AgentBrain(
             )
         }
 
+        // Google Maps & Navigation Workflows ("Navigate to Connaught Place", "Google Maps par Airport ka rasta dikhao")
+        val mapsNavRegex = Regex(
+            "(?i)(?:navigate\\s+to|directions\\s+to|route\\s+to|google\\s+maps\\s+par)\\s+(.+?)(?:\\s+(?:on\\s+google\\s+maps|ka\\s+rasta\\s+dikhao|ka\\s+route\\s+dikhao|chalo|dikhao))?$"
+        )
+        val mapsMatch = mapsNavRegex.find(instruction.trim())
+        if (mapsMatch != null) {
+            val dest = mapsMatch.groupValues[1]
+                .replace(Regex("(?i)\\s+(?:ka\\s+rasta|ka\\s+route|on\\s+google\\s+maps|in\\s+google\\s+maps).*$"), "")
+                .trim()
+            if (dest.isNotEmpty()) {
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.LAUNCH_APP,
+                        target = "Google Maps",
+                        parameters = mapOf(
+                            "appName" to "Google Maps",
+                            "navigationDestination" to dest
+                        ),
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+                return actions
+            }
+        }
+
         return actions
+    }
+
+    /**
+     * Prevents infinite loops or repeated identical tool calls in iterative execution (Section 1).
+     */
+    fun hasRepeatedToolCallLoop(
+        history: List<AgentAction>,
+        candidate: AgentAction,
+        maxConsecutiveRepeats: Int = 2
+    ): Boolean {
+        if (history.size < maxConsecutiveRepeats) return false
+        val recent = history.takeLast(maxConsecutiveRepeats)
+        return recent.all { prev ->
+            prev.actionType == candidate.actionType &&
+                (prev.target ?: "").equals(candidate.target ?: "", ignoreCase = true) &&
+                prev.parameters == candidate.parameters
+        }
     }
 
     /**
@@ -951,6 +1056,7 @@ class AgentBrain(
     ): BrainExecutionOutcome {
         isCancelled = false
         val steps = mutableListOf<BrainReasoningStep>()
+        val executedHistory = mutableListOf<AgentAction>()
         _reasoningTrace.value = emptyList()
 
         if (task.actions.isEmpty()) {
@@ -981,6 +1087,24 @@ class AgentBrain(
                     lastStatus = VerificationStatus.CANCELLED
                     break
                 }
+
+                if (hasRepeatedToolCallLoop(executedHistory, rawAction, maxConsecutiveRepeats = 2)) {
+                    lastStatus = VerificationStatus.FAILED
+                    steps.add(
+                        BrainReasoningStep(
+                            stepIndex = index + 1,
+                            thought = "Aborted repeated identical tool call loop for ${rawAction.actionType.name}",
+                            selectedAction = rawAction.actionType,
+                            target = rawAction.target,
+                            executionOutput = "Aborted repeated identical tool call (${rawAction.actionType.name}) to prevent an infinite loop.",
+                            verificationStatus = VerificationStatus.FAILED,
+                            isComplete = false
+                        )
+                    )
+                    _reasoningTrace.value = steps.toList()
+                    break
+                }
+                executedHistory.add(rawAction)
 
                 task.currentActionIndex = index
                 // Inject previous step outputs into action parameters if referenced

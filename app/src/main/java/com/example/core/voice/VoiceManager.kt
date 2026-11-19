@@ -40,6 +40,7 @@ import java.util.Locale
 class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitListener {
 
     val wakeWordEngine = LocalWakeWordEngine(context)
+    val speechRecognitionProvider = AndroidSpeechRecognitionProvider(context)
 
     var isDestroyed: Boolean = false
         private set
@@ -53,6 +54,11 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
     private val _transcribedText = MutableStateFlow("")
     val transcribedText: StateFlow<String> = _transcribedText.asStateFlow()
 
+    val partialTranscript: StateFlow<String> = speechRecognitionProvider.partialTranscript
+    val normalizedAudioLevel: StateFlow<Float> = speechRecognitionProvider.normalizedAudioLevel
+    val rmsDb: StateFlow<Float> = speechRecognitionProvider.rmsDb
+    val lastRecognitionResult: StateFlow<SpeechRecognitionResult?> = speechRecognitionProvider.lastResult
+
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
@@ -64,7 +70,6 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
 
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
-    private var speechRecognizer: SpeechRecognizer? = null
     private val mainHandler: Handler? = try {
         val looper = Looper.getMainLooper()
         if (looper != null) Handler(looper) else null
@@ -229,9 +234,62 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
 
     fun hasActiveUiListener(): Boolean = uiResultListener != null || onSpeechRecognized != null
 
+    @Volatile
+    private var lastDispatchedVoiceTranscript: String = ""
+
+    @Volatile
+    private var lastDispatchedVoiceTimestampMs: Long = 0L
+
+    /**
+     * Section 4 — Normalizes raw ASR transcript by trimming, collapsing whitespace, and removing trailing filler punctuation.
+     */
+    fun normalizeTranscript(rawText: String): String {
+        return rawText
+            .trim()
+            .replace(Regex("\\s+"), " ")
+    }
+
+    /**
+     * Section 4 — Prevents duplicate voice command execution if SpeechRecognizer emits identical final results within a short window.
+     */
+    @Synchronized
+    fun isDuplicateVoiceCommand(
+        transcript: String,
+        nowMs: Long = System.currentTimeMillis(),
+        dedupWindowMs: Long = 2_000L
+    ): Boolean {
+        val norm = normalizeTranscript(transcript).lowercase()
+        if (norm.isEmpty()) return false
+        val isDup = norm == lastDispatchedVoiceTranscript && (nowMs - lastDispatchedVoiceTimestampMs) in 0 until dedupWindowMs
+        if (!isDup) {
+            lastDispatchedVoiceTranscript = norm
+            lastDispatchedVoiceTimestampMs = nowMs
+        }
+        return isDup
+    }
+
+    fun resetVoiceCommandDeduplication() {
+        lastDispatchedVoiceTranscript = ""
+        lastDispatchedVoiceTimestampMs = 0L
+    }
+
+    /**
+     * Section 4 — Configures recognition and TTS language tag (e.g., "hi-IN", "en-IN", "en-US").
+     */
+    fun setRecognitionLanguage(languageTag: String) {
+        val cleanTag = languageTag.trim().ifEmpty { "en-IN" }
+        _configuration.value = _configuration.value.copy(languageTag = cleanTag)
+        if (isTtsReady) {
+            try {
+                tts?.language = Locale.forLanguageTag(cleanTag)
+            } catch (_: Throwable) {}
+        }
+    }
+
     fun dispatchRecognizedSpeech(text: String) {
-        val clean = text.trim()
+        val clean = normalizeTranscript(text)
         if (clean.isEmpty()) return
+        if (isDuplicateVoiceCommand(clean)) return
         _transcribedText.value = clean
         val uiTarget = uiResultListener ?: onSpeechRecognized
         if (uiTarget != null) {
@@ -241,10 +299,29 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
         }
     }
 
+    fun updateAssistantIdentity(assistantName: String) {
+        val cleanName = assistantName.trim().ifEmpty { "Babu" }
+        val configuredPhrases = wakeWordEngine.configureWakePhrasesForAssistantName(cleanName)
+        _configuration.value = _configuration.value.copy(
+            assistantName = cleanName,
+            wakePhrase = "Hey $cleanName",
+            wakePhrases = configuredPhrases.keys.toList()
+        )
+    }
+
     fun updateConfiguration(newConfig: VoiceConfiguration) {
         _configuration.value = newConfig
         wakeWordEngine.setSensitivity(newConfig.sensitivity)
-        listOf(newConfig.wakePhrase, "Hey Babu", "Hi Babu", "Hey Cutie", "Hi Nayro")
+        wakeWordEngine.configureWakePhrasesForAssistantName(newConfig.assistantName)
+        listOf(
+            newConfig.wakePhrase,
+            "Hi ${newConfig.assistantName}",
+            "Hey ${newConfig.assistantName}",
+            "Hey Babu",
+            "Hi Babu",
+            "Hey Cutie",
+            "Hi Nayro"
+        )
             .distinct()
             .forEach { wakeWordEngine.addWakePhrase(it) }
 
@@ -342,13 +419,7 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
         // Ensure wake-word AudioRecord is released before SpeechRecognizer acquires the mic
         wakeWordEngine.pauseForAsr()
 
-        val ctx = context ?: run {
-            _audioSessionOwner.value = AudioSessionOwner.NONE
-            _voiceState.value = VoiceState.ERROR
-            return
-        }
-
-        if (!SpeechRecognizer.isRecognitionAvailable(ctx)) {
+        if (!speechRecognitionProvider.isRecognitionAvailable()) {
             _audioSessionOwner.value = AudioSessionOwner.NONE
             _voiceState.value = VoiceState.ERROR
             val msg = "Speech recognition service is not available on this device."
@@ -359,122 +430,76 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
 
         requestTransientAudioFocus()
 
-        postToMain {
-            try {
-                speechRecognizer?.destroy()
-                speechRecognizer = if (_configuration.value.preferOfflineSpeechRecognition &&
-                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                    SpeechRecognizer.isOnDeviceRecognitionAvailable(ctx)
-                ) {
-                    SpeechRecognizer.createOnDeviceSpeechRecognizer(ctx)
+        speechRecognitionProvider.startListening(
+            languageTag = _configuration.value.languageTag,
+            preferOffline = _configuration.value.preferOfflineSpeechRecognition && isOfflineSpeechRecognitionSupported(),
+            onReady = {
+                _audioSessionOwner.value = AudioSessionOwner.SPEECH_RECOGNIZER
+                _voiceState.value = if (isFollowUpTurn) {
+                    VoiceState.FOLLOW_UP_LISTENING
                 } else {
-                    SpeechRecognizer.createSpeechRecognizer(ctx)
+                    VoiceState.LISTENING
                 }
-
-                speechRecognizer?.setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) {
-                        _audioSessionOwner.value = AudioSessionOwner.SPEECH_RECOGNIZER
-                        _voiceState.value = if (isFollowUpTurn) {
-                            VoiceState.FOLLOW_UP_LISTENING
-                        } else {
-                            VoiceState.LISTENING
-                        }
-                        if (isFollowUpTurn) {
-                            scheduleFollowUpTimeout()
-                        }
-                    }
-
-                    override fun onBeginningOfSpeech() {
-                        cancelFollowUpTimeout()
-                        _voiceState.value = VoiceState.LISTENING
-                    }
-
-                    override fun onRmsChanged(rmsdB: Float) {}
-                    override fun onBufferReceived(buffer: ByteArray?) {}
-
-                    override fun onEndOfSpeech() {
-                        cancelFollowUpTimeout()
-                        _voiceState.value = VoiceState.TRANSCRIBING
-                    }
-
-                    override fun onError(error: Int) {
-                        cancelFollowUpTimeout()
-                        abandonTransientAudioFocus()
-                        _audioSessionOwner.value = AudioSessionOwner.NONE
-
-                        // If silence/timeout occurred during a follow-up window, gracefully return to standby
-                        if (isFollowUpTurn && (error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_NO_MATCH)) {
-                            _isFollowUpSessionActive.value = false
-                            returnToStandbyOrIdle()
-                            return
-                        }
-
-                        val errText = mapSpeechError(error)
-                        _errorMessage.value = errText
-                        _voiceState.value = VoiceState.ERROR
-                        onSpeechError?.invoke(errText)
-                        returnToStandbyOrIdle()
-                    }
-
-                    override fun onResults(results: Bundle?) {
-                        cancelFollowUpTimeout()
-                        abandonTransientAudioFocus()
-                        _audioSessionOwner.value = AudioSessionOwner.NONE
-
-                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        val text = matches?.firstOrNull().orEmpty().trim()
-                        _transcribedText.value = text
-
-                        if (text.isNotBlank()) {
-                            if (wakeWordEngine.isVoiceExitCommand(text) || isConversationExitPhrase(text)) {
-                                _isFollowUpSessionActive.value = false
-                                onVoiceExitCommand?.invoke()
-                                returnToStandbyOrIdle()
-                                return
-                            }
-                            _voiceState.value = VoiceState.THINKING
-                            if (_configuration.value.isContinuousConversationEnabled) {
-                                _isFollowUpSessionActive.value = true
-                            }
-                            val callback = onResultCallback ?: onSpeechRecognized ?: serviceResultListener
-                            callback?.invoke(text)
-                        } else {
-                            _isFollowUpSessionActive.value = false
-                            returnToStandbyOrIdle()
-                        }
-                    }
-
-                    override fun onPartialResults(partialResults: Bundle?) {
-                        val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                        if (!partial.isNullOrBlank()) {
-                            _transcribedText.value = partial
-                        }
-                    }
-
-                    override fun onEvent(eventType: Int, params: Bundle?) {}
-                })
-
-                val recognizerIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, _configuration.value.languageTag)
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-                    if (_configuration.value.preferOfflineSpeechRecognition && isOfflineSpeechRecognitionSupported()) {
-                        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                    }
+                if (isFollowUpTurn) {
+                    scheduleFollowUpTimeout()
                 }
-
-                speechRecognizer?.startListening(recognizerIntent)
-            } catch (e: Exception) {
+            },
+            onBeginningOfSpeech = {
+                cancelFollowUpTimeout()
+                _voiceState.value = VoiceState.LISTENING
+            },
+            onPartialText = { partial ->
+                if (partial.isNotBlank()) {
+                    _transcribedText.value = partial
+                }
+            },
+            onEndOfSpeech = {
+                cancelFollowUpTimeout()
+                _voiceState.value = VoiceState.TRANSCRIBING
+            },
+            onFinalResult = { result ->
+                cancelFollowUpTimeout()
                 abandonTransientAudioFocus()
                 _audioSessionOwner.value = AudioSessionOwner.NONE
-                val errMsg = "Failed to start speech recognizer: ${e.localizedMessage}"
-                _errorMessage.value = errMsg
+
+                val text = result.primaryText.trim()
+                _transcribedText.value = text
+
+                if (text.isNotBlank()) {
+                    if (wakeWordEngine.isVoiceExitCommand(text) || isConversationExitPhrase(text)) {
+                        _isFollowUpSessionActive.value = false
+                        onVoiceExitCommand?.invoke()
+                        returnToStandbyOrIdle()
+                        return@startListening
+                    }
+                    _voiceState.value = VoiceState.THINKING
+                    if (_configuration.value.isContinuousConversationEnabled) {
+                        _isFollowUpSessionActive.value = true
+                    }
+                    val callback = onResultCallback ?: uiResultListener ?: onSpeechRecognized ?: serviceResultListener
+                    callback?.invoke(text)
+                } else {
+                    _isFollowUpSessionActive.value = false
+                    returnToStandbyOrIdle()
+                }
+            },
+            onError = { errorCode, errText ->
+                cancelFollowUpTimeout()
+                abandonTransientAudioFocus()
+                _audioSessionOwner.value = AudioSessionOwner.NONE
+
+                if (isFollowUpTurn && (errorCode == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || errorCode == SpeechRecognizer.ERROR_NO_MATCH)) {
+                    _isFollowUpSessionActive.value = false
+                    returnToStandbyOrIdle()
+                    return@startListening
+                }
+
+                _errorMessage.value = errText
                 _voiceState.value = VoiceState.ERROR
-                onSpeechError?.invoke(errMsg)
+                (uiErrorListener ?: onSpeechError)?.invoke(errText)
                 returnToStandbyOrIdle()
             }
-        }
+        )
     }
 
     fun markAgentThinking() {
@@ -503,9 +528,7 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
 
         // Ensure microphone is not capturing while Babu speaks
         cancelFollowUpTimeout()
-        try {
-            speechRecognizer?.cancel()
-        } catch (_: Exception) {}
+        speechRecognitionProvider.cancel()
         wakeWordEngine.pauseForAsr()
         requestTransientAudioFocus()
 
@@ -562,15 +585,11 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
     fun stopListening() {
         cancelFollowUpTimeout()
         _isFollowUpSessionActive.value = false
-        postToMain {
-            try {
-                speechRecognizer?.stopListening()
-                speechRecognizer?.cancel()
-            } catch (_: Exception) {}
-            abandonTransientAudioFocus()
-            _audioSessionOwner.value = AudioSessionOwner.NONE
-            returnToStandbyOrIdle()
-        }
+        speechRecognitionProvider.stopListening()
+        speechRecognitionProvider.cancel()
+        abandonTransientAudioFocus()
+        _audioSessionOwner.value = AudioSessionOwner.NONE
+        returnToStandbyOrIdle()
     }
 
     fun stopSpeaking() {
@@ -597,9 +616,7 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
     fun onExternalAudioInterruption(reason: String = "External audio interruption") {
         cancelFollowUpTimeout()
         _isFollowUpSessionActive.value = false
-        try {
-            speechRecognizer?.cancel()
-        } catch (_: Exception) {}
+        speechRecognitionProvider.cancel()
         try {
             tts?.stop()
         } catch (_: Exception) {}
@@ -806,11 +823,7 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
         cancelFollowUpTimeout()
         _isFollowUpSessionActive.value = false
         abandonTransientAudioFocus()
-        try {
-            speechRecognizer?.cancel()
-            speechRecognizer?.destroy()
-        } catch (_: Exception) {}
-        speechRecognizer = null
+        speechRecognitionProvider.release()
         try {
             tts?.stop()
         } catch (_: Exception) {}
@@ -832,10 +845,7 @@ class VoiceManager(private val context: Context? = null) : TextToSpeech.OnInitLi
         _isFollowUpSessionActive.value = false
         wakeWordEngine.stopListening()
         abandonTransientAudioFocus()
-        try {
-            speechRecognizer?.destroy()
-        } catch (_: Exception) {}
-        speechRecognizer = null
+        speechRecognitionProvider.release()
         try {
             tts?.stop()
             tts?.shutdown()

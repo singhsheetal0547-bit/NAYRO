@@ -76,6 +76,55 @@ class NayroAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Reads and parses the current live UI tree into an immutable [com.example.core.screen.ScreenSnapshot]
+     * containing visible text labels and interactive elements (buttons, text fields, scrollable containers).
+     */
+    fun readCurrentUiTree(): com.example.core.screen.ScreenSnapshot? {
+        val rootNode = getSafeRootInActiveWindow() ?: return null
+        val tree = com.example.core.screen.AccessibilityTreeReader.readTree(rootNode)
+        val texts = com.example.core.screen.AccessibilityTreeReader.flattenAllTexts(tree)
+        val interactive = com.example.core.screen.AccessibilityTreeReader.extractInteractiveElements(tree)
+        return com.example.core.screen.ScreenSnapshot(
+            packageName = rootNode.packageName?.toString() ?: AccessibilityConnectionManager.lastActivePackage.value,
+            visibleTexts = texts,
+            interactiveElements = interactive,
+            totalNodeCount = texts.size + interactive.size
+        )
+    }
+
+    /**
+     * Performs a semantic node tap (or coordinate fallback tap) on a UI element matching [targetText] or [viewId].
+     */
+    suspend fun performTapOnTarget(targetText: String? = null, viewId: String? = null): Boolean {
+        return AccessibilityActionController.performClickWithCoordinateFallback(
+            targetText = targetText,
+            viewId = viewId
+        )
+    }
+
+    /**
+     * Performs a scroll interaction (forward or backward) on the active scrollable container in the UI tree.
+     */
+    fun performScroll(forward: Boolean = true, viewId: String? = null): Boolean {
+        return if (forward) {
+            AccessibilityActionController.performScrollForward(viewId)
+        } else {
+            AccessibilityActionController.performScrollBackward(viewId)
+        }
+    }
+
+    /**
+     * Enters text into an editable field in the active UI tree.
+     */
+    fun performSetTextInField(text: String, viewId: String? = null, targetText: String? = null): Boolean {
+        return AccessibilityActionController.performSetText(
+            text = text,
+            viewId = viewId,
+            targetText = targetText
+        )
+    }
+
+    /**
      * Captures a real screenshot using Android 11+ (API 30+) AccessibilityService.takeScreenshot.
      * Never returns a fake success string when screenshot capture is unsupported or fails.
      */
