@@ -73,6 +73,7 @@ enum class ActionType {
     NAVIGATE_BACK,
     NAVIGATE_HOME,
     TAKE_SCREENSHOT,
+    MANAGE_SCREEN_RECORDING,
     INTERACT_COORDINATES,
     ANALYZE_IMAGE_VISION,
     CONTROL_MEDIA,
@@ -89,6 +90,9 @@ enum class ActionType {
     SAVE_CONTACT,
     MAKE_PHONE_CALL,
     OPEN_PHONE_DIALER,
+    COMPOSE_EMAIL,
+    READ_EMAIL_NOTIFICATIONS,
+    CHECK_COMMUNICATION_SPAM,
     READ_NOTIFICATIONS,
     SUMMARIZE_NOTIFICATIONS,
     CLASSIFY_NOTIFICATIONS,
@@ -278,6 +282,8 @@ object ConfirmationSchemaBuilder {
             ActionType.MESSAGE_DRAFT_SEND,
             ActionType.ASK_USER_CONFIRMATION -> "Confirm WhatsApp Message"
             ActionType.MANAGE_CALL -> "Confirm Call Control"
+            ActionType.COMPOSE_EMAIL -> "Confirm Email Composer"
+            ActionType.MANAGE_SCREEN_RECORDING -> "Confirm Screen Recording"
             ActionType.SAVE_CONTACT -> "Confirm New Contact"
             ActionType.DELETE_NOTE -> "Confirm Note Deletion"
             ActionType.DELETE_CALENDAR_EVENT -> "Confirm Calendar Event Deletion"
@@ -432,6 +438,7 @@ fun ActionType.toUserFriendlyDescription(
         ActionType.NAVIGATE_BACK -> "Navigating back..."
         ActionType.NAVIGATE_HOME -> "Returning to Home screen..."
         ActionType.TAKE_SCREENSHOT -> "Capturing screen snapshot..."
+        ActionType.MANAGE_SCREEN_RECORDING -> "Managing screen recording (${parameters["operation"] ?: target ?: "status"})..."
         ActionType.INTERACT_COORDINATES -> "Interacting with screen coordinates..."
         ActionType.ANALYZE_IMAGE_VISION -> "Analyzing screen image..."
         ActionType.CONTROL_MEDIA -> "Controlling media playback (${parameters["operation"] ?: target ?: "play"})..."
@@ -450,6 +457,9 @@ fun ActionType.toUserFriendlyDescription(
         ActionType.SAVE_CONTACT -> "Saving contact ${parameters["name"] ?: target ?: ""}...".trim()
         ActionType.MAKE_PHONE_CALL -> "Placing phone call${if (recipient != null) " to $recipient" else ""}..."
         ActionType.OPEN_PHONE_DIALER -> "Opening phone dialer${if (recipient != null || target != null) " for ${recipient ?: target}" else ""}..."
+        ActionType.COMPOSE_EMAIL -> "Preparing email draft${if (recipient != null) " for $recipient" else ""}..."
+        ActionType.READ_EMAIL_NOTIFICATIONS -> "Checking recent email notifications..."
+        ActionType.CHECK_COMMUNICATION_SPAM -> "Checking calls & messages for spam or phishing risk..."
         ActionType.READ_NOTIFICATIONS -> "Reading active notifications..."
         ActionType.SUMMARIZE_NOTIFICATIONS -> "Summarizing your recent notifications..."
         ActionType.CLASSIFY_NOTIFICATIONS -> "Organizing notifications by priority..."

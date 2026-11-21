@@ -14,7 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
@@ -26,6 +26,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -35,39 +36,62 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.core.provider.ProviderConfig
+import com.example.core.voice.SpeechRecognitionEngineType
+import com.example.core.voice.VoiceProviderStatus
+import com.example.core.voice.engine.WakeCalibrationTestResult
+import com.example.core.voice.engine.WakePhraseSupportStatus
 import com.example.ui.components.StatusBadge
 import com.example.ui.theme.Coral
 import com.example.ui.theme.DarkSurfaceVariant
+import com.example.ui.theme.ErrorRed
 import com.example.ui.theme.ForestGreen
 import com.example.ui.theme.SoftSage
 import com.example.ui.theme.SuccessGreen
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
-    assistantName: String = "Babu",
+    assistantName: String = "NAYRO",
     isWakeEnabled: Boolean = false,
     providers: List<ProviderConfig> = emptyList(),
     activeProviderId: String? = null,
     onSaveAssistantName: (String) -> Unit = {},
     onAddCustomWakePhrase: (String) -> Unit = {},
     onSaveApiKey: (String, String) -> Unit = { _, _ -> },
+    onDeleteApiKey: (String) -> Unit = {},
+    onSelectPrimaryProvider: (String) -> Unit = {},
     onSaveCustomProvider: (String, String, String, String) -> Unit = { _, _, _, _ -> },
     onToggleWake: (Boolean) -> Unit = {},
     onTestProvider: (String) -> Unit = {},
     wakeSensitivity: Float = 0.72f,
     onWakeSensitivityChange: (Float) -> Unit = {},
-    onEnrollWakePhrase: (String) -> Unit = {}
+    onEnrollWakePhrase: (String) -> Unit = {},
+    configuredWakePhrases: List<String> = emptyList(),
+    backgroundListeningStatus: String = "",
+    onRemoveWakePhrase: (String) -> Unit = {},
+    onEnrollWakePhraseAsync: (suspend (String) -> Pair<Boolean, String>)? = null,
+    onTestWakePhraseAsync: (suspend (String) -> WakeCalibrationTestResult)? = null,
+    voiceProviderStatus: VoiceProviderStatus = VoiceProviderStatus(),
+    onSelectSttEngine: (SpeechRecognitionEngineType) -> Unit = {},
+    onSaveDeepgramKey: (String) -> Unit = {},
+    onDeleteDeepgramKey: () -> Unit = {},
+    onTestDeepgramConnection: (suspend () -> Pair<Boolean, String>)? = null,
+    providerTestStatusMessage: String = ""
 ) {
     val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
 
     var assistantNameDraft by remember(assistantName) { mutableStateOf(assistantName) }
     var customWakePhraseDraft by remember { mutableStateOf("") }
@@ -75,15 +99,23 @@ fun SettingsScreen(
     var openaiKeyInput by remember { mutableStateOf("") }
     var grokKeyInput by remember { mutableStateOf("") }
     var deepseekKeyInput by remember { mutableStateOf("") }
+    var deepgramKeyInput by remember { mutableStateOf("") }
+    var deepgramStatusNote by remember { mutableStateOf("") }
     var customBaseUrl by remember { mutableStateOf("") }
     var customModelId by remember { mutableStateOf("") }
     var customApiKey by remember { mutableStateOf("") }
     var selectedSensitivity by remember(wakeSensitivity) { mutableStateOf(wakeSensitivity) }
     var enrolledSamplesStatus by remember { mutableStateOf("") }
+    var isRecordingWakeSample by remember { mutableStateOf(false) }
+    var enrollmentRefreshTick by remember { mutableIntStateOf(0) }
 
-    val dynamicWakePhrases = remember(assistantName) {
-        val clean = assistantName.trim().ifEmpty { "Babu" }
-        listOf("Hi $clean", "Hey $clean", "Hi Nayro").distinct()
+    val dynamicWakePhrases = remember(assistantName, configuredWakePhrases, enrollmentRefreshTick) {
+        if (configuredWakePhrases.isNotEmpty()) {
+            configuredWakePhrases.distinctBy { it.lowercase() }
+        } else {
+            val clean = assistantName.trim().ifEmpty { "NAYRO" }
+            listOf("Hi $clean", "Hey $clean", "Hi Nayro").distinctBy { it.lowercase() }
+        }
     }
 
     Column(
@@ -189,9 +221,18 @@ fun SettingsScreen(
             Column(modifier = Modifier.padding(16.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
-                        Text("On-Device Wake-Word Detection", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            "Listens for 'Hey $assistantName' locally on-device using 13-MFCC + Sakoe-Chiba DTW. Custom wake phrases require voice enrollment to activate acoustic DTW matching.",
+                            text = if (isWakeEnabled) {
+                                "Background Voice Listening: ON"
+                            } else {
+                                "Background Voice Listening: OFF"
+                            },
+                            style = MaterialTheme.typography.titleLarge
+                        )
+                        Text(
+                            text = backgroundListeningStatus.ifBlank {
+                                "Listens locally on-device using 13-MFCC + Sakoe-Chiba DTW. Custom wake phrases require real microphone voice enrollment to activate acoustic DTW matching."
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -226,26 +267,119 @@ fun SettingsScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Voice Sample Enrollment (Multi-Frame DTW)",
-                    style = MaterialTheme.typography.bodyMedium
+                    text = "Wake Phrases — Real Voice Enrollment (1.2s) & Live Calibration",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
                 )
                 Spacer(modifier = Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    dynamicWakePhrases.forEach { phrase ->
-                        OutlinedButton(
-                            onClick = {
-                                onEnrollWakePhrase(phrase)
-                                val quality = try {
-                                    com.example.NayroApplication.instance.voiceManager.wakeWordEngine.validateEnrollmentQuality(phrase)
-                                } catch (_: Exception) {
-                                    null
+
+                dynamicWakePhrases.forEach { phrase ->
+                    val engine = remember {
+                        try {
+                            com.example.NayroApplication.instance.voiceManager.wakeWordEngine
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                    val sampleCount = remember(phrase, enrollmentRefreshTick) {
+                        engine?.getEnrolledSampleCount(phrase) ?: 0
+                    }
+                    val supportStatus = remember(phrase, enrollmentRefreshTick) {
+                        engine?.getWakePhraseSupportStatus(phrase) ?: WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT
+                    }
+                    val statusLabel = when {
+                        sampleCount > 0 -> "Enrolled ($sampleCount/5)"
+                        supportStatus == WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE -> "Bundled (Enroll for accuracy)"
+                        else -> "Needs Enrollment"
+                    }
+
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "\"$phrase\"",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = statusLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (sampleCount > 0) SuccessGreen else Coral
+                                    )
                                 }
-                                enrolledSamplesStatus = quality?.qualitySummary
-                                    ?: "Enrolled voice template for '$phrase'"
-                            },
-                            modifier = Modifier.testTag("enroll_wake_${phrase.lowercase().replace(" ", "_")}")
-                        ) {
-                            Text(phrase, style = MaterialTheme.typography.bodySmall)
+                                if (dynamicWakePhrases.size > 1) {
+                                    IconButton(
+                                        onClick = {
+                                            onRemoveWakePhrase(phrase)
+                                            enrollmentRefreshTick++
+                                            enrolledSamplesStatus = "Removed wake phrase '$phrase'."
+                                        },
+                                        modifier = Modifier.testTag("remove_wake_${phrase.lowercase().replace(" ", "_")}")
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Delete,
+                                            contentDescription = "Remove wake phrase $phrase",
+                                            tint = Coral
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    enabled = !isRecordingWakeSample,
+                                    onClick = {
+                                        if (onEnrollWakePhraseAsync != null) {
+                                            isRecordingWakeSample = true
+                                            enrolledSamplesStatus = "Listening (1.2s)... Speak '$phrase' clearly now."
+                                            scope.launch {
+                                                val (_, msg) = onEnrollWakePhraseAsync(phrase)
+                                                enrolledSamplesStatus = msg
+                                                enrollmentRefreshTick++
+                                                isRecordingWakeSample = false
+                                            }
+                                        } else {
+                                            onEnrollWakePhrase(phrase)
+                                            enrollmentRefreshTick++
+                                            enrolledSamplesStatus = engine?.validateEnrollmentQuality(phrase)?.qualitySummary
+                                                ?: "Enrolled voice template for '$phrase'"
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("enroll_wake_${phrase.lowercase().replace(" ", "_")}")
+                                ) {
+                                    Text(if (isRecordingWakeSample) "Recording..." else "Enroll (1.2s)", style = MaterialTheme.typography.bodySmall)
+                                }
+                                OutlinedButton(
+                                    enabled = !isRecordingWakeSample,
+                                    onClick = {
+                                        if (onTestWakePhraseAsync != null) {
+                                            isRecordingWakeSample = true
+                                            enrolledSamplesStatus = "Testing (1.2s)... Speak '$phrase' now to calibrate."
+                                            scope.launch {
+                                                val result = onTestWakePhraseAsync(phrase)
+                                                enrolledSamplesStatus = result.diagnosticMessage
+                                                isRecordingWakeSample = false
+                                            }
+                                        } else {
+                                            enrolledSamplesStatus = "Live microphone calibration requires Android device audio."
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("test_wake_${phrase.lowercase().replace(" ", "_")}")
+                                ) {
+                                    Text("Test / Calibrate", style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
                         }
                     }
                 }
@@ -325,16 +459,122 @@ fun SettingsScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // C. Multi-Provider AI Engine Setup
+        // C. Multi-Provider AI & Voice Architecture Setup
         SettingsGroup(
-            title = "C. Multi-Provider AI Architecture",
+            title = "C. Multi-Provider AI & Voice Providers",
             icon = Icons.Default.Key
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
-                    text = "Configure AI Provider API Keys (Hardware-Encrypted via Android KeyStore)",
+                    text = "Speech Recognition (STT) & Speech Output (TTS)",
                     style = MaterialTheme.typography.titleLarge
                 )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Active STT: ${voiceProviderStatus.effectiveSttEngine.displayName} • TTS: ${voiceProviderStatus.selectedTtsEngine.displayName}. Local wake-word detection stays 100% offline and independent of cloud APIs.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                voiceProviderStatus.fallbackActiveReason?.let { fallbackMsg ->
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = fallbackMsg,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Coral
+                    )
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SpeechRecognitionEngineType.entries.forEach { engineType ->
+                        val isSelected = voiceProviderStatus.selectedSttEngine == engineType
+                        if (isSelected) {
+                            Button(
+                                onClick = { onSelectSttEngine(engineType) },
+                                colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("stt_engine_${engineType.name.lowercase()}")
+                            ) {
+                                Text(
+                                    if (engineType == SpeechRecognitionEngineType.DEEPGRAM_CLOUD) "Deepgram STT" else "Android STT",
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                        } else {
+                            OutlinedButton(
+                                onClick = { onSelectSttEngine(engineType) },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("stt_engine_${engineType.name.lowercase()}")
+                            ) {
+                                Text(
+                                    if (engineType == SpeechRecognitionEngineType.DEEPGRAM_CLOUD) "Deepgram STT" else "Android STT",
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Deepgram Cloud STT API Key Card (Add / Edit / Delete / Test)
+                ProviderEntryCard(
+                    title = "Deepgram Cloud STT (Nova-2)",
+                    modelInfo = "Model: nova-2 • Automatic fallback to Android SpeechRecognizer if key missing or offline",
+                    hasKey = voiceProviderStatus.hasDeepgramKey,
+                    isActive = voiceProviderStatus.effectiveSttEngine == SpeechRecognitionEngineType.DEEPGRAM_CLOUD,
+                    inputValue = deepgramKeyInput,
+                    onInputChange = { deepgramKeyInput = it },
+                    label = "Deepgram API Key",
+                    onSave = {
+                        if (deepgramKeyInput.isNotBlank()) {
+                            onSaveDeepgramKey(deepgramKeyInput)
+                            deepgramKeyInput = ""
+                            deepgramStatusNote = "Deepgram API key securely saved in Android KeyStore."
+                        }
+                    },
+                    onDelete = {
+                        onDeleteDeepgramKey()
+                        deepgramStatusNote = "Deepgram API key deleted. Using Android SpeechRecognizer."
+                    },
+                    onTest = {
+                        if (onTestDeepgramConnection != null) {
+                            deepgramStatusNote = "Testing Deepgram API connection..."
+                            scope.launch {
+                                val (_, msg) = onTestDeepgramConnection()
+                                deepgramStatusNote = msg
+                            }
+                        }
+                    },
+                    testTag = "deepgram"
+                )
+                if (deepgramStatusNote.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = deepgramStatusNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SuccessGreen
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
+                    text = "AI Reasoning Providers (Hardware-Encrypted via Android KeyStore)",
+                    style = MaterialTheme.typography.titleLarge
+                )
+                if (providerTestStatusMessage.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = providerTestStatusMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SuccessGreen
+                    )
+                }
                 Spacer(modifier = Modifier.height(12.dp))
 
                 // Provider 1: Gemini
@@ -354,6 +594,8 @@ fun SettingsScreen(
                             geminiKeyInput = ""
                         }
                     },
+                    onDelete = { onDeleteApiKey("gemini_default") },
+                    onSelectPrimary = { onSelectPrimaryProvider("gemini_default") },
                     onTest = { onTestProvider("gemini_default") },
                     testTag = "gemini"
                 )
@@ -377,6 +619,8 @@ fun SettingsScreen(
                             openaiKeyInput = ""
                         }
                     },
+                    onDelete = { onDeleteApiKey("openai_custom") },
+                    onSelectPrimary = { onSelectPrimaryProvider("openai_custom") },
                     onTest = { onTestProvider("openai_custom") },
                     testTag = "openai"
                 )
@@ -400,6 +644,8 @@ fun SettingsScreen(
                             grokKeyInput = ""
                         }
                     },
+                    onDelete = { onDeleteApiKey("grok_custom") },
+                    onSelectPrimary = { onSelectPrimaryProvider("grok_custom") },
                     onTest = { onTestProvider("grok_custom") },
                     testTag = "grok"
                 )
@@ -423,6 +669,8 @@ fun SettingsScreen(
                             deepseekKeyInput = ""
                         }
                     },
+                    onDelete = { onDeleteApiKey("deepseek_custom") },
+                    onSelectPrimary = { onSelectPrimaryProvider("deepseek_custom") },
                     onTest = { onTestProvider("deepseek_custom") },
                     testTag = "deepseek"
                 )
@@ -526,7 +774,9 @@ fun ProviderEntryCard(
     label: String,
     onSave: () -> Unit,
     onTest: () -> Unit,
-    testTag: String
+    testTag: String,
+    onDelete: (() -> Unit)? = null,
+    onSelectPrimary: (() -> Unit)? = null
 ) {
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
@@ -555,7 +805,7 @@ fun ProviderEntryCard(
                 value = inputValue,
                 onValueChange = onInputChange,
                 label = { Text(label) },
-                placeholder = { Text(if (hasKey) "•••••••••••••••• (Key saved)" else "Enter API Key") },
+                placeholder = { Text(if (hasKey) "•••••••••••••••• (Key saved — enter new to update)" else "Enter API Key") },
                 modifier = Modifier.fillMaxWidth().testTag("input_$testTag"),
                 shape = RoundedCornerShape(10.dp),
                 colors = OutlinedTextFieldDefaults.colors(focusedBorderColor = ForestGreen)
@@ -565,8 +815,30 @@ fun ProviderEntryCard(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.End
+                horizontalArrangement = Arrangement.spacedBy(6.dp, Alignment.End),
+                verticalAlignment = Alignment.CenterVertically
             ) {
+                if (hasKey && onDelete != null) {
+                    OutlinedButton(
+                        onClick = onDelete,
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed),
+                        modifier = Modifier.testTag("delete_btn_$testTag")
+                    ) {
+                        Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete Key", tint = ErrorRed)
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Delete", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+
+                if (hasKey && !isActive && onSelectPrimary != null) {
+                    OutlinedButton(
+                        onClick = onSelectPrimary,
+                        modifier = Modifier.testTag("primary_btn_$testTag")
+                    ) {
+                        Text("Use Primary", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+
                 if (hasKey) {
                     OutlinedButton(
                         onClick = onTest,
@@ -574,9 +846,8 @@ fun ProviderEntryCard(
                     ) {
                         Icon(imageVector = Icons.Default.PlayArrow, contentDescription = "Test", tint = ForestGreen)
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Test API")
+                        Text("Test", style = MaterialTheme.typography.labelSmall)
                     }
-                    Spacer(modifier = Modifier.width(8.dp))
                 }
 
                 Button(
@@ -584,7 +855,7 @@ fun ProviderEntryCard(
                     colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
                     modifier = Modifier.testTag("save_btn_$testTag")
                 ) {
-                    Text("Save Key")
+                    Text(if (hasKey) "Update" else "Save Key", style = MaterialTheme.typography.labelSmall)
                 }
             }
         }

@@ -8,8 +8,11 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -25,7 +28,6 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
@@ -36,32 +38,43 @@ import com.example.R
 import com.example.core.agent.AgentState
 import com.example.core.agent.toUserFriendlyDescription
 import com.example.core.agent.toUserFriendlyIntentLabel
+import com.example.core.identity.AssistantIdentityProfile
+import com.example.core.identity.AssistantIdentityStore
 import com.example.core.service.ServiceLifecycleState
 import com.example.core.service.ServiceStateRepository
 import com.example.core.service.ServiceStatus
 import com.example.core.voice.VoiceState
 import com.example.data.local.entities.ConversationEntity
+import com.example.ui.components.VisualizerVisualState
+import com.example.ui.components.computeVisualizerBarHeights
+import com.example.ui.components.resolveVisualizerState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
 
 /**
- * System B — Andee-Style Floating Babu Agent Service.
- * Genuine WindowManager TYPE_APPLICATION_OVERLAY implementation connected directly
- * to the single unified AgentRuntime.
- * Supports:
- * - Draggable floating icon with automatic screen-edge snapping & position persistence
- * - Compact interactive overlay panel with live AgentState & Task progress synchronization
- * - In-overlay text input + Send execution without leaving the current app
- * - In-overlay Voice listen toggle connected to VoiceManager & AgentRuntime
- * - Inline Confirmation Approve / Reject controls for R2/R3 actions
- * - Quick Screen Read & Stop Task triggers, Minimize, Expand to Full App, and Hide Overlay
+ * Professional Floating NAYRO Agent Service (Section 6).
+ *
+ * Connects directly to the single application-scoped AgentRuntime, VoiceManager,
+ * AssistantIdentityStore, and BackgroundVoiceController — never creates a duplicate agent engine.
+ *
+ * Capabilities:
+ * - Compact draggable floating NAYRO icon with safe display inset clamping, edge snapping & persistence
+ * - Live state ring on the bubble reflecting active agent/voice state
+ * - Expandable/collapsible compact conversation overlay
+ * - Real-time audio-reactive waveform driven by actual SpeechRecognizer / WakeEngine RMS telemetry
+ * - Direct voice interaction via isolated floating listener (never clobbers MainActivity listener)
+ * - Inline pending confirmation Approve/Reject controls
+ * - Immediate Stop (cancels active task, listening, and TTS)
+ * - Direct Background Listening ON/OFF toggle right inside the floating panel
  */
 class NayroFloatingService : Service() {
 
@@ -121,18 +134,23 @@ class NayroFloatingService : Service() {
     private lateinit var windowManager: WindowManager
     private lateinit var prefs: FloatingAssistantPreferences
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private var stateCollectorJob: Job? = null
+    private var bubbleObserverJob: Job? = null
+    private var panelCollectorJob: Job? = null
 
     // Views
     private var bubbleRootView: FrameLayout? = null
+    private var bubbleInnerCircle: FrameLayout? = null
+    private var bubbleInitialText: TextView? = null
     private var panelRootView: FrameLayout? = null
 
     // Dynamic UI elements inside the open panel
     private var stateBadgeView: TextView? = null
     private var responsePreviewView: TextView? = null
+    private var waveformView: FloatingAudioWaveformView? = null
     private var confirmationContainer: LinearLayout? = null
     private var confirmationTextView: TextView? = null
     private var voiceBtnView: Button? = null
+    private var bgListeningToggleBtn: Button? = null
 
     // Layout Params
     private lateinit var bubbleParams: WindowManager.LayoutParams
@@ -145,6 +163,25 @@ class NayroFloatingService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         prefs = FloatingAssistantPreferences(this)
         createNotificationChannel()
+    }
+
+    private fun resolveAssistantName(): String {
+        return AssistantIdentityStore.sharedInstance?.getDisplayName()?.takeIf { it.isNotBlank() }
+            ?: try {
+                NayroApplication.instance.assistantIdentityStore.getDisplayName()
+            } catch (_: Exception) {
+                AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
+            }
+    }
+
+    private fun getSafeTopInsetPx(): Int {
+        val resId = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (resId > 0) resources.getDimensionPixelSize(resId) else dp(28)
+    }
+
+    private fun getSafeBottomInsetPx(): Int {
+        val resId = resources.getIdentifier("navigation_bar_height", "dimen", "android")
+        return if (resId > 0) resources.getDimensionPixelSize(resId) else dp(28)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -168,21 +205,13 @@ class NayroFloatingService : Service() {
         }
 
         try {
-            val notification = createNotification()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-                )
-            } else {
-                startForeground(NOTIFICATION_ID, notification)
-            }
+            promoteForegroundWithSafeType()
 
             val windowAdded = initBubbleView()
             if (windowAdded) {
                 prefs.setFloatingEnabled(true)
                 ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.RUNNING)
+                startObservingBubbleState()
             } else {
                 ServiceStateRepository.updateFloatingStatus(
                     ServiceLifecycleState.FAILED,
@@ -203,9 +232,44 @@ class NayroFloatingService : Service() {
         return START_STICKY
     }
 
+    /**
+     * Starts or refreshes foreground service type safely across Android 10–16:
+     * includes FOREGROUND_SERVICE_TYPE_MICROPHONE alongside SPECIAL_USE whenever RECORD_AUDIO
+     * is granted so floating-bubble voice capture works reliably in the background over other apps.
+     */
+    private fun promoteForegroundWithSafeType() {
+        val notification = createNotification()
+        val hasMicPermission = androidx.core.content.ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val fgsTypes = if (hasMicPermission) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            }
+            try {
+                startForeground(NOTIFICATION_ID, notification, fgsTypes)
+            } catch (_: SecurityException) {
+                // Graceful fallback if OS restricts microphone FGS promotion while backgrounded
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
-        stateCollectorJob?.cancel()
+        bubbleObserverJob?.cancel()
+        panelCollectorJob?.cancel()
+        try {
+            NayroApplication.instance.voiceManager.detachFloatingListener()
+        } catch (_: Exception) {}
         serviceScope.cancel()
         removeOverlayViews()
         ServiceStateRepository.updateFloatingStatus(ServiceLifecycleState.STOPPED)
@@ -216,16 +280,18 @@ class NayroFloatingService : Service() {
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
         super.onConfigurationChanged(newConfig)
         if (bubbleRootView != null && ::bubbleParams.isInitialized) {
-            val screenWidth = resources.displayMetrics.widthPixels
-            val screenHeight = resources.displayMetrics.heightPixels
-            val margin = dp(12)
-            val dpSize = dp(58)
-            bubbleParams.x = if (bubbleParams.x + dpSize / 2 < screenWidth / 2) {
-                margin
-            } else {
-                (screenWidth - dpSize - margin).coerceAtLeast(margin)
-            }
-            bubbleParams.y = bubbleParams.y.coerceIn(margin, (screenHeight - dpSize - margin).coerceAtLeast(margin))
+            val (snappedX, safeY) = FloatingAssistantPreferences.snapToNearestHorizontalEdge(
+                x = bubbleParams.x,
+                y = bubbleParams.y,
+                screenWidth = resources.displayMetrics.widthPixels,
+                screenHeight = resources.displayMetrics.heightPixels,
+                bubbleSizePx = dp(56),
+                edgeMarginPx = dp(12),
+                topInsetPx = getSafeTopInsetPx(),
+                bottomInsetPx = getSafeBottomInsetPx()
+            )
+            bubbleParams.x = snappedX
+            bubbleParams.y = safeY
             try {
                 windowManager.updateViewLayout(bubbleRootView, bubbleParams)
                 prefs.savePosition(bubbleParams.x, bubbleParams.y)
@@ -239,10 +305,10 @@ class NayroFloatingService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "NAYRO Floating Babu Assistant",
+                "NAYRO Floating Agent",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Status notification while Babu floating assistant overlay is active."
+                description = "Status notification while NAYRO floating agent overlay is active."
                 setShowBadge(false)
             }
             val manager = getSystemService(NotificationManager::class.java)
@@ -251,6 +317,7 @@ class NayroFloatingService : Service() {
     }
 
     private fun createNotification(): Notification {
+        val assistantName = resolveAssistantName()
         val launchIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
@@ -272,13 +339,13 @@ class NayroFloatingService : Service() {
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Babu Floating Agent Active")
-            .setContentText("Tap floating bubble anywhere to talk or run commands.")
+            .setContentTitle("NAYRO Floating Agent ($assistantName)")
+            .setContentText("Tap the floating icon anywhere to converse, run tasks, or toggle listening.")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Hide Bubble", stopPendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Hide Icon", stopPendingIntent)
             .build()
     }
 
@@ -292,49 +359,72 @@ class NayroFloatingService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+        val dpSize = dp(56)
         val (savedX, savedY) = prefs.getPosition()
+        val (clampedX, clampedY) = FloatingAssistantPreferences.clampToSafeBounds(
+            x = savedX,
+            y = savedY,
+            screenWidth = resources.displayMetrics.widthPixels,
+            screenHeight = resources.displayMetrics.heightPixels,
+            bubbleSizePx = dpSize,
+            edgeMarginPx = dp(12),
+            topInsetPx = getSafeTopInsetPx(),
+            bottomInsetPx = getSafeBottomInsetPx()
+        )
 
         bubbleParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
             layoutType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = savedX
-            y = savedY
+            x = clampedX
+            y = clampedY
         }
 
-        val dpSize = dp(58)
+        val initialChar = resolveAssistantName().firstOrNull()?.uppercaseChar()?.toString() ?: "N"
 
         val bubble = FrameLayout(this).apply {
             layoutParams = ViewGroup.LayoutParams(dpSize, dpSize)
+            contentDescription = "NAYRO floating agent icon. Tap to open, drag to move."
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
                 colors = intArrayOf(
-                    Color.parseColor("#FFFFFF"),
-                    Color.parseColor("#F1F5F9")
+                    Color.parseColor("#F6F2E8"),
+                    Color.parseColor("#DCE7DE")
                 )
                 gradientType = GradientDrawable.RADIAL_GRADIENT
                 gradientRadius = dpSize * 0.75f
-                setStroke(dp(3), Color.parseColor("#0F3D36"))
+                setStroke(dp(3), Color.parseColor("#153B35"))
             }
             elevation = dp(8).toFloat()
         }
 
+        val innerCircle = FrameLayout(this).apply {
+            val innerSize = dp(40)
+            layoutParams = FrameLayout.LayoutParams(innerSize, innerSize, Gravity.CENTER)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.parseColor("#153B35"))
+            }
+        }
         val innerBadge = TextView(this).apply {
-            text = "B"
-            textSize = 20f
+            text = initialChar
+            textSize = 19f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(Color.parseColor("#0F3D36"))
+            setTextColor(Color.parseColor("#F6F2E8"))
             gravity = Gravity.CENTER
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
-        bubble.addView(innerIconOrBadge(innerBadge))
+        innerCircle.addView(innerBadge)
+        bubble.addView(innerCircle)
+        bubbleInnerCircle = innerCircle
+        bubbleInitialText = innerBadge
 
         bubble.setOnTouchListener(object : View.OnTouchListener {
             private var initialX = 0
@@ -359,8 +449,18 @@ class NayroFloatingService : Service() {
                         if (abs(dx) > 10 || abs(dy) > 10) {
                             isDrag = true
                         }
-                        bubbleParams.x = initialX + dx
-                        bubbleParams.y = initialY + dy
+                        val (safeX, safeY) = FloatingAssistantPreferences.clampToSafeBounds(
+                            x = initialX + dx,
+                            y = initialY + dy,
+                            screenWidth = resources.displayMetrics.widthPixels,
+                            screenHeight = resources.displayMetrics.heightPixels,
+                            bubbleSizePx = dpSize,
+                            edgeMarginPx = dp(8),
+                            topInsetPx = getSafeTopInsetPx(),
+                            bottomInsetPx = getSafeBottomInsetPx()
+                        )
+                        bubbleParams.x = safeX
+                        bubbleParams.y = safeY
                         try {
                             windowManager.updateViewLayout(bubbleRootView, bubbleParams)
                         } catch (_: Exception) {}
@@ -368,13 +468,18 @@ class NayroFloatingService : Service() {
                     }
                     MotionEvent.ACTION_UP -> {
                         if (isDrag) {
-                            val screenWidth = resources.displayMetrics.widthPixels
-                            val margin = dp(12)
-                            bubbleParams.x = if (bubbleParams.x + dpSize / 2 < screenWidth / 2) {
-                                margin
-                            } else {
-                                screenWidth - dpSize - margin
-                            }
+                            val (snappedX, safeY) = FloatingAssistantPreferences.snapToNearestHorizontalEdge(
+                                x = bubbleParams.x,
+                                y = bubbleParams.y,
+                                screenWidth = resources.displayMetrics.widthPixels,
+                                screenHeight = resources.displayMetrics.heightPixels,
+                                bubbleSizePx = dpSize,
+                                edgeMarginPx = dp(12),
+                                topInsetPx = getSafeTopInsetPx(),
+                                bottomInsetPx = getSafeBottomInsetPx()
+                            )
+                            bubbleParams.x = snappedX
+                            bubbleParams.y = safeY
                             try {
                                 windowManager.updateViewLayout(bubbleRootView, bubbleParams)
                             } catch (_: Exception) {}
@@ -399,33 +504,46 @@ class NayroFloatingService : Service() {
         }
     }
 
-    private fun innerIconOrBadge(badge: TextView): View {
-        val container = FrameLayout(this)
-        val innerCircle = FrameLayout(this).apply {
-            val innerSize = dp(42)
-            layoutParams = FrameLayout.LayoutParams(innerSize, innerSize, Gravity.CENTER)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setColor(Color.parseColor("#0F3D36"))
-            }
+    private fun startObservingBubbleState() {
+        bubbleObserverJob?.cancel()
+        bubbleObserverJob = serviceScope.launch {
+            try {
+                val app = NayroApplication.instance
+                launch {
+                    app.assistantIdentityStore.profile.collect { profile ->
+                        val initial = profile.assistantDisplayName.firstOrNull()?.uppercaseChar()?.toString() ?: "N"
+                        bubbleInitialText?.text = initial
+                    }
+                }
+                launch {
+                    app.voiceManager.voiceState.collect { vState ->
+                        val strokeColor = when (vState) {
+                            VoiceState.LISTENING, VoiceState.FOLLOW_UP_LISTENING, VoiceState.WAKE_DETECTED -> Color.parseColor("#D56A50")
+                            VoiceState.SPEAKING -> Color.parseColor("#2F7D57")
+                            VoiceState.ERROR -> Color.parseColor("#B9423A")
+                            VoiceState.STANDBY -> Color.parseColor("#153B35")
+                            else -> Color.parseColor("#0E2925")
+                        }
+                        (bubbleRootView?.background as? GradientDrawable)?.setStroke(dp(3), strokeColor)
+                        (bubbleInnerCircle?.background as? GradientDrawable)?.setColor(strokeColor)
+                    }
+                }
+            } catch (_: Exception) {}
         }
-        badge.setTextColor(Color.parseColor("#FFFFFF"))
-        innerCircle.addView(badge)
-        container.addView(innerCircle)
-        return container
     }
 
     private fun togglePanel() {
         if (isPanelOpen) {
             closePanel()
         } else {
-            openPanel()
+            openPanel(autoStartVoice = true)
         }
     }
 
-    private fun openPanel() {
+    private fun openPanel(autoStartVoice: Boolean = true) {
         if (panelRootView != null) return
 
+        val assistantName = resolveAssistantName()
         val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
         } else {
@@ -433,8 +551,9 @@ class NayroFloatingService : Service() {
             WindowManager.LayoutParams.TYPE_PHONE
         }
 
+        val maxPanelWidth = (resources.displayMetrics.widthPixels - dp(24)).coerceAtMost(dp(352))
         panelParams = WindowManager.LayoutParams(
-            dp(344),
+            maxPanelWidth,
             WindowManager.LayoutParams.WRAP_CONTENT,
             layoutType,
             WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
@@ -446,13 +565,13 @@ class NayroFloatingService : Service() {
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            val pad = dp(18)
+            val pad = dp(16)
             setPadding(pad, pad, pad, pad)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(22).toFloat()
-                setColor(Color.parseColor("#FFFFFF"))
-                setStroke(dp(2), Color.parseColor("#CBD5E1"))
+                setColor(Color.parseColor("#F6F2E8"))
+                setStroke(dp(2), Color.parseColor("#153B35"))
             }
             elevation = dp(12).toFloat()
         }
@@ -469,16 +588,16 @@ class NayroFloatingService : Service() {
         }
 
         val header = TextView(this).apply {
-            text = "Babu • Autonomous Agent"
-            setTextColor(Color.parseColor("#0F172A"))
-            textSize = 17f
+            text = "NAYRO • $assistantName"
+            setTextColor(Color.parseColor("#1E2926"))
+            textSize = 16f
             setTypeface(typeface, Typeface.BOLD)
         }
         titleCol.addView(header)
 
         val stateBadge = TextView(this).apply {
-            text = "State: Idle • Ready"
-            setTextColor(Color.parseColor("#0F3D36"))
+            text = "Idle • Ready"
+            setTextColor(Color.parseColor("#153B35"))
             textSize = 12f
             setPadding(0, dp(2), 0, 0)
         }
@@ -489,8 +608,8 @@ class NayroFloatingService : Service() {
         val expandBtn = Button(this).apply {
             text = "Open App"
             textSize = 11f
-            setTextColor(Color.parseColor("#0F3D36"))
-            setBackgroundColor(Color.parseColor("#E2E8F0"))
+            setTextColor(Color.parseColor("#153B35"))
+            setBackgroundColor(Color.parseColor("#DCE7DE"))
             setOnClickListener {
                 closePanel()
                 val mainIntent = Intent(this@NayroFloatingService, MainActivity::class.java).apply {
@@ -504,26 +623,38 @@ class NayroFloatingService : Service() {
         headerRow.addView(expandBtn)
         panel.addView(headerRow)
 
-        // Response / Live Output Box
+        // Real-Time Audio-Reactive Waveform View
+        val waveform = FloatingAudioWaveformView(this).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(34)
+            ).apply {
+                topMargin = dp(8)
+                bottomMargin = dp(6)
+            }
+        }
+        waveformView = waveform
+        panel.addView(waveform)
+
+        // Compact Conversation / Live Transcript Box
         val responseBox = TextView(this).apply {
-            text = "Ask Babu to open apps, read the current screen, send messages, or run multi-step tasks."
-            setTextColor(Color.parseColor("#334155"))
+            text = "Ask $assistantName anything — general questions, research, or Android device tasks."
+            setTextColor(Color.parseColor("#1E2926"))
             textSize = 13f
             val p = dp(10)
             setPadding(p, p, p, p)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(12).toFloat()
-                setColor(Color.parseColor("#F8FAFC"))
-                setStroke(dp(1), Color.parseColor("#E2E8F0"))
+                setColor(Color.WHITE)
+                setStroke(dp(1), Color.parseColor("#DCE7DE"))
             }
-            val lp = LinearLayout.LayoutParams(
+            layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            lp.topMargin = dp(10)
-            lp.bottomMargin = dp(10)
-            layoutParams = lp
+            ).apply {
+                bottomMargin = dp(8)
+            }
         }
         responsePreviewView = responseBox
         panel.addView(responseBox)
@@ -540,12 +671,12 @@ class NayroFloatingService : Service() {
                 setColor(Color.parseColor("#FFF7ED"))
                 setStroke(dp(1), Color.parseColor("#D56A50"))
             }
-            val lp = LinearLayout.LayoutParams(
+            layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            lp.bottomMargin = dp(10)
-            layoutParams = lp
+            ).apply {
+                bottomMargin = dp(8)
+            }
         }
         val confLabel = TextView(this).apply {
             text = "Confirmation Required"
@@ -563,7 +694,7 @@ class NayroFloatingService : Service() {
             text = "Approve"
             textSize = 12f
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#15803D"))
+            setBackgroundColor(Color.parseColor("#2F7D57"))
             setOnClickListener {
                 try {
                     val app = NayroApplication.instance
@@ -578,7 +709,7 @@ class NayroFloatingService : Service() {
             text = "Reject"
             textSize = 12f
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#B91C1C"))
+            setBackgroundColor(Color.parseColor("#B9423A"))
             setOnClickListener {
                 try {
                     val app = NayroApplication.instance
@@ -596,91 +727,84 @@ class NayroFloatingService : Service() {
         confirmationTextView = confLabel
         panel.addView(confBox)
 
-        // Quick Action Row inside Overlay
-        val quickRow = LinearLayout(this).apply {
+        // Control Row: Background Listening ON/OFF | Immediate Stop
+        val controlRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            val lp = LinearLayout.LayoutParams(
+            layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            lp.bottomMargin = dp(8)
-            layoutParams = lp
-        }
-
-        val readScreenBtn = Button(this).apply {
-            text = "Read Screen"
-            textSize = 11f
-            setTextColor(Color.parseColor("#0F3D36"))
-            setBackgroundColor(Color.parseColor("#F1F5F9"))
-            setOnClickListener {
-                dispatchOverlayCommand("Screen par kya likha hai?")
+            ).apply {
+                bottomMargin = dp(8)
             }
         }
-        val pauseResumeBtn = Button(this).apply {
-            text = "Pause"
+
+        val bgToggleBtn = Button(this).apply {
             textSize = 11f
-            setTextColor(Color.parseColor("#B45309"))
-            setBackgroundColor(Color.parseColor("#FEF3C7"))
             setOnClickListener {
                 try {
-                    val runtime = NayroApplication.instance.agentRuntime
-                    if (runtime.isPaused()) {
-                        runtime.resumeCurrentTask()
-                        text = "Pause"
-                        responsePreviewView?.text = "Resumed active task."
-                    } else {
-                        runtime.pauseCurrentTask()
-                        text = "Resume"
-                        responsePreviewView?.text = "Paused active task."
+                    val app = NayroApplication.instance
+                    val currentlyEnabled = app.backgroundVoiceController.state.value.isEnabled
+                    val (ok, msg) = app.backgroundVoiceController.setBackgroundListeningEnabled(
+                        enabled = !currentlyEnabled,
+                        activityContext = this@NayroFloatingService
+                    )
+                    responsePreviewView?.text = msg
+                    if (!ok) {
+                        Toast.makeText(this@NayroFloatingService, msg, Toast.LENGTH_SHORT).show()
                     }
                 } catch (_: Exception) {}
             }
         }
-        val stopTaskBtn = Button(this).apply {
-            text = "Stop Task"
+        bgListeningToggleBtn = bgToggleBtn
+
+        val stopAllBtn = Button(this).apply {
+            text = "Stop Now"
             textSize = 11f
-            setTextColor(Color.parseColor("#B91C1C"))
-            setBackgroundColor(Color.parseColor("#FEF2F2"))
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#B9423A"))
             setOnClickListener {
                 try {
-                    NayroApplication.instance.agentRuntime.cancelCurrentTask()
-                    responsePreviewView?.text = "Current task cancelled."
+                    val app = NayroApplication.instance
+                    app.agentRuntime.cancelCurrentTask()
+                    app.voiceManager.endConversationSession(
+                        returnToStandby = app.backgroundVoiceController.state.value.isEnabled
+                    )
+                    responsePreviewView?.text = "Stopped active task and voice playback."
                 } catch (_: Exception) {}
             }
         }
-        quickRow.addView(readScreenBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        quickRow.addView(pauseResumeBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        quickRow.addView(stopTaskBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        panel.addView(quickRow)
+        controlRow.addView(bgToggleBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.4f))
+        controlRow.addView(stopAllBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        panel.addView(controlRow)
 
         // Text Input Field
         val input = EditText(this).apply {
-            hint = "Ask Babu anything (Hindi / English)..."
-            setHintTextColor(Color.parseColor("#64748B"))
-            setTextColor(Color.parseColor("#0F172A"))
+            hint = "Ask $assistantName anything (Hindi / English)..."
+            setHintTextColor(Color.parseColor("#6F7C76"))
+            setTextColor(Color.parseColor("#1E2926"))
             textSize = 14f
-            val p = dp(12)
+            val p = dp(11)
             setPadding(p, p, p, p)
             background = GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 cornerRadius = dp(12).toFloat()
-                setColor(Color.parseColor("#F8FAFC"))
-                setStroke(dp(1), Color.parseColor("#94A3B8"))
+                setColor(Color.WHITE)
+                setStroke(dp(1), Color.parseColor("#153B35"))
             }
         }
         panel.addView(input)
 
-        // Primary Action Row: Send | Voice | Minimize | Hide
+        // Primary Action Row: Send | Voice | Minimize
         val btnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(10), 0, 0)
+            setPadding(0, dp(8), 0, 0)
         }
 
         val sendBtn = Button(this).apply {
             text = "Send"
             textSize = 12f
-            setTextColor(Color.parseColor("#FFFFFF"))
-            setBackgroundColor(Color.parseColor("#94A3B8"))
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#6F7C76"))
             isEnabled = false
         }
 
@@ -690,7 +814,7 @@ class NayroFloatingService : Service() {
                 val hasText = !s.isNullOrBlank()
                 sendBtn.isEnabled = hasText
                 sendBtn.setBackgroundColor(
-                    if (hasText) Color.parseColor("#0F3D36") else Color.parseColor("#94A3B8")
+                    if (hasText) Color.parseColor("#153B35") else Color.parseColor("#6F7C76")
                 )
             }
             override fun afterTextChanged(s: Editable?) {}
@@ -708,27 +832,28 @@ class NayroFloatingService : Service() {
         btnRow.addView(sendBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         val voiceBtn = Button(this).apply {
-            text = "Voice"
+            text = "Speak"
             textSize = 12f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#D56A50"))
             setOnClickListener {
                 try {
                     val app = NayroApplication.instance
+                    val vState = app.voiceManager.voiceState.value
                     if (!app.permissionManager.isMicrophoneGranted()) {
-                        responsePreviewView?.text = "Microphone permission needed. Opening NAYRO permission setup..."
+                        responsePreviewView?.text = "Microphone permission needed. Opening NAYRO..."
                         val mainIntent = Intent(this@NayroFloatingService, MainActivity::class.java).apply {
                             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
                         }
                         startActivity(mainIntent)
-                    } else if (app.voiceManager.voiceState.value == VoiceState.LISTENING) {
+                    } else if (vState == VoiceState.LISTENING || vState == VoiceState.FOLLOW_UP_LISTENING) {
                         app.voiceManager.stopListening()
                     } else {
-                        app.voiceManager.onSpeechRecognized = { recognized ->
+                        app.voiceManager.attachFloatingListener { recognized ->
                             dispatchOverlayCommand(recognized)
                         }
                         app.voiceManager.startListening()
-                        responsePreviewView?.text = "Listening... speak your command to Babu."
+                        responsePreviewView?.text = "Listening... speak to ${resolveAssistantName()}."
                     }
                 } catch (e: Exception) {
                     responsePreviewView?.text = "Voice error: ${e.localizedMessage ?: "unavailable"}"
@@ -739,10 +864,10 @@ class NayroFloatingService : Service() {
         btnRow.addView(voiceBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
         val closeBtn = Button(this).apply {
-            text = "Minimize"
+            text = "Hide"
             textSize = 12f
-            setTextColor(Color.parseColor("#0F172A"))
-            setBackgroundColor(Color.parseColor("#E2E8F0"))
+            setTextColor(Color.parseColor("#1E2926"))
+            setBackgroundColor(Color.parseColor("#DCE7DE"))
             setOnClickListener {
                 closePanel()
             }
@@ -766,6 +891,9 @@ class NayroFloatingService : Service() {
             windowManager.addView(panelRootView, panelParams)
             isPanelOpen = true
             startObservingAgentState()
+            if (autoStartVoice) {
+                activateFloatingVoiceSession()
+            }
         } catch (e: Exception) {
             e.printStackTrace()
             panelRootView = null
@@ -773,61 +901,154 @@ class NayroFloatingService : Service() {
         }
     }
 
-    private fun dispatchOverlayCommand(userText: String) {
-        val cleanText = userText.trim()
+    /**
+     * Mode A — Floating Assistant auto-mic activation:
+     * Tapping the floating icon immediately activates the microphone and continuous
+     * voice conversation session (when RECORD_AUDIO is granted and no phone call is active)
+     * without requiring the user to repeat a wake phrase.
+     */
+    private fun activateFloatingVoiceSession() {
+        val app = try {
+            NayroApplication.instance
+        } catch (_: Exception) {
+            return
+        }
+        val assistantName = resolveAssistantName()
+        if (!app.permissionManager.isMicrophoneGranted()) {
+            responsePreviewView?.text = "Tap 'Speak' or grant Microphone permission in NAYRO for hands-free voice."
+            return
+        }
+        if (app.voiceManager.isPhoneCallActiveOrRinging()) {
+            responsePreviewView?.text = "Microphone paused during active phone call. You can type a command below."
+            return
+        }
+        val vState = app.voiceManager.voiceState.value
+        if (vState != VoiceState.LISTENING && vState != VoiceState.FOLLOW_UP_LISTENING) {
+            promoteForegroundWithSafeType()
+            app.voiceManager.attachFloatingListener { recognized ->
+                dispatchOverlayCommand(recognized)
+            }
+            app.voiceManager.startListening()
+            responsePreviewView?.text = "Listening... speak naturally to $assistantName (tap Stop Now anytime)."
+        }
+    }
+
+    private fun dispatchOverlayCommand(rawText: String) {
+        val app = try {
+            NayroApplication.instance
+        } catch (_: Exception) {
+            return
+        }
+        val cleanText = app.voiceManager.normalizeVoiceInvocationCommand(rawText)
         if (cleanText.isEmpty()) return
 
-        responsePreviewView?.text = "You: \"$cleanText\"\nBabu is working on it..."
+        if (app.voiceManager.isConversationExitPhrase(cleanText) ||
+            app.voiceManager.wakeWordEngine.isVoiceExitCommand(cleanText)
+        ) {
+            app.agentRuntime.cancelCurrentTask()
+            app.voiceManager.endConversationSession(
+                returnToStandby = app.backgroundVoiceController.state.value.isEnabled
+            )
+            responsePreviewView?.text = "Voice session ended and microphone released."
+            return
+        }
+
+        val assistantName = resolveAssistantName()
+        responsePreviewView?.text = "You: \"$cleanText\"\n$assistantName is working on it..."
         serviceScope.launch(Dispatchers.Default) {
+            var responseText = ""
             try {
-                val app = NayroApplication.instance
                 app.repository.addConversationMessage(
                     ConversationEntity(sender = "user", content = cleanText)
                 )
-                val responseText = app.agentRuntime.executeUserInstruction(cleanText)
+                responseText = app.agentRuntime.executeUserInstruction(cleanText)
                 app.repository.addConversationMessage(
-                    ConversationEntity(sender = "babu", content = responseText)
+                    ConversationEntity(sender = "assistant", content = responseText)
                 )
                 withContext(Dispatchers.Main) {
                     responsePreviewView?.text = responseText
                 }
-                if (app.voiceManager.configuration.value.isTtsEnabled) {
-                    app.voiceManager.speak(responseText)
-                }
             } catch (e: Exception) {
+                responseText = "Execution error: ${e.localizedMessage ?: e.javaClass.simpleName}"
                 withContext(Dispatchers.Main) {
-                    responsePreviewView?.text = "Execution error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                    responsePreviewView?.text = responseText
                 }
+            } finally {
+                // Always transition microphone ownership cleanly out of THINKING/PROCESSING
+                app.voiceManager.completeCommandTurn(
+                    responseText = responseText,
+                    shouldSpeak = app.voiceManager.configuration.value.isTtsEnabled,
+                    expectFollowUp = isPanelOpen && app.voiceManager.configuration.value.isContinuousConversationEnabled
+                )
             }
         }
     }
 
     private fun startObservingAgentState() {
-        stateCollectorJob?.cancel()
-        stateCollectorJob = serviceScope.launch {
+        panelCollectorJob?.cancel()
+        panelCollectorJob = serviceScope.launch {
             try {
                 val app = NayroApplication.instance
                 launch {
                     app.agentRuntime.currentState.collect { state ->
                         val label = when (state) {
-                            is AgentState.Idle -> "State: Idle • Ready"
-                            is AgentState.StandbyListening -> "State: Wake Standby Active"
-                            is AgentState.UserListening -> "State: Listening to Microphone..."
-                            is AgentState.Transcribing -> "State: Transcribing Speech..."
-                            is AgentState.Thinking -> "State: Understanding your request..."
-                            is AgentState.PlanningTask -> "State: Planning (${state.task.resolvedIntent.toUserFriendlyIntentLabel()})"
-                            is AgentState.ProposingAction -> "State: Proposing Action"
-                            is AgentState.ExecutingTask -> "State: Step ${state.step}/${state.totalSteps} • ${state.currentAction.actionType.toUserFriendlyDescription(state.currentAction.target, state.currentAction.parameters)}"
-                            is AgentState.ExecutingAction -> "State: ${state.toolName.toUserFriendlyIntentLabel()}..."
-                            is AgentState.WaitingForConfirmation -> "State: Waiting for Confirmation"
-                            is AgentState.WaitingForPermission -> "State: Waiting for Permission (${state.permission})"
-                            is AgentState.WaitingForDeviceUnlock -> "State: Waiting for Device Unlock"
-                            is AgentState.Speaking -> "State: Speaking Response"
-                            is AgentState.Completed -> "State: Completed"
-                            is AgentState.Cancelled -> "State: Cancelled (${state.reason.take(30)})"
-                            is AgentState.Error -> "State: Error (${state.message.take(40)})"
+                            is AgentState.Idle -> "Idle • Ready"
+                            is AgentState.StandbyListening -> "Standby • Wake Detection Active"
+                            is AgentState.UserListening -> "Listening to Microphone..."
+                            is AgentState.Transcribing -> "Transcribing Speech..."
+                            is AgentState.Thinking -> "Reasoning & Planning..."
+                            is AgentState.PlanningTask -> "Planning (${state.task.resolvedIntent.toUserFriendlyIntentLabel()})"
+                            is AgentState.ProposingAction -> "Proposing Action..."
+                            is AgentState.ExecutingTask -> "Step ${state.step}/${state.totalSteps} • ${state.currentAction.actionType.toUserFriendlyDescription(state.currentAction.target, state.currentAction.parameters)}"
+                            is AgentState.ExecutingAction -> "${state.toolName.toUserFriendlyIntentLabel()}..."
+                            is AgentState.WaitingForConfirmation -> "Waiting for Confirmation"
+                            is AgentState.WaitingForPermission -> "Permission Needed (${state.permission})"
+                            is AgentState.WaitingForDeviceUnlock -> "Waiting for Unlock"
+                            is AgentState.Speaking -> "Speaking Response"
+                            is AgentState.Completed -> "Completed"
+                            is AgentState.Cancelled -> "Cancelled (${state.reason.take(28)})"
+                            is AgentState.Error -> "Error (${state.message.take(36)})"
                         }
                         stateBadgeView?.text = label
+                        updateWaveformSnapshot(app)
+                    }
+                }
+                launch {
+                    app.voiceManager.voiceState.collect { vState ->
+                        val isCapturing = vState == VoiceState.LISTENING || vState == VoiceState.FOLLOW_UP_LISTENING
+                        voiceBtnView?.text = if (isCapturing) "Stop Mic" else "Speak"
+                        updateWaveformSnapshot(app)
+                    }
+                }
+                launch {
+                    app.voiceManager.normalizedAudioLevel.collect {
+                        updateWaveformSnapshot(app)
+                    }
+                }
+                launch {
+                    app.voiceManager.standbyAudioLevel.collect {
+                        updateWaveformSnapshot(app)
+                    }
+                }
+                launch {
+                    app.voiceManager.partialTranscript.collect { partial ->
+                        if (partial.isNotBlank() &&
+                            (app.voiceManager.voiceState.value == VoiceState.LISTENING ||
+                                app.voiceManager.voiceState.value == VoiceState.FOLLOW_UP_LISTENING)
+                        ) {
+                            responsePreviewView?.text = "Listening: \"$partial\""
+                        }
+                    }
+                }
+                launch {
+                    app.backgroundVoiceController.state.collect { bgState ->
+                        bgListeningToggleBtn?.apply {
+                            text = if (bgState.isEnabled) "Bg Listening: ON" else "Bg Listening: OFF"
+                            setTextColor(Color.WHITE)
+                            setBackgroundColor(
+                                if (bgState.isEnabled) Color.parseColor("#2F7D57") else Color.parseColor("#6F7C76")
+                            )
+                        }
                     }
                 }
                 launch {
@@ -840,18 +1061,65 @@ class NayroFloatingService : Service() {
                         }
                     }
                 }
+                // Lightweight phase ticker ONLY while panel is open and an animated state is active
+                launch {
+                    var phase = 0f
+                    while (isActive && isPanelOpen) {
+                        val vs = resolveVisualizerState(
+                            app.voiceManager.voiceState.value,
+                            app.agentRuntime.currentState.value
+                        )
+                        if (vs != VisualizerVisualState.IDLE &&
+                            vs != VisualizerVisualState.ERROR &&
+                            vs != VisualizerVisualState.LISTENING
+                        ) {
+                            phase = (phase + 0.06f) % 1f
+                            waveformView?.updateTelemetry(
+                                state = vs,
+                                audioLevel = app.voiceManager.normalizedAudioLevel.value,
+                                standbyLevel = app.voiceManager.standbyAudioLevel.value,
+                                phase = phase
+                            )
+                        }
+                        delay(55L)
+                    }
+                }
             } catch (_: Exception) {}
         }
     }
 
+    private fun updateWaveformSnapshot(app: NayroApplication) {
+        val vs = resolveVisualizerState(
+            app.voiceManager.voiceState.value,
+            app.agentRuntime.currentState.value
+        )
+        waveformView?.updateTelemetry(
+            state = vs,
+            audioLevel = app.voiceManager.normalizedAudioLevel.value,
+            standbyLevel = app.voiceManager.standbyAudioLevel.value
+        )
+    }
+
     private fun closePanel() {
-        stateCollectorJob?.cancel()
-        stateCollectorJob = null
+        panelCollectorJob?.cancel()
+        panelCollectorJob = null
+        try {
+            val app = NayroApplication.instance
+            val vState = app.voiceManager.voiceState.value
+            if (vState == VoiceState.LISTENING || vState == VoiceState.FOLLOW_UP_LISTENING) {
+                app.voiceManager.endConversationSession(
+                    returnToStandby = app.backgroundVoiceController.state.value.isEnabled
+                )
+            }
+            app.voiceManager.detachFloatingListener()
+        } catch (_: Exception) {}
         stateBadgeView = null
         responsePreviewView = null
+        waveformView = null
         confirmationContainer = null
         confirmationTextView = null
         voiceBtnView = null
+        bgListeningToggleBtn = null
 
         if (panelRootView != null) {
             try {
@@ -864,11 +1132,84 @@ class NayroFloatingService : Service() {
 
     private fun removeOverlayViews() {
         closePanel()
+        bubbleObserverJob?.cancel()
+        bubbleObserverJob = null
+        bubbleInnerCircle = null
+        bubbleInitialText = null
         if (bubbleRootView != null) {
             try {
                 windowManager.removeView(bubbleRootView)
             } catch (_: Exception) {}
             bubbleRootView = null
+        }
+    }
+
+    /**
+     * Lightweight native Canvas waveform view sharing the exact same [computeVisualizerBarHeights]
+     * real-telemetry math as Jetpack Compose's [NayroAudioVisualizer].
+     */
+    private class FloatingAudioWaveformView(context: Context) : View(context) {
+        private val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            color = Color.parseColor("#DCE7DE")
+        }
+        private val barRect = RectF()
+        private var currentState: VisualizerVisualState = VisualizerVisualState.IDLE
+        private var currentAudioLevel: Float = 0f
+        private var currentPhase: Float = 0f
+
+        fun updateTelemetry(
+            state: VisualizerVisualState,
+            audioLevel: Float,
+            standbyLevel: Float,
+            phase: Float = currentPhase
+        ) {
+            currentState = state
+            currentAudioLevel = when (state) {
+                VisualizerVisualState.LISTENING -> audioLevel
+                VisualizerVisualState.STANDBY -> standbyLevel
+                else -> 0f
+            }
+            currentPhase = phase
+            barPaint.color = when (state) {
+                VisualizerVisualState.IDLE -> Color.parseColor("#DCE7DE")
+                VisualizerVisualState.STANDBY -> Color.parseColor("#153B35")
+                VisualizerVisualState.WAKE_DETECTED,
+                VisualizerVisualState.LISTENING,
+                VisualizerVisualState.SPEAKING -> Color.parseColor("#D56A50")
+                VisualizerVisualState.TRANSCRIBING,
+                VisualizerVisualState.THINKING -> Color.parseColor("#153B35")
+                VisualizerVisualState.EXECUTING -> Color.parseColor("#2F7D57")
+                VisualizerVisualState.ERROR -> Color.parseColor("#B9423A")
+            }
+            contentDescription = state.accessibleLabel
+            invalidate()
+        }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            val w = width.toFloat()
+            val h = height.toFloat()
+            if (w <= 0f || h <= 0f) return
+
+            val heights = computeVisualizerBarHeights(
+                state = currentState,
+                realAudioLevel = currentAudioLevel,
+                phase = currentPhase,
+                barCount = 16
+            )
+            val count = heights.size
+            val spacing = w / (count * 2.1f)
+            val barWidth = ((w - spacing * (count - 1)) / count).coerceAtLeast(3f)
+            val centerY = h / 2f
+            val radius = barWidth / 2f
+
+            for (i in 0 until count) {
+                val barHeight = (h * heights[i]).coerceAtLeast(4f)
+                val left = i * (barWidth + spacing)
+                barRect.set(left, centerY - barHeight / 2f, left + barWidth, centerY + barHeight / 2f)
+                canvas.drawRoundRect(barRect, radius, radius, barPaint)
+            }
         }
     }
 }

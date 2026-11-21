@@ -42,16 +42,20 @@ object TaskClassifier {
 
     fun classify(prompt: String): ResolvedIntent {
         val stripped = prompt.trim()
+            .removeSuffix("।")
+            .trim()
             .replaceFirst(
-                Regex("^(?i)(?:hey babu|hi babu|babu|hey nayro|hi nayro|nayro|hey nairo|hi nairo|nairo|hey cutie|(?:hi|hey|hello|haan|sun|suno)\\s+[a-zA-Z0-9_]+)\\s*,?\\s*"),
+                Regex("^(?i)(?:hey babu|hi babu|babu|hey nayro|hi nayro|nayro|hey nairo|hi nairo|nairo|hey cutie|हे बाबू|हाय बाबू|बाबू|हे नायरो|हाय नायरो|नायरो|(?:hi|hey|hello|haan|sun|suno|हाँ|सुनो)\\s+[\\p{L}\\p{M}0-9_]+)\\s*,?\\s*"),
                 ""
             )
             .trim()
-        val trimmed = if (stripped.isNotBlank()) stripped else prompt.trim()
+        val trimmed = (if (stripped.isNotBlank()) stripped else prompt.trim()).removeSuffix("।").trim()
         val lower = trimmed.lowercase()
 
         // 1. Memory Save Intent
-        if (lower.startsWith("yaad rakho") || lower.startsWith("remember that") || lower.contains("yaad rakhna")) {
+        if (lower.startsWith("yaad rakho") || lower.startsWith("remember that") || lower.contains("yaad rakhna") ||
+            trimmed.startsWith("याद रखो") || trimmed.contains("याद रखना")
+        ) {
             return ResolvedIntent(
                 type = UserIntentType.MEMORY_SAVE,
                 searchQueryOrContent = trimmed,
@@ -60,8 +64,11 @@ object TaskClassifier {
         }
 
         // 2. Note Create Intent
-        if (lower.startsWith("note banao") || lower.startsWith("note likho") || lower.startsWith("create note") || lower.startsWith("take a note") || lower.startsWith("save a note") || lower.startsWith("save note")) {
-            val content = trimmed.replaceFirst(Regex("^(?i)(note banao:|note banao|note likho:|note likho|create note:|create note|take a note:|save a note:|save a note|save note:|save note)\\s*"), "")
+        if (lower.startsWith("note banao") || lower.startsWith("note likho") || lower.startsWith("create note") ||
+            lower.startsWith("take a note") || lower.startsWith("save a note") || lower.startsWith("save note") ||
+            trimmed.startsWith("नोट बनाओ") || trimmed.startsWith("नोट लिखो")
+        ) {
+            val content = trimmed.replaceFirst(Regex("^(?i)(note banao:|note banao|note likho:|note likho|create note:|create note|take a note:|save a note:|save a note|save note:|save note|नोट बनाओ:|नोट बनाओ|नोट लिखो:|नोट लिखो)\\s*"), "")
             return ResolvedIntent(
                 type = UserIntentType.NOTE_CREATE,
                 searchQueryOrContent = content.ifBlank { "Untitled Note" },
@@ -123,16 +130,21 @@ object TaskClassifier {
             )
         }
 
-        // 2b. Reminder / Alarm Create Intent (e.g. "create a reminder for tomorrow", "remind me to call mom", "Kal subah 6 baje alarm laga do")
+        // 2b. Reminder / Alarm Create Intent (English, Hinglish, and Devanagari Hindi)
         if (lower.contains("reminder") ||
             lower.startsWith("remind me") ||
             lower.contains("yaad dilana") ||
-            (lower.contains("alarm") && (lower.contains("laga") || lower.contains("set") || lower.contains("baje") || lower.contains("schedule")))
+            trimmed.contains("रिमाइंडर") ||
+            trimmed.contains("याद दिलाना") ||
+            trimmed.contains("याद दिला दो") ||
+            ((lower.contains("alarm") || trimmed.contains("अलार्म")) &&
+                (lower.contains("laga") || lower.contains("set") || lower.contains("baje") || lower.contains("schedule") || trimmed.contains("लगा") || trimmed.contains("बजे")))
         ) {
             val reminderText = trimmed
-                .replaceFirst(Regex("^(?i)(create a reminder|create reminder|set a reminder|set reminder|remind me to|remind me|reminder lagao)\\b\\s*(?:(?:for|to)\\b|:)?\\s*"), "")
+                .replaceFirst(Regex("^(?i)(create a reminder|create reminder|set a reminder|set reminder|remind me to|remind me|reminder lagao|रिमाइंडर लगाओ|रिमाइंडर सेट करो)\\b\\s*(?:(?:for|to)\\b|:)?\\s*"), "")
                 .trim()
                 .removeSuffix(".")
+                .removeSuffix("।")
             return ResolvedIntent(
                 type = UserIntentType.REMINDER_CREATE,
                 searchQueryOrContent = reminderText.ifBlank { trimmed },
@@ -140,9 +152,9 @@ object TaskClassifier {
             )
         }
 
-        // 2c. Flashlight / Torch Control Intent (e.g. "turn on the flashlight", "turn off flashlight", "torch chalu karo")
-        if (lower.contains("flashlight") || lower.contains("torch")) {
-            val turnOff = lower.contains("off") || lower.contains("band") || lower.contains("disable")
+        // 2c. Flashlight / Torch Control Intent
+        if (lower.contains("flashlight") || lower.contains("torch") || trimmed.contains("टॉर्च") || trimmed.contains("फ्लैशलाइट")) {
+            val turnOff = lower.contains("off") || lower.contains("band") || lower.contains("disable") || trimmed.contains("बंद")
             return ResolvedIntent(
                 type = UserIntentType.FLASHLIGHT_CONTROL,
                 searchQueryOrContent = if (turnOff) "false" else "true",
@@ -150,9 +162,12 @@ object TaskClassifier {
             )
         }
 
-        // 2d. Notification Read / Summarize Intent (e.g. "read my notifications", "summarize my notifications")
-        if (lower.contains("notification") && (lower.contains("read") || lower.contains("check") || lower.contains("summarize") || lower.contains("padho") || lower.contains("dikhao") || lower.contains("batao"))) {
-            val mode = if (lower.contains("summarize") || lower.contains("summary")) "summarize" else "read"
+        // 2d. Notification Read / Summarize Intent
+        if ((lower.contains("notification") || trimmed.contains("नोटिफिकेशन")) &&
+            (lower.contains("read") || lower.contains("check") || lower.contains("summarize") || lower.contains("padho") || lower.contains("dikhao") || lower.contains("batao") ||
+                trimmed.contains("पढ़ो") || trimmed.contains("दिखाओ") || trimmed.contains("बताओ"))
+        ) {
+            val mode = if (lower.contains("summarize") || lower.contains("summary") || trimmed.contains("सारांश")) "summarize" else "read"
             return ResolvedIntent(
                 type = UserIntentType.NOTIFICATION_READ,
                 searchQueryOrContent = mode,
@@ -160,16 +175,17 @@ object TaskClassifier {
             )
         }
 
-        // 2e. File / PDF Search Intent (e.g. "find my downloaded PDF", "search file report.pdf", "pdf dhundo")
-        if ((lower.contains("find") || lower.contains("search") || lower.contains("dhundo") || lower.contains("locate")) &&
-            (lower.contains("pdf") || lower.contains("file") || lower.contains("document") || lower.contains("download"))
+        // 2e. File / PDF Search Intent
+        if ((lower.contains("find") || lower.contains("search") || lower.contains("dhundo") || lower.contains("locate") || trimmed.contains("ढूंढो") || trimmed.contains("खोजो")) &&
+            (lower.contains("pdf") || lower.contains("file") || lower.contains("document") || lower.contains("download") || trimmed.contains("पीडीएफ") || trimmed.contains("फाइल"))
         ) {
             val query = when {
-                lower.contains("pdf") -> ".pdf"
+                lower.contains("pdf") || trimmed.contains("पीडीएफ") -> ".pdf"
                 else -> trimmed
                     .replaceFirst(Regex("^(?i)(find|search|locate)\\s+(my\\s+)?(downloaded\\s+)?(file|document)s?\\s*"), "")
                     .trim()
                     .removeSuffix(".")
+                    .removeSuffix("।")
                     .ifBlank { "txt" }
             }
             return ResolvedIntent(
@@ -179,7 +195,7 @@ object TaskClassifier {
             )
         }
 
-        // 3. Screen Read / Dialog Explanation Intent ("Is page par kya likha hai?", "Is dialog ko samjhao", "Read screen")
+        // 3. Screen Read / Dialog Explanation Intent
         if (lower.contains("screen par kya") ||
             lower.contains("page par kya likha") ||
             lower.contains("dialog ko samjhao") ||
@@ -188,6 +204,8 @@ object TaskClassifier {
             lower.contains("what is on screen") ||
             lower.contains("what's on screen") ||
             lower.contains("read screen") ||
+            trimmed.contains("स्क्रीन पढ़ो") ||
+            trimmed.contains("स्क्रीन पर क्या") ||
             (lower.contains("read") && lower.contains("screen") && !lower.contains("save"))
         ) {
             return ResolvedIntent(
@@ -197,7 +215,9 @@ object TaskClassifier {
         }
 
         // 4. Local Time Intent
-        if (lower.contains("time kya") || lower.contains("what time") || lower.contains("current time") || lower.contains("samay kya")) {
+        if (lower.contains("time kya") || lower.contains("what time") || lower.contains("current time") ||
+            lower.contains("samay kya") || trimmed.contains("समय क्या") || trimmed.contains("टाइम क्या")
+        ) {
             return ResolvedIntent(
                 type = UserIntentType.LOCAL_TIME,
                 rawPrompt = prompt
@@ -337,48 +357,53 @@ object TaskClassifier {
             )
         }
 
-        if ((lower.contains("message") || lower.contains("sandesh") || lower.contains("msg")) &&
-            (lower.contains("likho") || lower.contains("write") || lower.contains("draft") || lower.contains("bhejo") || lower.contains("bhej do") || lower.contains("bhejna") || lower.contains("send") || lower.contains("saying") || lower.contains("that"))
-        ) {
+        val hasMessageNoun = lower.contains("message") || lower.contains("sandesh") || lower.contains("msg") ||
+            trimmed.contains("मैसेज") || trimmed.contains("संदेश")
+        val hasMessageVerb = lower.contains("likho") || lower.contains("write") || lower.contains("draft") ||
+            lower.contains("bhejo") || lower.contains("bhej do") || lower.contains("bhejna") ||
+            lower.contains("send") || lower.contains("saying") || lower.contains("that") ||
+            trimmed.contains("भेजो") || trimmed.contains("भेज दो") || trimmed.contains("भेजना") ||
+            trimmed.contains("लिखो") || trimmed.contains("भेज")
+
+        if (hasMessageNoun && hasMessageVerb) {
             var recipient = "Contact"
             var messageContent = ""
 
-            // Extract recipient ("find Rahul", "Rahul ko", "to Rahul", "message Rahul", "send Rahul")
-            val findMatch = Regex("(?i)\\bfind\\s+([a-zA-Z0-9_]+)\\b").find(trimmed)
-            val msgTargetMatch = Regex("(?i)\\b(?:message|msg|send)\\s+([a-zA-Z0-9_]+)\\b").find(trimmed)
+            // Extract recipient across English, Hinglish, and Devanagari ("find Rahul", "Rahul ko", "Amit को message", "to Rahul")
+            val findMatch = Regex("(?i)\\bfind\\s+([\\p{L}\\p{M}0-9_]+)").find(trimmed)
+            val msgTargetMatch = Regex("(?i)\\b(?:message|msg|send)\\s+([\\p{L}\\p{M}0-9_]+)").find(trimmed)
+            val koHindiMatch = Regex("(?i)(?:^|\\s)(?:aur|और|for|to)?\\s*([\\p{L}\\p{M}0-9_+]+)\\s+(?:ke liye|के लिए|ko|को)\\s+(?:whatsapp|व्हाट्सएप|वॉट्सऐप)?\\s*(?:par|पर)?\\s*(?:message|msg|sandesh|मैसेज|संदेश)").find(trimmed)
             val recipientMatch = findMatch
-                ?: Regex("(?i)(?:aur|for|to)?\\s*([a-zA-Z0-9_]+)\\s*(?:ke liye|ko)\\s*(?:whatsapp\\s*)?(?:par\\s*)?(?:message|msg|sandesh)").find(trimmed)
-                ?: Regex("(?i)(?:message|msg|sandesh)\\s*(?:to|bhejo|bhejna|send)\\s*([a-zA-Z0-9_]+)").find(trimmed)
+                ?: koHindiMatch
+                ?: Regex("(?i)(?:message|msg|sandesh|मैसेज|संदेश)\\s*(?:to|bhejo|bhejna|send|भेजो|भेजना)\\s*([\\p{L}\\p{M}0-9_+]+)").find(trimmed)
                 ?: msgTargetMatch
             if (recipientMatch != null) {
                 val groupVal = if (recipientMatch.groupValues.size > 1) recipientMatch.groupValues[1] else ""
-                if (groupVal.isNotBlank() &&
-                    !groupVal.equals("message", ignoreCase = true) &&
-                    !groupVal.equals("msg", ignoreCase = true) &&
-                    !groupVal.equals("a", ignoreCase = true) &&
-                    !groupVal.equals("the", ignoreCase = true) &&
-                    !groupVal.equals("whatsapp", ignoreCase = true) &&
-                    !groupVal.equals("him", ignoreCase = true) &&
-                    !groupVal.equals("her", ignoreCase = true)
-                ) {
+                val blockedTokens = setOf(
+                    "message", "msg", "a", "the", "whatsapp", "him", "her", "to", "par", "पर",
+                    "भेज", "भेजो", "भेजना", "दो", "है", "हैं", "करना", "करो", "व्हाट्सएप", "वॉट्सऐप",
+                    "मुझे", "आज", "फिर", "और"
+                )
+                if (groupVal.isNotBlank() && groupVal.lowercase() !in blockedTokens) {
                     recipient = groupVal
                 }
             }
 
-            // Extract message body if colon or "that/saying <message>" is used
+            // Extract message body if colon or "that/saying/ki/कि <message>" is used
             val splitByColon = trimmed.split(":", limit = 2)
-            val thatMatch = Regex("(?i)\\b(?:message|msg)\\s+(?:that|saying|ki)\\s+(.+)$").find(trimmed)
-                ?: Regex("(?i)\\b(?:saying|that)\\s+(.+)$").find(trimmed)
+            val thatMatch = Regex("(?i)(?:message|msg|मैसेज|संदेश)\\s+(?:that|saying|ki|कि)\\s+(.+)$").find(trimmed)
+                ?: Regex("(?i)\\b(?:saying|that|कि)\\s+(.+)$").find(trimmed)
             if (splitByColon.size > 1) {
-                messageContent = splitByColon[1].trim()
+                messageContent = splitByColon[1].trim().removeSuffix("।").trim()
             } else if (thatMatch != null) {
-                messageContent = thatMatch.groupValues[1].trim().removeSuffix(".")
+                messageContent = thatMatch.groupValues[1].trim().removeSuffix(".").removeSuffix("।").trim()
             } else {
                 messageContent = trimmed
-                    .replaceFirst(Regex("(?i)^.*?\\b(message|msg|sandesh)\\b\\s*"), "")
-                    .replaceFirst(Regex("(?i)^\\s*(likho|likh do|draft|send|bhejo|bhej do|bhejna|karo|kar do|hai)\\s*"), "")
+                    .replaceFirst(Regex("(?i)^.*?(?:message|msg|sandesh|मैसेज|संदेश)\\s*"), "")
+                    .replaceFirst(Regex("(?i)^\\s*(likho|likh do|draft|send|bhejo|bhej do|bhejna|karo|kar do|hai|भेजो|भेज दो|भेज देना|भेजना है|भेजना|लिखो|लिख दो|करना है|करो|है)\\s*"), "")
                     .trim()
                     .removeSuffix(".")
+                    .removeSuffix("।")
                     .trim()
             }
 
@@ -391,25 +416,44 @@ object TaskClassifier {
             )
         }
 
-        // 5b. Phone Call Intent (e.g. "call Rahul", "call +919876543210", "Rahul ko call karo", "Ab usko call bhi kar do")
+        // 5b. Phone Call Intent (English, Hinglish, and Devanagari Hindi: "call Rahul", "Rahul ko call karo", "आज मुझे Rahul को कॉल करना है")
+        val isDevanagariCall = trimmed.contains("को कॉल") ||
+            trimmed.contains("को फ़ोन") ||
+            trimmed.contains("को फोन") ||
+            trimmed.contains("कॉल करना") ||
+            trimmed.contains("कॉल करो") ||
+            trimmed.contains("कॉल लगाओ") ||
+            trimmed.contains("फ़ोन करो") ||
+            trimmed.contains("फोन करो") ||
+            trimmed.contains("फोन लगाओ")
+
         if (lower.startsWith("call ") ||
             lower.contains("ko call karo") ||
             lower.contains("ko call kar do") ||
             lower.contains("ko call bhi kar do") ||
+            lower.contains("ko call karna") ||
             lower.contains("ko phone karo") ||
+            lower.contains("ko phone karna") ||
             lower.contains("par call karo") ||
             lower.startsWith("phone lagao") ||
             lower.startsWith("make a call to ") ||
             lower.startsWith("make a phone call to ") ||
-            lower.startsWith("dial ")
+            lower.startsWith("dial ") ||
+            isDevanagariCall
         ) {
-            val targetContact = trimmed
+            val hindiCallTarget = Regex("(?i)([\\p{L}\\p{M}0-9_+]+)\\s+(?:ko|को|par|पर)\\s+(?:call|phone|कॉल|फ़ोन|फोन)").find(trimmed)
+                ?.groupValues?.getOrNull(1)?.trim()
+                ?.takeIf { it.lowercase() !in setOf("mujhe", "मुझे", "aaj", "आज", "ab", "अब", "phir", "फिर") }
+
+            val targetContact = hindiCallTarget ?: trimmed
                 .removeSuffix(".")
+                .removeSuffix("।")
                 .trim()
-                .replaceFirst(Regex("^(?i)(ab\\s+|now\\s+)?(make a phone call to|make a call to|call|dial|phone lagao)\\s+"), "")
-                .replaceFirst(Regex("(?i)\\s*(ko call bhi kar do|ko call kar do|ko call karo|ko phone karo|par call karo|ko)\\s*$"), "")
+                .replaceFirst(Regex("^(?i)(aaj\\s+mujhe\\s+|mujhe\\s+|आज\\s+मुझे\\s+|मुझे\\s+|ab\\s+|अब\\s+|now\\s+)?(make a phone call to|make a call to|call|dial|phone lagao|कॉल करो|कॉल लगाओ|फोन लगाओ)\\s+"), "")
+                .replaceFirst(Regex("(?i)\\s*(ko call bhi kar do|ko call kar do|ko call karna hai|ko call karna|ko call karo|ko phone karo|par call karo|को कॉल करना है|को कॉल करना|को कॉल करो|को कॉल कर दो|को कॉल लगाओ|को फ़ोन करो|को फोन करो|ko|को)\\s*$"), "")
                 .trim()
                 .removeSuffix(".")
+                .removeSuffix("।")
             if (targetContact.isNotBlank()) {
                 return ResolvedIntent(
                     type = UserIntentType.PHONE_CALL,
@@ -553,18 +597,32 @@ object TaskClassifier {
             )
         }
 
-        // 8. App Launch Intent (e.g. "Chrome kholo", "open WhatsApp.", "Settings kholo")
-        if ((lower.contains("kholo") || lower.contains("open") || lower.contains("chalao") || lower.contains("launch") || lower.contains("start")) &&
+        // 8. App Launch Intent (English, Hinglish, and Devanagari Hindi: "Chrome kholo", "open WhatsApp", "व्हाट्सएप खोलो")
+        if ((lower.contains("kholo") || lower.contains("open") || lower.contains("chalao") || lower.contains("launch") || lower.contains("start") ||
+                trimmed.contains("खोलो") || trimmed.contains("खोल दो") || trimmed.contains("चलाओ")) &&
             !lower.contains("screen par") && !lower.contains("option")
         ) {
-            val cleanedApp = trimmed
+            val cleanedAppRaw = trimmed
                 .removeSuffix(".")
+                .removeSuffix("।")
                 .trim()
-                .replaceFirst(Regex("^(?i)(babu|nayro)\\s*,?\\s*"), "")
-                .replaceFirst(Regex("^(?i)(open|launch|start|kholo)\\s*"), "")
-                .replaceFirst(Regex("(?i)\\s*(kholo|chalao|start karo|open karo)\\s*$"), "")
+                .replaceFirst(Regex("^(?i)(babu|nayro|बाबू|नायरो)\\s*,?\\s*"), "")
+                .replaceFirst(Regex("^(?i)(open|launch|start|kholo|खोलो)\\s*"), "")
+                .replaceFirst(Regex("(?i)\\s*(kholo|chalao|start karo|open karo|खोलो|खोल दो|चलाओ|चालू करो)\\s*$"), "")
                 .trim()
                 .removeSuffix(".")
+                .removeSuffix("।")
+
+            val cleanedApp = when (cleanedAppRaw) {
+                "व्हाट्सएप", "वॉट्सऐप", "व्हाट्सऐप" -> "WhatsApp"
+                "यूट्यूब" -> "YouTube"
+                "क्रोम" -> "Chrome"
+                "इंस्टाग्राम" -> "Instagram"
+                "सेटिंग्स", "सेटिंग" -> "Settings"
+                "जीमेल" -> "Gmail"
+                "कैमरा" -> "Camera"
+                else -> cleanedAppRaw
+            }
 
             if (cleanedApp.isNotBlank()) {
                 return ResolvedIntent(

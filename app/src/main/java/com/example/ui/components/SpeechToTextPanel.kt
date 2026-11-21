@@ -8,14 +8,11 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -54,6 +51,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
@@ -65,9 +64,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -75,6 +71,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.R
+import com.example.core.agent.AgentState
 import com.example.core.voice.VoiceState
 import com.example.ui.theme.Coral
 import com.example.ui.theme.ErrorRed
@@ -95,13 +92,14 @@ private val DefaultSpeechLanguages = listOf(
 )
 
 /**
- * Interactive Speech-to-Text Voice Command Panel for "Babu NAYRO cute baby".
+ * Interactive Speech-to-Text & Autonomous Voice Control Panel for NAYRO.
  *
- * Implements the full Android runtime microphone permission flow via
+ * Implements the Android runtime microphone permission flow via
  * [ActivityResultContracts.RequestPermission] for [Manifest.permission.RECORD_AUDIO],
- * displays live audio waveform bars from SpeechRecognizer RMS telemetry, streams partial and
- * final speech transcripts, supports Hindi/English/Hinglish language switching, and routes
- * recognized voice commands directly to NAYRO's unified AgentRuntime.
+ * renders [NayroAudioVisualizer] driven by real SpeechRecognizer/AudioRecord RMS telemetry,
+ * streams partial and final transcripts, supports Hindi/English/Hinglish switching,
+ * exposes a dedicated Background Listening ON/OFF toggle and continuous conversation session control,
+ * and routes recognized voice commands directly to NAYRO's unified AgentRuntime.
  */
 @Composable
 fun SpeechToTextVoicePanel(
@@ -121,7 +119,13 @@ fun SpeechToTextVoicePanel(
     onLanguageSelected: (String) -> Unit,
     onSendRecognizedCommand: (String) -> Unit,
     onClearTranscript: () -> Unit,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    agentState: AgentState = AgentState.Idle,
+    standbyAudioLevel: Float = 0f,
+    isBackgroundListeningEnabled: Boolean = false,
+    isFollowUpSessionActive: Boolean = false,
+    onToggleBackgroundListening: (Boolean) -> Unit = {},
+    onEndConversationSession: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var permissionDeniedOnce by remember { mutableStateOf(false) }
@@ -156,6 +160,7 @@ fun SpeechToTextVoicePanel(
     val isTranscribing = voiceState == VoiceState.TRANSCRIBING
     val isSpeaking = voiceState == VoiceState.SPEAKING
     val isActiveCapture = isListening || isTranscribing
+    val visualState = resolveVisualizerState(voiceState, agentState)
 
     val displayTranscript = remember(partialTranscript, finalTranscript, isActiveCapture) {
         when {
@@ -165,11 +170,12 @@ fun SpeechToTextVoicePanel(
         }
     }
 
-    val personaTitle = stringResource(R.string.stt_persona_title)
-    val subtitleText = if (assistantName.isNotBlank() && !personaTitle.contains(assistantName, ignoreCase = true)) {
-        "$assistantName • ${stringResource(R.string.stt_panel_subtitle)}"
-    } else {
-        stringResource(R.string.stt_panel_subtitle)
+    val cleanAssistantName = assistantName.trim().ifEmpty { "NAYRO" }
+    val personaTitle = "$cleanAssistantName • Voice Agent"
+    val subtitleText = when {
+        isFollowUpSessionActive -> "Continuous voice session active • Speak naturally without wake phrase"
+        isBackgroundListeningEnabled -> "Background wake listening ON • Local on-device detection"
+        else -> stringResource(R.string.stt_panel_subtitle)
     }
 
     fun triggerMicAction() {
@@ -477,6 +483,7 @@ fun SpeechToTextVoicePanel(
                                     isTranscribing -> stringResource(R.string.stt_transcribing_prompt)
                                     isSpeaking -> stringResource(R.string.stt_speaking_prompt)
                                     !hasMicPermission -> stringResource(R.string.stt_mic_rationale_title)
+                                    visualState != VisualizerVisualState.IDLE -> visualState.accessibleLabel
                                     else -> stringResource(R.string.stt_tap_to_speak)
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
@@ -485,12 +492,15 @@ fun SpeechToTextVoicePanel(
                                 modifier = Modifier.testTag("stt_status_label")
                             )
                             Spacer(modifier = Modifier.height(6.dp))
-                            VoiceAudioWaveform(
-                                audioLevel = if (isListening) audioLevel else 0f,
-                                isActive = isActiveCapture,
+                            NayroAudioVisualizer(
+                                voiceState = voiceState,
+                                agentState = agentState,
+                                audioLevel = audioLevel,
+                                standbyAudioLevel = standbyAudioLevel,
+                                barCount = 18,
+                                height = 32.dp,
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .height(22.dp)
                                     .testTag("stt_audio_waveform")
                             )
                         }
@@ -511,6 +521,50 @@ fun SpeechToTextVoicePanel(
                                 )
                             }
                         }
+                    }
+
+                    // Inline Continuous Session & Background Listening quick controls
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(
+                                text = if (isBackgroundListeningEnabled) {
+                                    "Background Listening: ON"
+                                } else {
+                                    "Background Listening: OFF"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (isBackgroundListeningEnabled) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (isFollowUpSessionActive) {
+                                Spacer(modifier = Modifier.width(8.dp))
+                                TextButton(
+                                    onClick = onEndConversationSession,
+                                    modifier = Modifier
+                                        .minimumInteractiveComponentSize()
+                                        .testTag("stt_end_session_button")
+                                ) {
+                                    Text("End Session", color = Coral, style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                        Switch(
+                            checked = isBackgroundListeningEnabled,
+                            onCheckedChange = onToggleBackgroundListening,
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = Coral,
+                                checkedTrackColor = ForestGreen
+                            ),
+                            modifier = Modifier.testTag("stt_bg_listening_toggle")
+                        )
                     }
 
                     // Live / Final Recognized Speech Transcript Box
@@ -617,48 +671,6 @@ fun SpeechToTextVoicePanel(
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun VoiceAudioWaveform(
-    audioLevel: Float,
-    isActive: Boolean,
-    modifier: Modifier = Modifier
-) {
-    val smoothedLevel by animateFloatAsState(
-        targetValue = if (isActive) audioLevel.coerceIn(0.12f, 1f) else 0.14f,
-        animationSpec = spring(dampingRatio = 0.72f, stiffness = 420f),
-        label = "stt_waveform_level"
-    )
-    val activeColor = Coral
-    val idleColor = SoftSage
-
-    Canvas(modifier = modifier) {
-        val barCount = 16
-        val spacing = size.width / (barCount * 1.9f)
-        val barWidth = ((size.width - spacing * (barCount - 1)) / barCount).coerceAtLeast(3f)
-        val centerY = size.height / 2f
-
-        for (i in 0 until barCount) {
-            // Symmetrical harmonic envelope across bars so RMS audio level animates organically
-            val normalizedPos = (i.toFloat() / (barCount - 1)) * 2f - 1f // -1..1
-            val envelope = (1f - (normalizedPos * normalizedPos * 0.65f)).coerceIn(0.25f, 1f)
-            val variation = if (i % 2 == 0) 1f else 0.72f
-            val heightFraction = if (isActive) {
-                (smoothedLevel * envelope * variation).coerceIn(0.18f, 1f)
-            } else {
-                0.22f * envelope
-            }
-            val barHeight = (size.height * heightFraction).coerceAtLeast(4f)
-            val left = i * (barWidth + spacing)
-            drawRoundRect(
-                color = if (isActive) activeColor else idleColor,
-                topLeft = Offset(left, centerY - barHeight / 2f),
-                size = Size(barWidth, barHeight),
-                cornerRadius = CornerRadius(barWidth / 2f, barWidth / 2f)
-            )
         }
     }
 }

@@ -95,10 +95,16 @@ fun BackgroundControlScreen(
     currentAgentStateLabel: String = "IDLE",
     onPauseBackgroundAgent: (Int?) -> Unit = {},
     onResumeBackgroundAgent: () -> Unit = {},
-    onOpenPermissionSettings: (PermissionType) -> Unit = {}
+    onOpenPermissionSettings: (PermissionType) -> Unit = {},
+    assistantName: String = "NAYRO",
+    configuredWakePhrases: List<String> = emptyList(),
+    backgroundListeningStatus: String = "",
+    oemBackgroundGuidance: String = ""
 ) {
     val context = LocalContext.current
     val scrollState = rememberScrollState()
+    val cleanAssistantName = assistantName.trim().ifEmpty { "NAYRO" }
+    val primaryWakeLabel = configuredWakePhrases.firstOrNull()?.takeIf { it.isNotBlank() } ?: "Hi $cleanAssistantName"
 
     val foregroundStatus by ServiceStateRepository.foregroundServiceStatus.collectAsState()
     val isBackgroundPaused by ServiceStateRepository.isBackgroundAgentPaused.collectAsState()
@@ -132,6 +138,167 @@ fun BackgroundControlScreen(
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Master Card: Dedicated Background Voice Listening ON/OFF Control
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(
+                width = 1.5.dp,
+                color = if (isWakeWordEnabled) SuccessGreen else MaterialTheme.colorScheme.outline.copy(alpha = 0.5f)
+            ),
+            shape = RoundedCornerShape(18.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("bg_master_listening_card")
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (isWakeWordEnabled) {
+                                "Background Voice Listening: ON"
+                            } else {
+                                "Background Voice Listening: OFF"
+                            },
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = backgroundListeningStatus.ifBlank {
+                                if (isWakeWordEnabled) {
+                                    "Local wake-word detection active for '$primaryWakeLabel'. Microphone audio stays on-device."
+                                } else {
+                                    "Off — AudioRecord and microphone foreground service are stopped. In-app chat & mic continue working."
+                                }
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Switch(
+                        checked = isWakeWordEnabled,
+                        onCheckedChange = onToggleWakeWord,
+                        colors = SwitchDefaults.colors(checkedThumbColor = Coral, checkedTrackColor = ForestGreen),
+                        modifier = Modifier.testTag("bg_master_listening_switch")
+                    )
+                }
+                if (oemBackgroundGuidance.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = oemBackgroundGuidance,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Coral
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // Dual Voice Activation & Screen-Off System Assistant Card (Mode A + Mode B)
+        val screenOffReport = com.example.core.voice.assistant.ScreenOffWakeCapabilityManager.evaluateCapability(
+            context = context,
+            isLocalWakeListening = isWakeWordEnabled && isForegroundRunning
+        )
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.45f)),
+            shape = RoundedCornerShape(16.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("card_dual_voice_activation")
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Dual Voice Activation (Floating + Screen-Off)",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = screenOffReport.mode.label,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Coral
+                        )
+                    }
+                    StatusBadge(
+                        label = if (screenOffReport.isDefaultAssistantRoleHeld || screenOffReport.isVoiceInteractionServiceActive) {
+                            "ASSISTANT SET"
+                        } else {
+                            "LOCAL FALLBACK"
+                        },
+                        isActive = screenOffReport.isLocalFallbackListeningActive || screenOffReport.isDefaultAssistantRoleHeld,
+                        testTag = "badge_screen_off_mode"
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Text(
+                    text = "Mode A (Floating Icon): ${if (isFloatingRunning) "Active — tap floating bubble to start continuous mic session immediately." else "Stopped — start Floating Assistant below."}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Mode B (Screen-Off & VoiceInteractionService): ${screenOffReport.honestStatusSummary}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Hardware DSP Hotword: ${if (screenOffReport.isHardwareDspHotwordSupported) "Supported (Privileged)" else "Unavailable on third-party installs (using local MFCC+DTW fallback)"}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (screenOffReport.isHardwareDspHotwordSupported) SuccessGreen else WarningAmber
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = screenOffReport.oemCompatibilityNote,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                val intent = com.example.core.voice.assistant.ScreenOffWakeCapabilityManager
+                                    .createDefaultAssistantSettingsIntent(context)
+                                context.startActivity(intent)
+                            } catch (_: Exception) {}
+                        },
+                        modifier = Modifier.testTag("btn_set_default_assistant")
+                    ) {
+                        Icon(imageVector = Icons.Default.Settings, contentDescription = "Set Default Assistant")
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            if (screenOffReport.isDefaultAssistantRoleHeld) "Assistant Settings" else "Set Default Assistant",
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
+                }
+            }
+        }
 
         Spacer(modifier = Modifier.height(16.dp))
 
@@ -205,7 +372,7 @@ fun BackgroundControlScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "2. Wake Word Detection ('Hi Babu')",
+                            text = "2. Wake Word Detection ('$primaryWakeLabel')",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurface
                         )
@@ -389,7 +556,7 @@ fun BackgroundControlScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "Floating Assistant (Babu Bubble)",
+                            text = "Floating Assistant ($cleanAssistantName Bubble)",
                             style = MaterialTheme.typography.titleLarge,
                             color = MaterialTheme.colorScheme.onSurface
                         )
@@ -409,7 +576,7 @@ fun BackgroundControlScreen(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 Text(
-                    text = "A real system-level draggable floating icon for Babu. Drag to reposition, tap to expand quick prompt panel, or drag to screen edge to snap.",
+                    text = "A real system-level draggable floating icon for $cleanAssistantName. Drag to reposition, tap to expand compact voice/chat overlay with live waveform, or drag to screen edge to snap.",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

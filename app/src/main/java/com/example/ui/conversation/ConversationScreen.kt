@@ -25,7 +25,6 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -41,27 +40,39 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.core.agent.AgentState
 import com.example.core.voice.VoiceState
 import com.example.data.local.entities.ConversationEntity
+import com.example.ui.components.NayroAudioVisualizer
+import com.example.ui.components.VisualizerVisualState
+import com.example.ui.components.resolveVisualizerState
 import com.example.ui.theme.Coral
 import com.example.ui.theme.ForestGreen
 import com.example.ui.theme.SoftSage
 
 @Composable
 fun ConversationScreen(
-    assistantName: String = "Babu",
+    assistantName: String = "NAYRO",
     conversations: List<ConversationEntity> = emptyList(),
     voiceState: VoiceState = VoiceState.DISABLED,
     liveTranscript: String = "",
     audioLevel: Float = 0f,
     onVoiceTap: () -> Unit = {},
     onSendMessage: (String) -> Unit = {},
-    onClearHistory: () -> Unit = {}
+    onClearHistory: () -> Unit = {},
+    agentState: AgentState = AgentState.Idle,
+    standbyAudioLevel: Float = 0f,
+    isFollowUpSessionActive: Boolean = false,
+    onEndConversationSession: () -> Unit = {}
 ) {
     var textInput by remember { mutableStateOf("") }
+    val cleanAssistantName = assistantName.trim().ifEmpty { "NAYRO" }
     val isVoiceCapturing = voiceState == VoiceState.LISTENING ||
         voiceState == VoiceState.FOLLOW_UP_LISTENING ||
         voiceState == VoiceState.TRANSCRIBING
+    val visualState = resolveVisualizerState(voiceState, agentState)
+    val showVisualizerBanner = visualState != VisualizerVisualState.IDLE &&
+        visualState != VisualizerVisualState.STANDBY
 
     Column(
         modifier = Modifier
@@ -80,6 +91,14 @@ fun ConversationScreen(
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.weight(1f)
             )
+            if (isFollowUpSessionActive) {
+                androidx.compose.material3.TextButton(
+                    onClick = onEndConversationSession,
+                    modifier = Modifier.testTag("chat_end_session_button")
+                ) {
+                    Text("End Voice Session", color = Coral)
+                }
+            }
             IconButton(
                 onClick = onClearHistory,
                 modifier = Modifier.testTag("clear_history_button")
@@ -103,7 +122,7 @@ fun ConversationScreen(
                 contentAlignment = Alignment.Center
             ) {
                 Text(
-                    text = "No previous conversations. Tap the microphone or type below to talk with $assistantName!",
+                    text = "No previous conversations. Tap the microphone or type below to talk with $cleanAssistantName!",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -134,7 +153,7 @@ fun ConversationScreen(
                         ) {
                             Column(modifier = Modifier.padding(12.dp)) {
                                 Text(
-                                    text = if (isUser) "You" else assistantName,
+                                    text = if (isUser) "You" else cleanAssistantName,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = if (isUser) Coral else ForestGreen
                                 )
@@ -151,7 +170,7 @@ fun ConversationScreen(
             }
         }
 
-        if (isVoiceCapturing) {
+        if (showVisualizerBanner) {
             Spacer(modifier = Modifier.height(8.dp))
             Card(
                 colors = CardDefaults.cardColors(
@@ -169,13 +188,13 @@ fun ConversationScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = if (voiceState == VoiceState.TRANSCRIBING) "Transcribing speech..." else "Listening for voice command...",
+                            text = visualState.accessibleLabel,
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.SemiBold,
                             color = Coral
                         )
                         Text(
-                            text = "Tap Stop to cancel",
+                            text = if (isVoiceCapturing) "Tap Stop to cancel" else visualState.name,
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -189,14 +208,13 @@ fun ConversationScreen(
                         )
                     }
                     Spacer(modifier = Modifier.height(6.dp))
-                    LinearProgressIndicator(
-                        progress = { audioLevel.coerceIn(0.08f, 1f) },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(4.dp)
-                            .clip(RoundedCornerShape(2.dp)),
-                        color = Coral,
-                        trackColor = SoftSage
+                    NayroAudioVisualizer(
+                        voiceState = voiceState,
+                        agentState = agentState,
+                        audioLevel = audioLevel,
+                        standbyAudioLevel = standbyAudioLevel,
+                        barCount = 18,
+                        height = 28.dp
                     )
                 }
             }

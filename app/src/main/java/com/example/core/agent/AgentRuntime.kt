@@ -82,6 +82,7 @@ class AgentRuntime(
     private val stateManager = TaskStateManager()
     private val planValidator = PlanValidator(context, permissionManager, capabilityManager)
     val confirmationManager = ConfirmationManager()
+    val conversationalEngine = ConversationalIntelligenceEngine()
 
     val actionExecutor = ActionExecutor(
         context = context,
@@ -94,7 +95,8 @@ class AgentRuntime(
         subAgentManager = subAgentManager,
         callIntelligenceManager = callIntelligenceManager,
         workflowEngine = workflowEngine,
-        automationEngine = automationEngine
+        automationEngine = automationEngine,
+        conversationalEngine = conversationalEngine
     )
 
     val agentBrain = AgentBrain(
@@ -171,6 +173,22 @@ class AgentRuntime(
 
     fun isHeartbeatHealthy(maxStaleMs: Long = 60_000L): Boolean {
         return (System.currentTimeMillis() - lastHeartbeatTimestampMs) <= maxStaleMs
+    }
+
+    /**
+     * Reports which of NAYRO's three Execution Domains ([ExecutionDomain.DEVICE],
+     * [ExecutionDomain.VOICE], [ExecutionDomain.COMMUNICATION]) are coordinated by this
+     * single unified [AgentRuntime] for [task].
+     */
+    fun getActiveDomainsForTask(task: AgentTask, invokedViaVoice: Boolean = false): Set<ExecutionDomain> {
+        val domains = linkedSetOf<ExecutionDomain>()
+        if (invokedViaVoice) {
+            domains.add(ExecutionDomain.VOICE)
+        }
+        for (action in task.actions) {
+            domains.add(ConversationalIntelligenceEngine.domainForAction(action.actionType))
+        }
+        return domains
     }
 
     fun setState(newState: AgentState) {
@@ -564,24 +582,31 @@ class AgentRuntime(
         isTaskCancelled = false
         _currentState.value = AgentState.Thinking
 
-        // Handle pure wake greeting ("Hi <AssistantName>", "Hey <AssistantName>", "Hi Babu", "Hi Nayro") in continuous voice/chat mode
+        // Handle pure wake greeting using dynamic configured identity & wake phrases (no hardcoded lock-in)
         val normalizedGreeting = trimmedPrompt.lowercase().removeSuffix(".").removeSuffix("!").trim()
         val lowerPersona = assistantName.lowercase().trim()
-        val dynamicGreetings = setOf(
-            "hi $lowerPersona",
-            "hey $lowerPersona",
-            "hello $lowerPersona",
-            lowerPersona,
-            "hi babu",
-            "hey babu",
-            "hello babu",
-            "babu",
-            "hi nayro",
-            "hey nayro",
-            "hey cutie"
-        )
+        val configuredWakeGreetings = com.example.core.identity.AssistantIdentityStore.sharedInstance
+            ?.getWakePhrases()
+            ?.map { it.lowercase().trim() }
+            .orEmpty()
+        val dynamicGreetings = buildSet {
+            add("hi $lowerPersona")
+            add("hey $lowerPersona")
+            add("hello $lowerPersona")
+            add(lowerPersona)
+            add("hi nayro")
+            add("hey nayro")
+            add("hello nayro")
+            add("nayro")
+            addAll(configuredWakeGreetings)
+        }
         if (normalizedGreeting in dynamicGreetings) {
-            val greetingReply = "Haan, bolo! Main ($assistantName) sun raha hoon."
+            val activationCue = com.example.core.identity.AssistantIdentityStore.sharedInstance
+                ?.getCurrentProfile()?.activationResponse?.takeIf { it.isNotBlank() }
+                ?: "Yes, I'm listening."
+            val greetingReply = "$activationCue ($assistantName)"
+            continuityManager.recordConversationTurn("user", trimmedPrompt)
+            continuityManager.recordConversationTurn("assistant", greetingReply)
             val greetingTask = AgentTask(
                 userInstruction = userPrompt,
                 resolvedIntent = "WAKE_GREETING",
@@ -599,8 +624,9 @@ class AgentRuntime(
             )
         }
 
-        // 0. Resolve pronouns ("him", "usko", "that file") and check multi-turn continuation (Part 9)
+        // 0. Resolve pronouns ("him", "usko", "that file", "video about it", "open the second result") and check multi-turn continuation (Part 9)
         val resolvedPrompt = continuityManager.resolveReferencesInPrompt(userPrompt)
+        continuityManager.recordConversationTurn("user", resolvedPrompt)
         try {
             memoryManager.processPromptForMemory(resolvedPrompt)
         } catch (_: Exception) {}
@@ -887,6 +913,18 @@ class AgentRuntime(
             val enrichedParams = rawAction.parameters.toMutableMap()
             stepContext["previousStepOutput"]?.let { prev ->
                 enrichedParams.putIfAbsent("previousStepOutput", prev)
+            }
+            if (rawAction.actionType == ActionType.QUERY_LLM) {
+                stepContext["memoryContext"]?.let { mem ->
+                    enrichedParams.putIfAbsent("memoryContext", mem)
+                }
+                stepContext["conversationHistory"]?.let { hist ->
+                    enrichedParams.putIfAbsent("conversationHistory", hist)
+                }
+                val openEndedSummary = continuityManager.buildOpenEndedContextSummary()
+                if (openEndedSummary.isNotBlank()) {
+                    enrichedParams.putIfAbsent("openEndedContext", openEndedSummary)
+                }
             }
             val action = rawAction.copy(parameters = enrichedParams)
 

@@ -157,6 +157,15 @@ class AndroidSpeechRecognitionProvider(
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, cleanLang)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, cleanLang)
+            putExtra(RecognizerIntent.EXTRA_ONLY_RETURN_LANGUAGE_PREFERENCE, false)
+            // Enable automatic Hindi / English / Hinglish switching on Android 14+ (API 34+)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                putExtra(RecognizerIntent.EXTRA_ENABLE_LANGUAGE_DETECTION, true)
+                putStringArrayListExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_DETECTION_ALLOWED_LANGUAGES,
+                    arrayListOf("hi-IN", "en-IN", "en-US")
+                )
+            }
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, maxResults.coerceIn(1, 5))
             putExtra(RecognizerIntent.EXTRA_CONFIDENCE_SCORES, true)
@@ -273,6 +282,21 @@ class AndroidSpeechRecognitionProvider(
                 _isListening.value = false
                 _rmsDb.value = 0f
                 _normalizedAudioLevel.value = 0f
+                // Automatic one-time multilingual fallback if requested locale pack is unavailable (Android 13+ codes 12/13)
+                if ((error == 12 || error == 13) && !activeLanguageTag.equals("en-IN", ignoreCase = true)) {
+                    activeLanguageTag = "en-IN"
+                    postToMain {
+                        try {
+                            val fallbackIntent = buildRecognizerIntent(languageTag = "en-IN", preferOffline = false)
+                            speechRecognizer?.startListening(fallbackIntent)
+                        } catch (_: Throwable) {
+                            val message = mapSpeechRecognizerError(error)
+                            _lastError.value = message
+                            onErrorCallback?.invoke(error, message)
+                        }
+                    }
+                    return
+                }
                 val message = mapSpeechRecognizerError(error)
                 _lastError.value = message
                 onErrorCallback?.invoke(error, message)

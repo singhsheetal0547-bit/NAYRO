@@ -29,6 +29,25 @@ class OpenAICompatibleAdapter(
         .build()
 ) : AIProviderAdapter {
 
+    companion object {
+        const val OPENROUTER_REFERER = "https://github.com/singhsheetal0547-bit/NAYRO"
+        const val OPENROUTER_TITLE = "NAYRO Autonomous Android Agent"
+
+        fun buildRequestHeaders(config: ProviderConfig, apiKey: String): Map<String, String> {
+            val headers = linkedMapOf<String, String>()
+            if (apiKey.isNotBlank()) {
+                headers["Authorization"] = "Bearer $apiKey"
+            }
+            if (config.type == com.example.core.provider.ProviderType.OPENROUTER ||
+                config.baseUrl.contains("openrouter.ai", ignoreCase = true)
+            ) {
+                headers["HTTP-Referer"] = OPENROUTER_REFERER
+                headers["X-Title"] = OPENROUTER_TITLE
+            }
+            return headers
+        }
+    }
+
     override suspend fun generateResponse(request: AIRequest, apiKey: String): AIResult = withContext(Dispatchers.IO) {
         val normalizedBaseUrl = providerConfig.baseUrl.trimEnd('/')
         val endpointUrl = if (normalizedBaseUrl.endsWith("/chat/completions")) {
@@ -59,8 +78,8 @@ class OpenAICompatibleAdapter(
             .url(endpointUrl)
             .post(bodyJson.toString().toRequestBody(mediaType))
 
-        if (apiKey.isNotBlank()) {
-            requestBuilder.addHeader("Authorization", "Bearer $apiKey")
+        buildRequestHeaders(providerConfig, apiKey).forEach { (key, value) ->
+            requestBuilder.addHeader(key, value)
         }
 
         try {
@@ -68,10 +87,20 @@ class OpenAICompatibleAdapter(
             val responseBody = httpResponse.body?.string() ?: ""
 
             if (!httpResponse.isSuccessful) {
-                val errorMsg = try {
+                val baseErrorMsg = try {
                     JSONObject(responseBody).optJSONObject("error")?.optString("message") ?: "HTTP ${httpResponse.code}"
                 } catch (e: Exception) {
                     "HTTP ${httpResponse.code}: $responseBody"
+                }
+                val retryAfter = httpResponse.header("Retry-After")?.takeIf { it.isNotBlank() }
+                val errorMsg = if (httpResponse.code == 429) {
+                    if (retryAfter != null) {
+                        "Rate limit exceeded (${providerConfig.name}). Retry after ${retryAfter}s. $baseErrorMsg"
+                    } else {
+                        "Rate limit exceeded (${providerConfig.name}). $baseErrorMsg"
+                    }
+                } else {
+                    baseErrorMsg
                 }
                 return@withContext AIResult.Error(httpResponse.code, errorMsg, isRetryable = httpResponse.code in listOf(429, 500, 502, 503))
             }

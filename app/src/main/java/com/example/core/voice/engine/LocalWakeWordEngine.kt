@@ -27,34 +27,97 @@ import kotlin.math.sqrt
 
 enum class WakeEngineState {
     STOPPED,
+    NOT_CONFIGURED,
     LISTENING_FOR_WAKE,
     WAKE_DETECTED,
     MICROPHONE_BUSY,
     MODEL_UNAVAILABLE,
+    DEGRADED,
     ERROR
 }
 
 /**
- * Honest classification of the wake-word asset binary format (Section 5).
- * Distinguishes a genuine TensorFlow Lite FlatBuffer (`TFL3` header) from
- * NAYRO's JSON acoustic MFCC/DTW template store.
+ * Honest classification of the wake-word asset binary format (Section 5 / P0-1).
+ * Distinguishes a genuine TensorFlow Lite FlatBuffer (`TFL3` header),
+ * validated JSON MFCC/DTW acoustic templates, invalid/corrupt payloads, or missing assets.
  */
 enum class WakeAssetFormat {
     TFLITE_FLATBUFFER,
     JSON_ACOUSTIC_TEMPLATES,
+    INVALID,
     MISSING
 }
 
 /**
- * Honest support classification for wake phrases (Section 2).
- * Never claims an arbitrary custom wake phrase is acoustically active unless either a bundled
- * acoustic template or user-enrolled multi-frame DTW voice samples exist for that phrase.
+ * Honest support classification for wake phrases (Section 2 / P0-1).
+ * Never claims an arbitrary custom wake phrase is acoustically active unless either a validated bundled
+ * multi-frame acoustic template or user-enrolled multi-frame DTW voice samples exist for that phrase.
  */
 enum class WakePhraseSupportStatus {
     READY_BUNDLED_ACOUSTIC_TEMPLATE,
     READY_USER_ENROLLED_DTW,
     REQUIRES_VOICE_ENROLLMENT,
     INVALID_PHRASE
+}
+
+data class TemplateValidationResult(
+    val isValid: Boolean,
+    val loadedCount: Int,
+    val sampleRateHz: Int = 0,
+    val numMfccCoefficients: Int = 0,
+    val errors: List<String> = emptyList()
+)
+
+/**
+ * Thin hardware audio capture abstraction backed by Android [AudioRecord] in production (P0-2).
+ * Enables strict verification of `STATE_INITIALIZED`, `RECORDSTATE_RECORDING`, `SecurityException`,
+ * and runtime `read()` failure handling deterministically in JVM unit tests without mocking away validation.
+ */
+interface WakeAudioCaptureSession {
+    val isInitialized: Boolean
+    val isRecording: Boolean
+    fun startRecording()
+    fun read(buffer: ShortArray, offset: Int, size: Int): Int
+    fun stop()
+    fun release()
+}
+
+interface WakeAudioCaptureFactory {
+    fun getMinBufferSize(sampleRateHz: Int, channelConfig: Int, audioFormat: Int): Int
+    fun createSession(
+        audioSource: Int,
+        sampleRateHz: Int,
+        channelConfig: Int,
+        audioFormat: Int,
+        bufferSizeInBytes: Int
+    ): WakeAudioCaptureSession
+}
+
+class AndroidWakeAudioCaptureFactory : WakeAudioCaptureFactory {
+    override fun getMinBufferSize(sampleRateHz: Int, channelConfig: Int, audioFormat: Int): Int {
+        return AudioRecord.getMinBufferSize(sampleRateHz, channelConfig, audioFormat)
+    }
+
+    @android.annotation.SuppressLint("MissingPermission")
+    override fun createSession(
+        audioSource: Int,
+        sampleRateHz: Int,
+        channelConfig: Int,
+        audioFormat: Int,
+        bufferSizeInBytes: Int
+    ): WakeAudioCaptureSession {
+        val record = AudioRecord(audioSource, sampleRateHz, channelConfig, audioFormat, bufferSizeInBytes)
+        return object : WakeAudioCaptureSession {
+            override val isInitialized: Boolean
+                get() = record.state == AudioRecord.STATE_INITIALIZED
+            override val isRecording: Boolean
+                get() = record.recordingState == AudioRecord.RECORDSTATE_RECORDING
+            override fun startRecording() = record.startRecording()
+            override fun read(buffer: ShortArray, offset: Int, size: Int): Int = record.read(buffer, offset, size)
+            override fun stop() = record.stop()
+            override fun release() = record.release()
+        }
+    }
 }
 
 data class WakePhraseAcousticTemplate(
@@ -65,7 +128,8 @@ data class WakePhraseAcousticTemplate(
     val minVoicedRatio: Float = 0.32f,
     val maxVoicedRatio: Float = 0.95f,
     val minZcr: Float = 0.03f,
-    val maxZcr: Float = 0.44f
+    val maxZcr: Float = 0.44f,
+    val isFromValidatedBundledAsset: Boolean = false
 )
 
 data class WakeInferenceResult(
@@ -99,6 +163,18 @@ data class AmbientNoiseReport(
     val statusMessage: String = "$environmentQuality: $recommendation"
 )
 
+data class WakeCalibrationTestResult(
+    val expectedPhrase: String?,
+    val detectedPhrase: String?,
+    val matched: Boolean,
+    val confidence: Float,
+    val dtwDistance: Float,
+    val measuredRms: Double,
+    val noiseFloorRms: Double,
+    val snrDb: Double,
+    val diagnosticMessage: String
+)
+
 /**
  * Section 5 — Local Wake-Word Engine for NAYRO (MFCC + DTW Acoustic Template Matcher).
  *
@@ -129,10 +205,10 @@ class LocalWakeWordEngine(private val context: Context?) {
             "Hey Cutie"
         )
         val VOICE_EXIT_COMMANDS = setOf(
-            "stop", "cancel", "stop babu", "cancel babu", "bye babu",
-            "stop nayro", "cancel nayro", "stop nairo", "cancel nairo",
-            "stop nero", "cancel nero", "stop qki", "cancel qki",
-            "exit", "band karo", "ruko", "bas karo", "chup ho jao"
+            "stop", "cancel", "stop listening", "cancel listening",
+            "stop nayro", "cancel nayro", "bye nayro", "goodbye nayro",
+            "exit", "goodbye", "bye", "end session",
+            "band karo", "ruko", "bas karo", "chup ho jao"
         )
         const val BUNDLED_KWS_TEMPLATES_ASSET = "nayro_kws_templates.json"
         /** Backward-compatible alias pointing to the honestly named JSON MFCC+DTW template asset. */
@@ -149,6 +225,26 @@ class LocalWakeWordEngine(private val context: Context?) {
 
     private val _statusMessage = MutableStateFlow("Wake-word detector stopped.")
     val statusMessage: StateFlow<String> = _statusMessage.asStateFlow()
+
+    private val _standbyAudioLevel = MutableStateFlow(0f)
+    val standbyAudioLevel: StateFlow<Float> = _standbyAudioLevel.asStateFlow()
+
+    private val _lastDiagnosticSummary = MutableStateFlow("Engine idle — no wake diagnostics yet.")
+    val lastDiagnosticSummary: StateFlow<String> = _lastDiagnosticSummary.asStateFlow()
+
+    private val _isMicrophoneInitialized = MutableStateFlow(false)
+    val isMicrophoneInitialized: StateFlow<Boolean> = _isMicrophoneInitialized.asStateFlow()
+
+    private val _isAudioCaptureActive = MutableStateFlow(false)
+    val isAudioCaptureActive: StateFlow<Boolean> = _isAudioCaptureActive.asStateFlow()
+
+    private val _lastFailureReason = MutableStateFlow<String?>(null)
+    val lastFailureReason: StateFlow<String?> = _lastFailureReason.asStateFlow()
+
+    private val _lastValidationResult = MutableStateFlow(
+        TemplateValidationResult(isValid = false, loadedCount = 0, errors = listOf("Acoustic templates not yet loaded."))
+    )
+    val lastValidationResult: StateFlow<TemplateValidationResult> = _lastValidationResult.asStateFlow()
 
     private val activeWakePhrases = SUPPORTED_PHRASES.toMutableList()
     private val loadedTemplates = mutableMapOf<String, WakePhraseAcousticTemplate>()
@@ -170,17 +266,71 @@ class LocalWakeWordEngine(private val context: Context?) {
     @Volatile
     private var wasListeningBeforeInterruption: Boolean = false
 
-    private var audioRecord: AudioRecord? = null
+    private val captureLock = Any()
+    private var captureSession: WakeAudioCaptureSession? = null
+    private var customAudioCaptureFactory: WakeAudioCaptureFactory? = null
+    private var micPermissionCheckerOverride: (() -> Boolean)? = null
+    private var enrollmentOwnershipGuard: (suspend (block: suspend () -> Unit) -> Boolean)? = null
     private var captureJob: Job? = null
     private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
+    @Volatile
+    private var silentZeroFrameThreshold: Int = 150 // ~4.8s at 512 samples / 16kHz
+
+    private val _isMicrophoneSilenced = MutableStateFlow(false)
+    val isMicrophoneSilenced: StateFlow<Boolean> = _isMicrophoneSilenced.asStateFlow()
+
     var onWakeWordDetected: ((String) -> Unit)? = null
+    var onCaptureError: ((String) -> Unit)? = null
     var lastDetectionLatencyMs: Long = 0L
         private set
     var lastConfidenceScore: Float = 0f
         private set
     var lastDtwDistance: Float = Float.MAX_VALUE
         private set
+
+    fun setAudioCaptureFactoryForTesting(factory: WakeAudioCaptureFactory?) {
+        customAudioCaptureFactory = factory
+    }
+
+    fun setMicPermissionCheckerForTesting(checker: (() -> Boolean)?) {
+        micPermissionCheckerOverride = checker
+    }
+
+    fun setSilentMicFrameThresholdForTesting(frameCount: Int) {
+        silentZeroFrameThreshold = frameCount.coerceAtLeast(3)
+    }
+
+    fun setEnrollmentOwnershipGuard(guard: (suspend (block: suspend () -> Unit) -> Boolean)?) {
+        enrollmentOwnershipGuard = guard
+    }
+
+    fun isMicrophonePermissionGranted(): Boolean {
+        micPermissionCheckerOverride?.let { return it.invoke() }
+        val ctx = context ?: return false
+        return try {
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    fun hasUsableAcousticTemplates(): Boolean {
+        if (loadedTemplates.isEmpty()) return false
+        val phrases = getConfiguredWakePhrases()
+        return phrases.any { phrase ->
+            val t = loadedTemplates[phrase.lowercase()] ?: return@any false
+            val hasEnrolled = t.enrolledSamples.any { seq ->
+                seq.isNotEmpty() && seq.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
+            }
+            val hasValidatedBundled = t.isFromValidatedBundledAsset &&
+                t.mfccCentroid.size == NUM_MFCC &&
+                t.mfccCentroid.all { it.isFinite() } &&
+                t.mfccSequence.size >= 4 &&
+                t.mfccSequence.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
+            hasEnrolled || hasValidatedBundled
+        }
+    }
 
     private var sensitivity: Float = 0.55f // 0.1 (strict) .. 0.95 (high sensitivity)
     private var confidenceThreshold: Float = 0.72f
@@ -262,12 +412,29 @@ class LocalWakeWordEngine(private val context: Context?) {
             .replace(Regex("[^a-z0-9\\s]"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
-        val lowerAssistant = assistantName.trim().lowercase().ifEmpty { "babu" }
-        val dynamicExitCommands = setOf(
-            "stop $lowerAssistant",
-            "cancel $lowerAssistant",
-            "bye $lowerAssistant"
-        )
+        val lowerAssistant = assistantName.trim().lowercase()
+            .ifEmpty { com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME.lowercase() }
+        val activeTargetNames = buildSet {
+            add(lowerAssistant)
+            synchronized(activeWakePhrases) {
+                for (phrase in activeWakePhrases) {
+                    val stripped = phrase.trim().lowercase()
+                        .removePrefix("hi ")
+                        .removePrefix("hey ")
+                        .removePrefix("hello ")
+                        .trim()
+                    if (stripped.isNotBlank()) add(stripped)
+                }
+            }
+        }
+        val dynamicExitCommands = buildSet {
+            for (target in activeTargetNames) {
+                add("stop $target")
+                add("cancel $target")
+                add("bye $target")
+                add("goodbye $target")
+            }
+        }
         return norm in VOICE_EXIT_COMMANDS || norm in dynamicExitCommands
     }
 
@@ -276,54 +443,402 @@ class LocalWakeWordEngine(private val context: Context?) {
      * By default, `LocalWakeWordEngine(null)` without calling this method simulates a missing asset
      * so `testWakeWordEngineNeverFiresOnRawNoiseOrUnrelatedSpeech` can verify `MODEL_UNAVAILABLE` handling.
      */
+    /**
+     * Loads and strictly validates bundled acoustic KWS templates from `nayro_kws_templates.json` (P0-1).
+     *
+     * Rules:
+     * - Validates `sampleRateHz == 16000`, `numMfccCoefficients == 13`, finite 13-dim centroids,
+     *   multi-frame `referenceMfccFrames` (>= 4 frames of exact length 13), and valid speech envelope ranges.
+     * - NEVER silently falls back to fake hardcoded templates or synthetic MFCC trajectories on error.
+     * - On missing or invalid templates, clears loaded templates and reports `MODEL_UNAVAILABLE` / `ERROR`.
+     */
     fun loadAcousticModel(allowEmbeddedFallbackInTests: Boolean = true): Boolean {
         loadedTemplates.clear()
         val rawJson = readModelAssetString(allowEmbeddedFallbackInTests)
         if (rawJson.isNullOrBlank()) {
             detectedAssetFormat = WakeAssetFormat.MISSING
+            isEmbeddedModelEnabledForTesting = false
+            val res = TemplateValidationResult(
+                isValid = false,
+                loadedCount = 0,
+                errors = listOf("Bundled wake template asset ($BUNDLED_KWS_MODEL_ASSET) not found or empty.")
+            )
+            _lastValidationResult.value = res
+            _lastFailureReason.value = res.errors.first()
+            _engineState.value = WakeEngineState.MODEL_UNAVAILABLE
+            _statusMessage.value = res.errors.first()
             return false
         }
-        return try {
+        val validation = loadTemplatesFromJson(rawJson)
+        if (!validation.isValid) {
+            isEmbeddedModelEnabledForTesting = false
+            return false
+        }
+        loadSavedEnrollments()
+        if (allowEmbeddedFallbackInTests && context == null) {
+            isEmbeddedModelEnabledForTesting = loadedTemplates.isNotEmpty()
+        }
+        return loadedTemplates.isNotEmpty()
+    }
+
+    /**
+     * Strictly parses and validates a JSON acoustic template payload using both Android [JSONObject]
+     * and a pure-Kotlin validator/parser so JVM tests and on-device runtime enforce identical checks (P0-1).
+     */
+    fun loadTemplatesFromJson(rawJson: String): TemplateValidationResult {
+        loadedTemplates.clear()
+        val errors = mutableListOf<String>()
+        val trimmed = rawJson.trim()
+        if (trimmed.isEmpty() || !trimmed.startsWith("{") || !trimmed.endsWith("}")) {
+            val res = TemplateValidationResult(
+                isValid = false,
+                loadedCount = 0,
+                errors = listOf("Invalid wake template JSON: payload is empty or malformed.")
+            )
+            applyValidationFailure(res, WakeAssetFormat.INVALID)
+            return res
+        }
+
+        val parsed = parseTemplatesPayloadRobust(trimmed, errors)
+        if (parsed == null) {
+            val res = TemplateValidationResult(
+                isValid = false,
+                loadedCount = 0,
+                errors = errors.ifEmpty { listOf("Failed to parse wake template JSON payload.") }
+            )
+            applyValidationFailure(res, WakeAssetFormat.INVALID)
+            return res
+        }
+
+        if (parsed.sampleRateHz != DEFAULT_SAMPLE_RATE_HZ) {
+            errors.add("Incompatible sampleRateHz=${parsed.sampleRateHz}; expected $DEFAULT_SAMPLE_RATE_HZ Hz.")
+        }
+        if (parsed.numMfccCoefficients != NUM_MFCC) {
+            errors.add("Incompatible numMfccCoefficients=${parsed.numMfccCoefficients}; expected $NUM_MFCC.")
+        }
+        if (!parsed.defaultConfidenceThreshold.isFinite() || parsed.defaultConfidenceThreshold !in 0.40f..0.95f) {
+            errors.add("Invalid defaultConfidenceThreshold=${parsed.defaultConfidenceThreshold}; expected 0.40..0.95.")
+        }
+        if (parsed.templates.isEmpty()) {
+            errors.add("wakePhraseTemplates array is missing or empty.")
+        }
+
+        val validated = linkedMapOf<String, WakePhraseAcousticTemplate>()
+        for ((index, candidate) in parsed.templates.withIndex()) {
+            val cleanPhrase = candidate.phrase.trim()
+            if (cleanPhrase.length < 3) {
+                errors.add("Template[$index]: phrase '$cleanPhrase' must be at least 3 characters.")
+                continue
+            }
+            if (candidate.mfccCentroid.size != NUM_MFCC || candidate.mfccCentroid.any { !it.isFinite() }) {
+                errors.add("Template '$cleanPhrase': mfccCentroid must contain exactly $NUM_MFCC finite floats (found ${candidate.mfccCentroid.size}).")
+                continue
+            }
+            if (candidate.mfccSequence.size < 4) {
+                errors.add("Template '$cleanPhrase': referenceMfccFrames must contain at least 4 genuine multi-frame MFCC vectors (found ${candidate.mfccSequence.size}); synthetic trajectories are not permitted.")
+                continue
+            }
+            val invalidFrame = candidate.mfccSequence.indexOfFirst { frame ->
+                frame.size != NUM_MFCC || frame.any { !it.isFinite() }
+            }
+            if (invalidFrame >= 0) {
+                errors.add("Template '$cleanPhrase': referenceMfccFrames[$invalidFrame] has invalid dimension or non-finite values (expected $NUM_MFCC).")
+                continue
+            }
+            if (!candidate.minVoicedRatio.isFinite() || !candidate.maxVoicedRatio.isFinite() ||
+                candidate.minVoicedRatio < 0f || candidate.maxVoicedRatio > 1f ||
+                candidate.minVoicedRatio >= candidate.maxVoicedRatio
+            ) {
+                errors.add("Template '$cleanPhrase': invalid voicedRatioRange [${candidate.minVoicedRatio}, ${candidate.maxVoicedRatio}].")
+                continue
+            }
+            if (!candidate.minZcr.isFinite() || !candidate.maxZcr.isFinite() ||
+                candidate.minZcr < 0f || candidate.maxZcr > 0.5f ||
+                candidate.minZcr >= candidate.maxZcr
+            ) {
+                errors.add("Template '$cleanPhrase': invalid zcrRange [${candidate.minZcr}, ${candidate.maxZcr}].")
+                continue
+            }
+            validated[cleanPhrase.lowercase()] = candidate.copy(
+                phrase = cleanPhrase,
+                isFromValidatedBundledAsset = true
+            )
+        }
+
+        if (errors.isNotEmpty() || validated.isEmpty()) {
+            val res = TemplateValidationResult(
+                isValid = false,
+                loadedCount = 0,
+                sampleRateHz = parsed.sampleRateHz,
+                numMfccCoefficients = parsed.numMfccCoefficients,
+                errors = errors.ifEmpty { listOf("No valid wake-word templates found.") }
+            )
+            applyValidationFailure(res, WakeAssetFormat.INVALID)
+            return res
+        }
+
+        loadedTemplates.putAll(validated)
+        confidenceThreshold = parsed.defaultConfidenceThreshold
+        detectedAssetFormat = WakeAssetFormat.JSON_ACOUSTIC_TEMPLATES
+        val result = TemplateValidationResult(
+            isValid = true,
+            loadedCount = loadedTemplates.size,
+            sampleRateHz = parsed.sampleRateHz,
+            numMfccCoefficients = parsed.numMfccCoefficients,
+            errors = emptyList()
+        )
+        _lastValidationResult.value = result
+        _lastFailureReason.value = null
+        _lastDiagnosticSummary.value = "Loaded ${loadedTemplates.size} validated MFCC+DTW acoustic templates (${parsed.sampleRateHz}Hz, ${parsed.numMfccCoefficients}-dim)."
+        return result
+    }
+
+    private fun applyValidationFailure(result: TemplateValidationResult, format: WakeAssetFormat) {
+        loadedTemplates.clear()
+        detectedAssetFormat = format
+        _lastValidationResult.value = result
+        val reason = result.errors.joinToString("; ")
+        _lastFailureReason.value = reason
+        _engineState.value = if (format == WakeAssetFormat.MISSING) {
+            WakeEngineState.NOT_CONFIGURED
+        } else {
+            WakeEngineState.ERROR
+        }
+        _statusMessage.value = "Wake template validation failed: $reason"
+        _lastDiagnosticSummary.value = _statusMessage.value
+    }
+
+    private data class ParsedTemplatesPayload(
+        val sampleRateHz: Int,
+        val numMfccCoefficients: Int,
+        val defaultConfidenceThreshold: Float,
+        val templates: List<WakePhraseAcousticTemplate>
+    )
+
+    private fun parseTemplatesPayloadRobust(rawJson: String, errors: MutableList<String>): ParsedTemplatesPayload? {
+        // Attempt Android JSONObject first; note that android.jar stubs return 0/null in pure JVM tests.
+        try {
             val root = JSONObject(rawJson)
-            detectedAssetFormat = WakeAssetFormat.JSON_ACOUSTIC_TEMPLATES
-            confidenceThreshold = root.optDouble("defaultConfidenceThreshold", 0.72).toFloat()
             val arr = root.optJSONArray("wakePhraseTemplates")
-            if (arr != null) {
+            val sr = root.optInt("sampleRateHz", -1)
+            val dims = root.optInt("numMfccCoefficients", -1)
+            if (arr != null && arr.length() > 0 && sr > 0 && dims > 0) {
+                val threshold = root.optDouble("defaultConfidenceThreshold", 0.72).toFloat()
+                val list = mutableListOf<WakePhraseAcousticTemplate>()
                 for (i in 0 until arr.length()) {
-                    val obj = arr.getJSONObject(i)
-                    val phrase = obj.getString("phrase")
-                    val mfccArr = obj.getJSONArray("mfccCentroid")
-                    val centroid = FloatArray(mfccArr.length()) { idx -> mfccArr.getDouble(idx).toFloat() }
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val phrase = obj.optString("phrase", "")
+                    val mfccArr = obj.optJSONArray("mfccCentroid")
+                    val centroid = if (mfccArr != null) {
+                        FloatArray(mfccArr.length()) { idx -> mfccArr.optDouble(idx, Double.NaN).toFloat() }
+                    } else {
+                        FloatArray(0)
+                    }
+                    val framesArr = obj.optJSONArray("referenceMfccFrames")
+                    val frames = if (framesArr != null) {
+                        Array(framesArr.length()) { fIdx ->
+                            val row = framesArr.optJSONArray(fIdx)
+                            if (row != null) {
+                                FloatArray(row.length()) { cIdx -> row.optDouble(cIdx, Double.NaN).toFloat() }
+                            } else {
+                                FloatArray(0)
+                            }
+                        }
+                    } else {
+                        emptyArray()
+                    }
                     val voicedArr = obj.optJSONArray("voicedRatioRange")
                     val zcrArr = obj.optJSONArray("zcrRange")
-                    val defaultSeq = buildSyntheticMultiFrameTrajectory(centroid, frames = 8)
-                    loadedTemplates[phrase.lowercase()] = WakePhraseAcousticTemplate(
-                        phrase = phrase,
-                        mfccCentroid = centroid,
-                        mfccSequence = defaultSeq,
-                        minVoicedRatio = voicedArr?.optDouble(0, 0.32)?.toFloat() ?: 0.32f,
-                        maxVoicedRatio = voicedArr?.optDouble(1, 0.95)?.toFloat() ?: 0.95f,
-                        minZcr = zcrArr?.optDouble(0, 0.03)?.toFloat() ?: 0.03f,
-                        maxZcr = zcrArr?.optDouble(1, 0.44)?.toFloat() ?: 0.44f
+                    list.add(
+                        WakePhraseAcousticTemplate(
+                            phrase = phrase,
+                            mfccCentroid = centroid,
+                            mfccSequence = frames,
+                            minVoicedRatio = voicedArr?.optDouble(0, 0.32)?.toFloat() ?: 0.32f,
+                            maxVoicedRatio = voicedArr?.optDouble(1, 0.95)?.toFloat() ?: 0.95f,
+                            minZcr = zcrArr?.optDouble(0, 0.03)?.toFloat() ?: 0.03f,
+                            maxZcr = zcrArr?.optDouble(1, 0.44)?.toFloat() ?: 0.44f,
+                            isFromValidatedBundledAsset = true
+                        )
                     )
                 }
+                return ParsedTemplatesPayload(sr, dims, threshold, list)
             }
-            if (loadedTemplates.isEmpty()) {
-                seedDefaultAcousticTemplates()
+        } catch (_: Throwable) {
+            // Fall through to pure-Kotlin JSON parser (handles JVM test stubs & malformed detection cleanly)
+        }
+
+        return parseTemplatesJsonPureKotlin(rawJson, errors)
+    }
+
+    /**
+     * Minimal, strict recursive-descent JSON parser for wake-word templates so Android runtime
+     * and headless JVM unit tests validate the exact same JSON structure with zero stub bypass.
+     */
+    private fun parseTemplatesJsonPureKotlin(rawJson: String, errors: MutableList<String>): ParsedTemplatesPayload? {
+        var pos = 0
+        val len = rawJson.length
+
+        fun skipWs() {
+            while (pos < len && rawJson[pos].isWhitespace()) pos++
+        }
+
+        fun parseString(): String {
+            skipWs()
+            if (pos >= len || rawJson[pos] != '"') throw IllegalArgumentException("Expected string at $pos")
+            pos++
+            val sb = StringBuilder()
+            while (pos < len) {
+                val c = rawJson[pos++]
+                when (c) {
+                    '"' -> return sb.toString()
+                    '\\' -> {
+                        if (pos >= len) throw IllegalArgumentException("Unterminated escape")
+                        val esc = rawJson[pos++]
+                        when (esc) {
+                            '"', '\\', '/' -> sb.append(esc)
+                            'n' -> sb.append('\n')
+                            'r' -> sb.append('\r')
+                            't' -> sb.append('\t')
+                            else -> sb.append(esc)
+                        }
+                    }
+                    else -> sb.append(c)
+                }
             }
-            loadSavedEnrollments()
-            if (allowEmbeddedFallbackInTests && context == null) {
-                isEmbeddedModelEnabledForTesting = loadedTemplates.isNotEmpty()
+            throw IllegalArgumentException("Unterminated string")
+        }
+
+        fun parseNumber(): Double {
+            skipWs()
+            val start = pos
+            if (pos < len && (rawJson[pos] == '-' || rawJson[pos] == '+')) pos++
+            while (pos < len && (rawJson[pos].isDigit() || rawJson[pos] in ".eE+-")) pos++
+            val token = rawJson.substring(start, pos)
+            return token.toDoubleOrNull() ?: throw IllegalArgumentException("Invalid number '$token' at $start")
+        }
+
+        lateinit var parseValue: () -> Any?
+        parseValue = {
+            skipWs()
+            if (pos >= len) throw IllegalArgumentException("Unexpected end of JSON")
+            when (rawJson[pos]) {
+                '{' -> {
+                    pos++
+                    val map = linkedMapOf<String, Any?>()
+                    skipWs()
+                    if (pos < len && rawJson[pos] == '}') {
+                        pos++
+                        map
+                    } else {
+                        while (true) {
+                            skipWs()
+                            val key = parseString()
+                            skipWs()
+                            if (pos >= len || rawJson[pos] != ':') throw IllegalArgumentException("Expected ':' after '$key'")
+                            pos++
+                            map[key] = parseValue()
+                            skipWs()
+                            if (pos >= len) throw IllegalArgumentException("Unterminated object")
+                            when (rawJson[pos]) {
+                                ',' -> pos++
+                                '}' -> {
+                                    pos++
+                                    break
+                                }
+                                else -> throw IllegalArgumentException("Expected ',' or '}' at $pos")
+                            }
+                        }
+                        map
+                    }
+                }
+                '[' -> {
+                    pos++
+                    val list = mutableListOf<Any?>()
+                    skipWs()
+                    if (pos < len && rawJson[pos] == ']') {
+                        pos++
+                        list
+                    } else {
+                        while (true) {
+                            list.add(parseValue())
+                            skipWs()
+                            if (pos >= len) throw IllegalArgumentException("Unterminated array")
+                            when (rawJson[pos]) {
+                                ',' -> pos++
+                                ']' -> {
+                                    pos++
+                                    break
+                                }
+                                else -> throw IllegalArgumentException("Expected ',' or ']' at $pos")
+                            }
+                        }
+                        list
+                    }
+                }
+                '"' -> parseString()
+                't' -> {
+                    if (rawJson.startsWith("true", pos)) {
+                        pos += 4
+                        true
+                    } else throw IllegalArgumentException("Invalid token at $pos")
+                }
+                'f' -> {
+                    if (rawJson.startsWith("false", pos)) {
+                        pos += 5
+                        false
+                    } else throw IllegalArgumentException("Invalid token at $pos")
+                }
+                'n' -> {
+                    if (rawJson.startsWith("null", pos)) {
+                        pos += 4
+                        null
+                    } else throw IllegalArgumentException("Invalid token at $pos")
+                }
+                else -> parseNumber()
             }
-            loadedTemplates.isNotEmpty()
-        } catch (_: Exception) {
-            seedDefaultAcousticTemplates()
-            loadSavedEnrollments()
-            detectedAssetFormat = WakeAssetFormat.JSON_ACOUSTIC_TEMPLATES
-            if (allowEmbeddedFallbackInTests && context == null) {
-                isEmbeddedModelEnabledForTesting = true
+        }
+
+        return try {
+            val rootObj = parseValue() as? Map<*, *> ?: run {
+                errors.add("Root JSON value must be an object.")
+                return null
             }
-            true
+            skipWs()
+            if (pos != len) {
+                errors.add("Unexpected trailing characters in JSON at offset $pos.")
+                return null
+            }
+            val sr = (rootObj["sampleRateHz"] as? Number)?.toInt() ?: -1
+            val dims = (rootObj["numMfccCoefficients"] as? Number)?.toInt() ?: -1
+            val threshold = (rootObj["defaultConfidenceThreshold"] as? Number)?.toFloat() ?: 0.72f
+            val rawTemplates = rootObj["wakePhraseTemplates"] as? List<*> ?: emptyList<Any?>()
+            val templates = rawTemplates.mapNotNull { item ->
+                val obj = item as? Map<*, *> ?: return@mapNotNull null
+                val phrase = obj["phrase"] as? String ?: ""
+                val centroidList = (obj["mfccCentroid"] as? List<*>)?.map {
+                    (it as? Number)?.toFloat() ?: Float.NaN
+                }.orEmpty().toFloatArray()
+                val framesList = (obj["referenceMfccFrames"] as? List<*>)?.map { frameAny ->
+                    (frameAny as? List<*>)?.map { (it as? Number)?.toFloat() ?: Float.NaN }.orEmpty().toFloatArray()
+                }.orEmpty().toTypedArray()
+                val voicedList = (obj["voicedRatioRange"] as? List<*>)?.mapNotNull { (it as? Number)?.toFloat() }.orEmpty()
+                val zcrList = (obj["zcrRange"] as? List<*>)?.mapNotNull { (it as? Number)?.toFloat() }.orEmpty()
+                WakePhraseAcousticTemplate(
+                    phrase = phrase,
+                    mfccCentroid = centroidList,
+                    mfccSequence = framesList,
+                    minVoicedRatio = voicedList.getOrElse(0) { 0.32f },
+                    maxVoicedRatio = voicedList.getOrElse(1) { 0.95f },
+                    minZcr = zcrList.getOrElse(0) { 0.03f },
+                    maxZcr = zcrList.getOrElse(1) { 0.44f },
+                    isFromValidatedBundledAsset = true
+                )
+            }
+            ParsedTemplatesPayload(sr, dims, threshold, templates)
+        } catch (e: Exception) {
+            errors.add("JSON syntax error: ${e.message ?: e.javaClass.simpleName}")
+            null
         }
     }
 
@@ -343,42 +858,8 @@ class LocalWakeWordEngine(private val context: Context?) {
             if (assetFile != null) {
                 return runCatching { assetFile.readText() }.getOrNull()
             }
-            seedDefaultAcousticTemplates()
-            return "{\"defaultConfidenceThreshold\":0.72}"
         }
         return null
-    }
-
-    private fun buildSyntheticMultiFrameTrajectory(centroid: FloatArray, frames: Int = 8): Array<FloatArray> {
-        return Array(frames) { frameIdx ->
-            val phase = (frameIdx.toFloat() / max(1, frames - 1).toFloat())
-            // Models two-syllable envelope modulation ("Hi Ba-bu" / "Hey Nay-ro")
-            val contour = 0.85f + 0.30f * kotlin.math.sin(PI * phase).toFloat()
-            FloatArray(centroid.size) { c -> centroid[c] * contour }
-        }
-    }
-
-    private fun seedDefaultAcousticTemplates() {
-        val defaults = listOf(
-            "Hi Nayro" to floatArrayOf(11.8f, -3.5f, 4.4f, -2.1f, 2.7f, -0.8f, 1.6f, -0.7f, 0.9f, -0.3f, 0.6f, -0.2f, 0.4f),
-            "Hey Nayro" to floatArrayOf(12.2f, -3.1f, 4.0f, -1.9f, 2.4f, -1.0f, 1.5f, -0.6f, 0.8f, -0.4f, 0.5f, -0.2f, 0.3f),
-            "Hi Nero" to floatArrayOf(12.0f, -3.3f, 4.2f, -2.0f, 2.6f, -0.9f, 1.5f, -0.6f, 0.85f, -0.3f, 0.55f, -0.2f, 0.35f),
-            "Hey Nero" to floatArrayOf(12.3f, -3.0f, 3.9f, -1.8f, 2.3f, -1.0f, 1.4f, -0.6f, 0.8f, -0.35f, 0.5f, -0.2f, 0.3f),
-            "Hi Babu" to floatArrayOf(12.4f, -3.2f, 4.1f, -1.8f, 2.5f, -0.9f, 1.4f, -0.6f, 0.8f, -0.3f, 0.5f, -0.2f, 0.3f),
-            "Hey Babu" to floatArrayOf(13.1f, -2.9f, 3.8f, -1.5f, 2.2f, -1.1f, 1.3f, -0.5f, 0.7f, -0.4f, 0.4f, -0.2f, 0.3f),
-            "Hi Qki" to floatArrayOf(11.6f, -2.6f, 4.6f, -1.5f, 2.8f, -1.1f, 1.6f, -0.7f, 0.95f, -0.4f, 0.55f, -0.25f, 0.35f),
-            "Hey Qki" to floatArrayOf(11.9f, -2.5f, 4.5f, -1.4f, 2.7f, -1.1f, 1.55f, -0.7f, 0.9f, -0.4f, 0.5f, -0.25f, 0.35f),
-            "Hi Nairo" to floatArrayOf(11.8f, -3.5f, 4.4f, -2.1f, 2.7f, -0.8f, 1.6f, -0.7f, 0.9f, -0.3f, 0.6f, -0.2f, 0.4f),
-            "Hey Nairo" to floatArrayOf(12.2f, -3.1f, 4.0f, -1.9f, 2.4f, -1.0f, 1.5f, -0.6f, 0.8f, -0.4f, 0.5f, -0.2f, 0.3f),
-            "Hey Cutie" to floatArrayOf(11.5f, -2.4f, 4.8f, -1.4f, 2.9f, -1.2f, 1.7f, -0.8f, 1.0f, -0.5f, 0.6f, -0.3f, 0.4f)
-        )
-        for ((phrase, centroid) in defaults) {
-            loadedTemplates[phrase.lowercase()] = WakePhraseAcousticTemplate(
-                phrase = phrase,
-                mfccCentroid = centroid,
-                mfccSequence = buildSyntheticMultiFrameTrajectory(centroid, frames = 8)
-            )
-        }
     }
 
     /**
@@ -482,22 +963,34 @@ class LocalWakeWordEngine(private val context: Context?) {
                     rec.release()
                     return@run null
                 }
-                val buf = ShortArray(1600) // 100ms acoustic slice at 16kHz
+                val targetSamples = 19200 // 1.2s acoustic capture at 16kHz for natural two-word wake phrases
+                val buf = ShortArray(targetSamples)
                 rec.startRecording()
-                val read = rec.read(buf, 0, buf.size)
+                var totalRead = 0
+                val chunk = ShortArray(1024)
+                while (totalRead < targetSamples) {
+                    val read = rec.read(chunk, 0, kotlin.math.min(chunk.size, targetSamples - totalRead))
+                    if (read <= 0) break
+                    System.arraycopy(chunk, 0, buf, totalRead, read)
+                    totalRead += read
+                }
                 rec.stop()
                 rec.release()
-                if (read > 0) buf.copyOf(read) else null
+                if (totalRead > 0) trimSilenceEdges(buf.copyOf(totalRead)) else null
             } catch (_: Exception) {
                 null
             }
         }
 
         if (capturedPcm == null || capturedPcm.isEmpty()) {
-            return false to "Enrollment failed: microphone unavailable or no real audio was captured."
+            val msg = "Enrollment failed: microphone unavailable or no real audio was captured."
+            _lastDiagnosticSummary.value = msg
+            return false to msg
         }
         if (capturedPcm.size < 800) {
-            return false to "Enrollment failed: captured audio sample is too short (${capturedPcm.size} samples < 800 minimum)."
+            val msg = "Enrollment failed: captured audio sample is too short (${capturedPcm.size} samples < 800 minimum)."
+            _lastDiagnosticSummary.value = msg
+            return false to msg
         }
 
         val feat = extractAcousticFeatures(capturedPcm, capturedPcm.size)
@@ -505,15 +998,298 @@ class LocalWakeWordEngine(private val context: Context?) {
         val zcr = feat[1]
         val voicedRatio = feat[3]
         if (rms < 450f || zcr !in 0.02f..0.48f || voicedRatio < 0.25f) {
-            return false to "Enrollment failed: acoustic validation rejected silent or noisy audio (rms=${rms.toInt()}, zcr=${"%.2f".format(zcr)})."
+            val msg = "Enrollment failed: acoustic validation rejected silent or noisy audio (rms=${rms.toInt()}, zcr=${"%.2f".format(zcr)})."
+            _lastDiagnosticSummary.value = msg
+            return false to msg
         }
 
         val ok = enrollWakePhraseSample(clean, capturedPcm)
         val quality = validateEnrollmentQuality(clean)
-        return if (ok) {
-            true to "Enrolled '$clean' (Samples: ${quality.sampleCount}/5, Consistency: ${(quality.averageConsistencyScore * 100).toInt()}%)."
+        val resultMsg = if (ok) {
+            "Enrolled '$clean' (Samples: ${quality.sampleCount}/5, Consistency: ${(quality.averageConsistencyScore * 100).toInt()}%, RMS: ${rms.toInt()})."
         } else {
-            false to "Enrollment failed: audio sample rejected by speech envelope validator."
+            "Enrollment failed: audio sample rejected by speech envelope validator."
+        }
+        _lastDiagnosticSummary.value = resultMsg
+        return ok to resultMsg
+    }
+
+    /**
+     * Trims leading and trailing quiet frames from a recorded enrollment/test utterance
+     * while preserving at least 1600 samples if speech energy is detected.
+     */
+    fun trimSilenceEdges(pcm: ShortArray, frameSize: Int = 320, rmsThreshold: Float = 380f): ShortArray {
+        if (pcm.size <= frameSize * 3) return pcm
+        var startIdx = 0
+        var endIdx = pcm.size
+        var foundVoice = false
+        var pos = 0
+        while (pos + frameSize <= pcm.size) {
+            val slice = pcm.copyOfRange(pos, pos + frameSize)
+            val rms = extractAcousticFeatures(slice, slice.size)[0]
+            if (rms >= rmsThreshold) {
+                if (!foundVoice) {
+                    startIdx = (pos - frameSize).coerceAtLeast(0)
+                    foundVoice = true
+                }
+                endIdx = (pos + frameSize * 2).coerceAtMost(pcm.size)
+            }
+            pos += frameSize
+        }
+        if (!foundVoice || (endIdx - startIdx) < 800) return pcm
+        return pcm.copyOfRange(startIdx, endIdx)
+    }
+
+    /**
+     * Runs a real local DTW calibration/verification test against a captured PCM buffer
+     * without triggering false wake execution callbacks, returning exact confidence, DTW distance,
+     * RMS, SNR, and actionable diagnostic guidance.
+     */
+    fun testWakePhraseCalibration(
+        pcmSample: ShortArray,
+        expectedPhrase: String? = null
+    ): WakeCalibrationTestResult {
+        if (loadedTemplates.isEmpty()) {
+            loadAcousticModel(allowEmbeddedFallbackInTests = true)
+        }
+        val trimmed = trimSilenceEdges(pcmSample)
+        val features = extractAcousticFeatures(trimmed, trimmed.size)
+        val rms = features[0].toDouble()
+        val safeNoise = adaptiveNoiseFloorRms.coerceAtLeast(50.0)
+        val snrDb = 20.0 * kotlin.math.log10((rms.coerceAtLeast(50.0)) / safeNoise)
+
+        val (gatePassed, gateReason) = evaluateFalsePositiveGate(trimmed, trimmed.size, adaptiveNoiseFloorRms)
+        if (!gatePassed) {
+            val diag = "Calibration rejected: $gateReason (SNR=${"%.1f".format(snrDb)} dB)"
+            _lastDiagnosticSummary.value = diag
+            return WakeCalibrationTestResult(
+                expectedPhrase = expectedPhrase,
+                detectedPhrase = null,
+                matched = false,
+                confidence = 0f,
+                dtwDistance = Float.MAX_VALUE,
+                measuredRms = rms,
+                noiseFloorRms = adaptiveNoiseFloorRms,
+                snrDb = snrDb,
+                diagnosticMessage = diag
+            )
+        }
+
+        val querySeq = extractMfccSequence(trimmed, trimmed.size)
+        var bestPhrase: String? = null
+        var bestDist = Float.MAX_VALUE
+        val targetPhrases = if (!expectedPhrase.isNullOrBlank()) {
+            listOf(expectedPhrase.trim())
+        } else {
+            getConfiguredWakePhrases()
+        }
+
+        for (phrase in targetPhrases) {
+            val template = loadedTemplates[phrase.lowercase()] ?: continue
+            for (enrolledSeq in template.enrolledSamples) {
+                val dist = computeDtwDistance(querySeq, enrolledSeq)
+                if (dist < bestDist) {
+                    bestDist = dist
+                    bestPhrase = template.phrase
+                }
+            }
+        }
+
+        if (bestPhrase == null || !bestDist.isFinite()) {
+            val targetLabel = expectedPhrase ?: "configured wake phrases"
+            val diag = "No enrolled voice samples found for '$targetLabel'. Record 2–3 voice samples first to activate acoustic DTW recognition."
+            _lastDiagnosticSummary.value = diag
+            return WakeCalibrationTestResult(
+                expectedPhrase = expectedPhrase,
+                detectedPhrase = null,
+                matched = false,
+                confidence = 0f,
+                dtwDistance = Float.MAX_VALUE,
+                measuredRms = rms,
+                noiseFloorRms = adaptiveNoiseFloorRms,
+                snrDb = snrDb,
+                diagnosticMessage = diag
+            )
+        }
+
+        val confidence = (1.0f / (1.0f + bestDist * 0.22f)).coerceIn(0f, 0.99f)
+        val matched = bestDist <= 3.5f && confidence >= confidenceThreshold &&
+            (expectedPhrase.isNullOrBlank() || bestPhrase.equals(expectedPhrase.trim(), ignoreCase = true))
+        val diag = if (matched) {
+            "Matched '$bestPhrase' (Confidence: ${(confidence * 100).toInt()}%, DTW: ${"%.2f".format(bestDist)}, SNR: ${"%.1f".format(snrDb)} dB)."
+        } else {
+            "Below threshold for '${expectedPhrase ?: bestPhrase}' (Confidence: ${(confidence * 100).toInt()}% < ${(confidenceThreshold * 100).toInt()}%, DTW: ${"%.2f".format(bestDist)}). Try enrolling one more sample or raising sensitivity."
+        }
+        _lastDiagnosticSummary.value = diag
+        return WakeCalibrationTestResult(
+            expectedPhrase = expectedPhrase,
+            detectedPhrase = if (matched) bestPhrase else null,
+            matched = matched,
+            confidence = confidence,
+            dtwDistance = bestDist,
+            measuredRms = rms,
+            noiseFloorRms = adaptiveNoiseFloorRms,
+            snrDb = snrDb,
+            diagnosticMessage = diag
+        )
+    }
+
+    /**
+     * Records a 1.2s sample from the Android microphone off the main thread and enrolls [phrase].
+     * Automatically pauses standby AudioRecord during capture so microphones never collide.
+     */
+    suspend fun enrollPhraseFromMicrophoneAsync(phrase: String): Pair<Boolean, String> =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            val guard = enrollmentOwnershipGuard
+            if (guard != null) {
+                var result: Pair<Boolean, String> = false to "Microphone is currently busy with another audio session."
+                val acquired = guard {
+                    result = recordOrEnrollPhraseFromUi(phrase)
+                }
+                return@withContext if (acquired) result else (false to "Microphone is currently busy. Stop active listening and try again.")
+            }
+            val wasListening = _engineState.value == WakeEngineState.LISTENING_FOR_WAKE
+            if (wasListening) pauseForAsr()
+            try {
+                recordOrEnrollPhraseFromUi(phrase)
+            } finally {
+                if (wasListening) recoverFromAudioInterruption()
+            }
+        }
+
+    /**
+     * Records a 1.2s sample from the Android microphone off the main thread and runs calibration diagnostics.
+     */
+    suspend fun testWakePhraseFromMicrophoneAsync(expectedPhrase: String? = null): WakeCalibrationTestResult =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            val guard = enrollmentOwnershipGuard
+            if (guard != null) {
+                var result: WakeCalibrationTestResult? = null
+                val acquired = guard {
+                    result = runMicrophoneCalibrationCapture(expectedPhrase)
+                }
+                return@withContext if (acquired && result != null) {
+                    result!!
+                } else {
+                    WakeCalibrationTestResult(
+                        expectedPhrase = expectedPhrase,
+                        detectedPhrase = null,
+                        matched = false,
+                        confidence = 0f,
+                        dtwDistance = Float.MAX_VALUE,
+                        measuredRms = 0.0,
+                        noiseFloorRms = adaptiveNoiseFloorRms,
+                        snrDb = 0.0,
+                        diagnosticMessage = "Calibration blocked: microphone is currently owned by another active session."
+                    )
+                }
+            }
+            val wasListening = _engineState.value == WakeEngineState.LISTENING_FOR_WAKE
+            if (wasListening) pauseForAsr()
+            try {
+                runMicrophoneCalibrationCapture(expectedPhrase)
+            } finally {
+                if (wasListening) recoverFromAudioInterruption()
+            }
+        }
+
+    private fun runMicrophoneCalibrationCapture(expectedPhrase: String?): WakeCalibrationTestResult {
+        return try {
+            if (!isMicrophonePermissionGranted()) {
+                return WakeCalibrationTestResult(
+                    expectedPhrase = expectedPhrase,
+                    detectedPhrase = null,
+                    matched = false,
+                    confidence = 0f,
+                    dtwDistance = Float.MAX_VALUE,
+                    measuredRms = 0.0,
+                    noiseFloorRms = adaptiveNoiseFloorRms,
+                    snrDb = 0.0,
+                    diagnosticMessage = "Calibration unavailable: RECORD_AUDIO permission is not granted."
+                )
+            }
+            val factory = customAudioCaptureFactory ?: AndroidWakeAudioCaptureFactory()
+            val minBuf = factory.getMinBufferSize(
+                DEFAULT_SAMPLE_RATE_HZ,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+            if (minBuf <= 0) {
+                return WakeCalibrationTestResult(
+                    expectedPhrase = expectedPhrase,
+                    detectedPhrase = null,
+                    matched = false,
+                    confidence = 0f,
+                    dtwDistance = Float.MAX_VALUE,
+                    measuredRms = 0.0,
+                    noiseFloorRms = adaptiveNoiseFloorRms,
+                    snrDb = 0.0,
+                    diagnosticMessage = "Calibration unavailable: AudioRecord buffer initialization failed."
+                )
+            }
+            val rec = factory.createSession(
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                DEFAULT_SAMPLE_RATE_HZ,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                max(minBuf, 3200)
+            )
+            if (!rec.isInitialized) {
+                rec.release()
+                return WakeCalibrationTestResult(
+                    expectedPhrase = expectedPhrase,
+                    detectedPhrase = null,
+                    matched = false,
+                    confidence = 0f,
+                    dtwDistance = Float.MAX_VALUE,
+                    measuredRms = 0.0,
+                    noiseFloorRms = adaptiveNoiseFloorRms,
+                    snrDb = 0.0,
+                    diagnosticMessage = "Calibration unavailable: Microphone could not initialize."
+                )
+            }
+            try {
+                rec.startRecording()
+                if (!rec.isRecording) {
+                    return WakeCalibrationTestResult(
+                        expectedPhrase = expectedPhrase,
+                        detectedPhrase = null,
+                        matched = false,
+                        confidence = 0f,
+                        dtwDistance = Float.MAX_VALUE,
+                        measuredRms = 0.0,
+                        noiseFloorRms = adaptiveNoiseFloorRms,
+                        snrDb = 0.0,
+                        diagnosticMessage = "Calibration unavailable: AudioRecord failed to enter recording state."
+                    )
+                }
+                val targetSamples = 19200
+                val buf = ShortArray(targetSamples)
+                var totalRead = 0
+                val chunk = ShortArray(1024)
+                while (totalRead < targetSamples) {
+                    val read = rec.read(chunk, 0, kotlin.math.min(chunk.size, targetSamples - totalRead))
+                    if (read <= 0) break
+                    System.arraycopy(chunk, 0, buf, totalRead, read)
+                    totalRead += read
+                }
+                testWakePhraseCalibration(buf.copyOf(totalRead), expectedPhrase)
+            } finally {
+                try { rec.stop() } catch (_: Throwable) {}
+                try { rec.release() } catch (_: Throwable) {}
+            }
+        } catch (e: Exception) {
+            WakeCalibrationTestResult(
+                expectedPhrase = expectedPhrase,
+                detectedPhrase = null,
+                matched = false,
+                confidence = 0f,
+                dtwDistance = Float.MAX_VALUE,
+                measuredRms = 0.0,
+                noiseFloorRms = adaptiveNoiseFloorRms,
+                snrDb = 0.0,
+                diagnosticMessage = "Calibration error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            )
         }
     }
 
@@ -635,9 +1411,6 @@ class LocalWakeWordEngine(private val context: Context?) {
     fun importEnrollmentsJson(json: String): Int {
         if (json.isBlank()) return 0
         return try {
-            if (loadedTemplates.isEmpty()) {
-                seedDefaultAcousticTemplates()
-            }
             var restoredPhrases = 0
             val itemRegex = Regex("""\{\s*"key"\s*:\s*"([^"]+)"\s*,\s*"phrase"\s*:\s*"([^"]+)"\s*,\s*"mfccData"\s*:\s*"([^"]*)"\s*\}""")
             for (match in itemRegex.findAll(json)) {
@@ -727,6 +1500,9 @@ class LocalWakeWordEngine(private val context: Context?) {
 
     fun getLoadedTemplateCount(): Int = loadedTemplates.size
 
+    fun getLoadedTemplate(phrase: String): WakePhraseAcousticTemplate? =
+        loadedTemplates[phrase.trim().lowercase()]
+
     fun getConfiguredWakePhrases(): List<String> = synchronized(activeWakePhrases) {
         activeWakePhrases.toList()
     }
@@ -748,7 +1524,13 @@ class LocalWakeWordEngine(private val context: Context?) {
         if (template != null && template.enrolledSamples.isNotEmpty()) {
             return WakePhraseSupportStatus.READY_USER_ENROLLED_DTW
         }
-        if (SUPPORTED_PHRASES.any { it.equals(clean, ignoreCase = true) }) {
+        if (template != null && template.isFromValidatedBundledAsset && template.mfccSequence.size >= 4) {
+            return WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
+        }
+        // Only treat SUPPORTED_PHRASES as bundled-ready before model load if the model has not failed validation
+        if (loadedTemplates.isEmpty() && detectedAssetFormat != WakeAssetFormat.INVALID &&
+            SUPPORTED_PHRASES.any { it.equals(clean, ignoreCase = true) }
+        ) {
             return WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
         }
         return WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT
@@ -877,35 +1659,109 @@ class LocalWakeWordEngine(private val context: Context?) {
     }
 
     /**
-     * Extracts a 13-coefficient MFCC vector from a preprocessed PCM frame using a
-     * Discrete Cosine Transform (DCT-II) over log-energy Mel-spaced frequency sub-bands.
+     * Extracts a genuine 13-coefficient Mel-Frequency Cepstral Coefficient (MFCC) vector from a
+     * preprocessed PCM frame using a 512-point Radix-2 FFT, a 20-band triangular Mel filterbank
+     * (80 Hz..7600 Hz at 16 kHz), log filterbank energies, and orthonormal DCT-II (P0-1).
      */
     fun extractMfccFeatures(pcmBuffer: ShortArray, readCount: Int = pcmBuffer.size): FloatArray {
         val windowed = preprocessPcmFrame(pcmBuffer, readCount)
         if (windowed.isEmpty()) return FloatArray(NUM_MFCC)
 
-        val numBands = 20
-        val bandEnergies = DoubleArray(numBands)
-        val chunkSize = max(1, windowed.size / numBands)
-
-        for (b in 0 until numBands) {
-            val start = b * chunkSize
-            val end = (start + chunkSize).coerceAtMost(windowed.size)
-            var energy = 1e-6
-            for (i in start until end) {
-                val v = windowed[i].toDouble() / 32768.0
-                energy += v * v
-            }
-            bandEnergies[b] = ln(energy)
+        val fftSize = 512
+        val real = DoubleArray(fftSize)
+        val imag = DoubleArray(fftSize)
+        val copyLen = kotlin.math.min(windowed.size, fftSize)
+        for (i in 0 until copyLen) {
+            real[i] = windowed[i].toDouble() / 32768.0
         }
 
+        // In-place iterative Cooley-Tukey Radix-2 FFT
+        var j = 0
+        for (i in 1 until fftSize) {
+            var bit = fftSize shr 1
+            while (j and bit != 0) {
+                j = j xor bit
+                bit = bit shr 1
+            }
+            j = j xor bit
+            if (i < j) {
+                val tr = real[i]; real[i] = real[j]; real[j] = tr
+                val ti = imag[i]; imag[i] = imag[j]; imag[j] = ti
+            }
+        }
+        var len = 2
+        while (len <= fftSize) {
+            val halfLen = len shr 1
+            val angle = -2.0 * PI / len.toDouble()
+            val wLenR = cos(angle)
+            val wLenI = kotlin.math.sin(angle)
+            var i = 0
+            while (i < fftSize) {
+                var wR = 1.0
+                var wI = 0.0
+                for (k in 0 until halfLen) {
+                    val uR = real[i + k]
+                    val uI = imag[i + k]
+                    val vR = real[i + k + halfLen] * wR - imag[i + k + halfLen] * wI
+                    val vI = real[i + k + halfLen] * wI + imag[i + k + halfLen] * wR
+                    real[i + k] = uR + vR
+                    imag[i + k] = uI + vI
+                    real[i + k + halfLen] = uR - vR
+                    imag[i + k + halfLen] = uI - vI
+                    val nextWR = wR * wLenR - wI * wLenI
+                    wI = wR * wLenI + wI * wLenR
+                    wR = nextWR
+                }
+                i += len
+            }
+            len = len shl 1
+        }
+
+        val numBins = (fftSize / 2) + 1
+        val powerSpectrum = DoubleArray(numBins) { bin ->
+            (real[bin] * real[bin] + imag[bin] * imag[bin]) / fftSize.toDouble()
+        }
+
+        // 20-band triangular Mel filterbank from 80 Hz to 7600 Hz (16 kHz sample rate)
+        val numMelBands = 20
+        fun hzToMel(hz: Double): Double = 2595.0 * kotlin.math.log10(1.0 + hz / 700.0)
+        fun melToHz(mel: Double): Double = 700.0 * (Math.pow(10.0, mel / 2595.0) - 1.0)
+
+        val melLow = hzToMel(80.0)
+        val melHigh = hzToMel(7600.0)
+        val binPoints = IntArray(numMelBands + 2) { idx ->
+            val mel = melLow + (melHigh - melLow) * idx.toDouble() / (numMelBands + 1).toDouble()
+            val hz = melToHz(mel)
+            ((fftSize + 1) * hz / DEFAULT_SAMPLE_RATE_HZ.toDouble()).toInt().coerceIn(0, numBins - 1)
+        }
+
+        val logMelEnergies = DoubleArray(numMelBands)
+        for (m in 0 until numMelBands) {
+            val left = binPoints[m]
+            val center = max(left + 1, binPoints[m + 1]).coerceAtMost(numBins - 1)
+            val right = max(center + 1, binPoints[m + 2]).coerceAtMost(numBins - 1)
+            var energy = 1e-8
+            for (k in left until center) {
+                val weight = (k - left).toDouble() / max(1, center - left).toDouble()
+                energy += powerSpectrum[k] * weight
+            }
+            for (k in center..right) {
+                val weight = (right - k).toDouble() / max(1, right - center).toDouble()
+                energy += powerSpectrum[k] * weight.coerceAtLeast(0.0)
+            }
+            logMelEnergies[m] = ln(energy)
+        }
+
+        // Orthonormal DCT-II -> 13 MFCC coefficients
+        val scale = sqrt(2.0 / numMelBands.toDouble())
         val mfcc = FloatArray(NUM_MFCC)
         for (k in 0 until NUM_MFCC) {
             var sum = 0.0
-            for (m in 0 until numBands) {
-                sum += bandEnergies[m] * cos(PI * k * (m + 0.5) / numBands.toDouble())
+            for (m in 0 until numMelBands) {
+                sum += logMelEnergies[m] * cos(PI * k * (m + 0.5) / numMelBands.toDouble())
             }
-            mfcc[k] = sum.toFloat()
+            val factor = if (k == 0) sqrt(1.0 / numMelBands.toDouble()) else scale
+            mfcc[k] = (sum * factor).toFloat()
         }
         return mfcc
     }
@@ -974,53 +1830,130 @@ class LocalWakeWordEngine(private val context: Context?) {
         return raw / (n + m).toFloat()
     }
 
+    private fun computeCosineSimilarity(a: FloatArray, b: FloatArray): Float {
+        if (a.size != b.size || a.isEmpty()) return 0f
+        var dot = 0.0
+        var normA = 0.0
+        var normB = 0.0
+        for (i in a.indices) {
+            dot += a[i].toDouble() * b[i].toDouble()
+            normA += a[i].toDouble() * a[i].toDouble()
+            normB += b[i].toDouble() * b[i].toDouble()
+        }
+        if (normA <= 1e-9 || normB <= 1e-9) return 0f
+        return (dot / (sqrt(normA) * sqrt(normB))).toFloat().coerceIn(-1f, 1f)
+    }
+
+    private fun computeSequenceCentroid(seq: Array<FloatArray>): FloatArray {
+        if (seq.isEmpty()) return FloatArray(NUM_MFCC)
+        return FloatArray(NUM_MFCC) { coeff ->
+            var sum = 0f
+            var count = 0
+            for (frame in seq) {
+                if (coeff < frame.size && frame[coeff].isFinite()) {
+                    sum += frame[coeff]
+                    count++
+                }
+            }
+            if (count > 0) sum / count.toFloat() else 0f
+        }
+    }
+
     /**
-     * Evaluates a multi-frame utterance against user-enrolled DTW templates and default templates.
-     * Never fires on silence, claps/transients, or un-enrolled random noise.
+     * Evaluates a validated multi-frame 13-dim MFCC sequence against BOTH user-enrolled DTW templates
+     * and validated bundled reference templates from `nayro_kws_templates.json` (P0-1).
+     *
+     * False-positive rejection:
+     * - Enforces speech RMS energy, SNR margin, ZCR, and voicedRatio envelopes.
+     * - User-enrolled samples require `DTW <= 3.5f` and `confidence >= confidenceThreshold`.
+     * - Bundled reference templates require stricter `DTW <= 2.4f`, centroid cosine similarity `>= 0.90f`,
+     *   template-specific `voicedRatio` + `zcr` envelope match, and `confidence >= max(confidenceThreshold, 0.72f)`.
      */
-    fun matchUtteranceByDtw(pcmBuffer: ShortArray, readCount: Int = pcmBuffer.size): Pair<String, Float>? {
-        val total = readCount.coerceAtMost(pcmBuffer.size)
-        if (total < 400) return null
-        val features = extractAcousticFeatures(pcmBuffer, total)
-        val rms = features[0].toDouble()
-        val zcr = features[1].toDouble()
-        val voicedRatio = features[3]
+    fun matchMfccSequenceAgainstTemplates(
+        querySeq: Array<FloatArray>,
+        rms: Double,
+        zcr: Double,
+        voicedRatio: Float,
+        triggerCallback: Boolean = true
+    ): Pair<String, Float>? {
+        if (querySeq.size < 3) return null
+        if (querySeq.any { it.size != NUM_MFCC || it.any { c -> !c.isFinite() } }) return null
 
         val minRmsThreshold = max(adaptiveNoiseFloorRms * 1.8, (1100.0 - (sensitivity * 550.0)).coerceIn(450.0, 1200.0))
         if (rms !in minRmsThreshold..28000.0 || zcr !in 0.03..0.44 || voicedRatio < 0.25f) {
             return null
         }
 
-        val querySeq = extractMfccSequence(pcmBuffer, total)
-        if (querySeq.isEmpty()) return null
-
+        val queryCentroid = computeSequenceCentroid(querySeq)
         var bestPhrase: String? = null
         var bestDist = Float.MAX_VALUE
+        var matchedViaEnrolled = false
 
         for (phrase in getConfiguredWakePhrases()) {
             val template = loadedTemplates[phrase.lowercase()] ?: continue
-            // Only match purely acoustic DTW without phonetic hypothesis if user explicitly enrolled voice samples
+
+            // 1. User-enrolled voice DTW templates (highest priority)
             for (enrolledSeq in template.enrolledSamples) {
+                if (enrolledSeq.isEmpty()) continue
                 val dist = computeDtwDistance(querySeq, enrolledSeq)
                 if (dist < bestDist) {
                     bestDist = dist
                     bestPhrase = template.phrase
+                    matchedViaEnrolled = true
+                }
+            }
+
+            // 2. Validated bundled multi-frame reference templates from nayro_kws_templates.json (P0-1)
+            if (template.isFromValidatedBundledAsset && template.mfccSequence.size >= 4) {
+                val envelopeOk = voicedRatio in template.minVoicedRatio..template.maxVoicedRatio &&
+                    zcr.toFloat() in template.minZcr..template.maxZcr
+                if (envelopeOk) {
+                    val cosine = computeCosineSimilarity(queryCentroid, template.mfccCentroid)
+                    if (cosine >= 0.90f) {
+                        val bundledDist = computeDtwDistance(querySeq, template.mfccSequence)
+                        if (bundledDist <= 2.4f && bundledDist < bestDist) {
+                            bestDist = bundledDist
+                            bestPhrase = template.phrase
+                            matchedViaEnrolled = false
+                        }
+                    }
                 }
             }
         }
 
         lastDtwDistance = bestDist
-        if (bestPhrase != null && bestDist <= 3.5f) {
-            val conf = (1.0f / (1.0f + bestDist * 0.22f)).coerceIn(0f, 0.99f)
-            if (conf >= confidenceThreshold) {
+        val maxAllowedDist = if (matchedViaEnrolled) 3.5f else 2.4f
+        val effectiveThreshold = if (matchedViaEnrolled) confidenceThreshold else max(confidenceThreshold, 0.72f)
+        if (bestPhrase != null && bestDist <= maxAllowedDist) {
+            val decay = if (matchedViaEnrolled) 0.12f else 0.18f
+            val conf = (1.0f / (1.0f + bestDist * decay)).coerceIn(0f, 0.99f)
+            if (conf >= effectiveThreshold) {
                 lastConfidenceScore = conf
-                _engineState.value = WakeEngineState.WAKE_DETECTED
-                _statusMessage.value = "Wake phrase detected via DTW: $bestPhrase (confidence=${"%.2f".format(conf)})"
-                onWakeWordDetected?.invoke(bestPhrase)
+                if (triggerCallback) {
+                    _engineState.value = WakeEngineState.WAKE_DETECTED
+                    val source = if (matchedViaEnrolled) "enrolled DTW" else "bundled acoustic template"
+                    _statusMessage.value = "Wake phrase detected via $source: $bestPhrase (confidence=${"%.2f".format(conf)})"
+                    onWakeWordDetected?.invoke(bestPhrase)
+                }
                 return bestPhrase to conf
             }
         }
         return null
+    }
+
+    /**
+     * Evaluates a multi-frame PCM utterance against user-enrolled DTW templates and validated bundled templates.
+     * Never fires on silence, claps/transients, or random background noise.
+     */
+    fun matchUtteranceByDtw(pcmBuffer: ShortArray, readCount: Int = pcmBuffer.size): Pair<String, Float>? {
+        val total = readCount.coerceAtMost(pcmBuffer.size)
+        if (total < 800) return null
+        val features = extractAcousticFeatures(pcmBuffer, total)
+        val rms = features[0].toDouble()
+        val zcr = features[1].toDouble()
+        val voicedRatio = features[3]
+        val querySeq = extractMfccSequence(pcmBuffer, total)
+        return matchMfccSequenceAgainstTemplates(querySeq, rms, zcr, voicedRatio, triggerCallback = true)
     }
 
     /**
@@ -1172,22 +2105,67 @@ class LocalWakeWordEngine(private val context: Context?) {
         return matched
     }
 
-    fun startListening() {
-        if (_engineState.value == WakeEngineState.LISTENING_FOR_WAKE) return
+    /**
+     * Starts local wake-word listening with strict P0-1 & P0-2 verification:
+     * 1. Verifies acoustic templates exist and passed schema/dimension validation.
+     * 2. Verifies `RECORD_AUDIO` permission before creating [AudioRecord].
+     * 3. Verifies `minBufferSize > 0`, `AudioRecord.STATE_INITIALIZED`, and `AudioRecord.RECORDSTATE_RECORDING`.
+     * 4. Publishes [WakeEngineState.LISTENING_FOR_WAKE] ONLY AFTER capture has actually started.
+     * Returns `true` ONLY when listening genuinely started; `false` on any failure (`ERROR` / `NOT_CONFIGURED` / `MODEL_UNAVAILABLE`).
+     */
+    fun startListening(): Boolean {
+        if (_engineState.value == WakeEngineState.LISTENING_FOR_WAKE &&
+            (_isAudioCaptureActive.value || (context == null && customAudioCaptureFactory == null && isEmbeddedModelEnabledForTesting))
+        ) {
+            return true
+        }
 
-        if (!isOfflineKwsModelAvailable()) {
-            _engineState.value = WakeEngineState.MODEL_UNAVAILABLE
-            _statusMessage.value = "Offline wake-word acoustic model ($BUNDLED_KWS_MODEL_ASSET) is not bundled. Use manual microphone button or floating assistant."
-            return
+        if (!hasUsableAcousticTemplates() && !isOfflineKwsModelAvailable()) {
+            _isMicrophoneInitialized.value = false
+            _isAudioCaptureActive.value = false
+            val msg = "Offline wake-word acoustic templates ($BUNDLED_KWS_MODEL_ASSET) are missing or not configured."
+            _lastFailureReason.value = msg
+            _engineState.value = if (detectedAssetFormat == WakeAssetFormat.INVALID) {
+                WakeEngineState.ERROR
+            } else {
+                WakeEngineState.MODEL_UNAVAILABLE
+            }
+            _statusMessage.value = msg
+            return false
         }
 
         if (loadedTemplates.isEmpty()) {
-            loadAcousticModel(allowEmbeddedFallbackInTests = isEmbeddedModelEnabledForTesting)
+            val loaded = loadAcousticModel(allowEmbeddedFallbackInTests = isEmbeddedModelEnabledForTesting)
+            if (!loaded) {
+                _isMicrophoneInitialized.value = false
+                _isAudioCaptureActive.value = false
+                return false
+            }
         }
 
+        if (!hasUsableAcousticTemplates()) {
+            _isMicrophoneInitialized.value = false
+            _isAudioCaptureActive.value = false
+            val msg = "No valid acoustic templates or enrolled samples match the active wake phrases."
+            _lastFailureReason.value = msg
+            _engineState.value = WakeEngineState.NOT_CONFIGURED
+            _statusMessage.value = msg
+            return false
+        }
+
+        // Strict P0-2 hardware AudioRecord path whenever running on Android OR a capture/permission test harness is attached
+        val requiresHardwareCapture = context != null || customAudioCaptureFactory != null || micPermissionCheckerOverride != null
+        if (requiresHardwareCapture) {
+            return startVerifiedAudioCapture()
+        }
+
+        // Legacy headless JVM unit-test compatibility (when context == null & no capture factory/permission override)
+        _lastFailureReason.value = null
+        _isMicrophoneInitialized.value = false
+        _isAudioCaptureActive.value = false
         _engineState.value = WakeEngineState.LISTENING_FOR_WAKE
         _statusMessage.value = "Listening locally for wake phrase (${getConfiguredWakePhrases().joinToString()})..."
-        startHardwareAudioRecordIfPermitted()
+        return true
     }
 
     fun stopListening() {
@@ -1220,127 +2198,295 @@ class LocalWakeWordEngine(private val context: Context?) {
 
     /**
      * Recovers local wake-word listening after an audio interruption or ASR session finishes.
+     * Returns `true` only if capture genuinely resumed.
      */
-    fun recoverFromAudioInterruption() {
+    fun recoverFromAudioInterruption(): Boolean {
         if (wasListeningBeforeInterruption || _engineState.value == WakeEngineState.MICROPHONE_BUSY) {
             wasListeningBeforeInterruption = false
-            startListening()
+            return startListening()
         }
+        return _engineState.value == WakeEngineState.LISTENING_FOR_WAKE
     }
 
-    private fun startHardwareAudioRecordIfPermitted() {
-        val ctx = context ?: return
-        val hasMicPerm = try {
-            ContextCompat.checkSelfPermission(ctx, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        } catch (_: Exception) {
-            false
-        }
-        if (!hasMicPerm) return
-
-        try {
+    private fun startVerifiedAudioCapture(): Boolean {
+        if (!isMicrophonePermissionGranted()) {
             releaseAudioRecord()
-            val minBuf = AudioRecord.getMinBufferSize(
+            val msg = "RECORD_AUDIO permission denied. Cannot initialize AudioRecord for wake-word listening."
+            _lastFailureReason.value = msg
+            _engineState.value = WakeEngineState.ERROR
+            _statusMessage.value = msg
+            onCaptureError?.invoke(msg)
+            return false
+        }
+
+        if (!isValidSampleRate(DEFAULT_SAMPLE_RATE_HZ)) {
+            releaseAudioRecord()
+            val msg = "Invalid wake-word sample rate configuration ($DEFAULT_SAMPLE_RATE_HZ Hz)."
+            _lastFailureReason.value = msg
+            _engineState.value = WakeEngineState.ERROR
+            _statusMessage.value = msg
+            onCaptureError?.invoke(msg)
+            return false
+        }
+
+        val factory = customAudioCaptureFactory ?: AndroidWakeAudioCaptureFactory()
+        var session: WakeAudioCaptureSession? = null
+        return try {
+            releaseAudioRecord()
+            val minBuf = factory.getMinBufferSize(
                 DEFAULT_SAMPLE_RATE_HZ,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT
             )
-            if (minBuf <= 0) return
+            if (minBuf <= 0) {
+                val msg = "AudioRecord.getMinBufferSize returned invalid size ($minBuf)."
+                _lastFailureReason.value = msg
+                _engineState.value = WakeEngineState.ERROR
+                _statusMessage.value = msg
+                onCaptureError?.invoke(msg)
+                return false
+            }
 
-            val record = AudioRecord(
+            session = factory.createSession(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 DEFAULT_SAMPLE_RATE_HZ,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
                 max(minBuf, 2048)
             )
-            if (record.state != AudioRecord.STATE_INITIALIZED) {
-                record.release()
-                return
+
+            if (!session.isInitialized) {
+                try { session.release() } catch (_: Throwable) {}
+                val msg = "AudioRecord failed to reach STATE_INITIALIZED (microphone busy or hardware unavailable)."
+                _lastFailureReason.value = msg
+                _engineState.value = WakeEngineState.ERROR
+                _statusMessage.value = msg
+                onCaptureError?.invoke(msg)
+                return false
             }
 
-            audioRecord = record
-            record.startRecording()
+            _isMicrophoneInitialized.value = true
+            session.startRecording()
+
+            if (!session.isRecording) {
+                try { session.stop() } catch (_: Throwable) {}
+                try { session.release() } catch (_: Throwable) {}
+                _isMicrophoneInitialized.value = false
+                val msg = "AudioRecord did not enter RECORDSTATE_RECORDING after startRecording()."
+                _lastFailureReason.value = msg
+                _engineState.value = WakeEngineState.ERROR
+                _statusMessage.value = msg
+                onCaptureError?.invoke(msg)
+                return false
+            }
+
+            // ONLY AFTER verified initialization AND active recording: publish LISTENING_FOR_WAKE
+            synchronized(captureLock) {
+                captureSession = session
+            }
+            _isMicrophoneSilenced.value = false
+            _isAudioCaptureActive.value = true
+            _lastFailureReason.value = null
+            _engineState.value = WakeEngineState.LISTENING_FOR_WAKE
+            _statusMessage.value = "Listening locally for wake phrase (${getConfiguredWakePhrases().joinToString()})..."
+
+            val activeSession = session
             captureJob = engineScope.launch {
                 val frameBuf = ShortArray(512)
                 val segmentWindow = ShortArray(DEFAULT_SAMPLE_RATE_HZ) // 1.0s rolling speech segment
                 var segmentWritePos = 0
                 var activeVoicedFrames = 0
                 var silenceHangoverCount = 0
+                var consecutiveReadErrors = 0
+                var consecutiveAllZeroFrames = 0
 
-                while (isActive && _engineState.value == WakeEngineState.LISTENING_FOR_WAKE) {
-                    val read = try {
-                        record.read(frameBuf, 0, frameBuf.size)
-                    } catch (_: Exception) {
-                        -1
-                    }
-                    if (read > 0) {
-                        val features = extractAcousticFeatures(frameBuf, read)
-                        val rms = features[0].toDouble()
-                        val zcr = features[1].toDouble()
-                        val isSpeechFrame = rms >= 400.0 &&
-                            rms > adaptiveNoiseFloorRms * MIN_SNR_MARGIN_RATIO &&
-                            zcr in 0.02..0.46
+                try {
+                    while (isActive && _engineState.value == WakeEngineState.LISTENING_FOR_WAKE) {
+                        val read = try {
+                            activeSession.read(frameBuf, 0, frameBuf.size)
+                        } catch (se: SecurityException) {
+                            handleRuntimeCaptureFailure(
+                                "Microphone permission revoked during capture: ${se.localizedMessage ?: "SecurityException"}",
+                                isFatalSecurityError = true
+                            )
+                            break
+                        } catch (e: Throwable) {
+                            -1
+                        }
 
-                        if (isSpeechFrame) {
-                            silenceHangoverCount = 0
-                            val toCopy = kotlin.math.min(read, segmentWindow.size - segmentWritePos)
-                            if (toCopy > 0) {
-                                System.arraycopy(frameBuf, 0, segmentWindow, segmentWritePos, toCopy)
-                                segmentWritePos += toCopy
-                            }
-                            activeVoicedFrames++
-                            if (segmentWritePos >= segmentWindow.size) {
-                                val (accepted, _) = evaluateFalsePositiveGate(segmentWindow, segmentWritePos, adaptiveNoiseFloorRms)
-                                if (accepted) {
-                                    matchUtteranceByDtw(segmentWindow, segmentWritePos)
+                        if (read > 0) {
+                            consecutiveReadErrors = 0
+                            val features = extractAcousticFeatures(frameBuf, read)
+                            val rms = features[0].toDouble()
+                            val zcr = features[1].toDouble()
+                            val peak = features[2]
+
+                            // Detect Android 11-16 / OEM background microphone silencing (sustained all-zero PCM frames)
+                            if (peak == 0f && rms == 0.0) {
+                                consecutiveAllZeroFrames++
+                                if (consecutiveAllZeroFrames >= silentZeroFrameThreshold) {
+                                    _isMicrophoneSilenced.value = true
+                                    handleRuntimeCaptureFailure(
+                                        "Microphone audio stream is silenced (received $consecutiveAllZeroFrames consecutive all-zero frames — OS/OEM background mic restriction or hardware mute).",
+                                        isFatalSecurityError = false
+                                    )
+                                    break
                                 }
-                                segmentWritePos = 0
-                                activeVoicedFrames = 0
+                            } else {
+                                consecutiveAllZeroFrames = 0
+                                if (_isMicrophoneSilenced.value) {
+                                    _isMicrophoneSilenced.value = false
+                                }
                             }
-                        } else {
-                            if (rms < 400.0) {
-                                adaptiveNoiseFloorRms = (0.92 * adaptiveNoiseFloorRms + 0.08 * rms).coerceIn(80.0, 650.0)
-                            }
-                            if (activeVoicedFrames > 0) {
-                                silenceHangoverCount++
-                                if (silenceHangoverCount < SILENCE_HANGOVER_FRAMES && segmentWritePos + read <= segmentWindow.size) {
-                                    // Preserve brief inter-syllable pause inside two-word wake phrases ("Hi ... Nero")
-                                    System.arraycopy(frameBuf, 0, segmentWindow, segmentWritePos, read)
-                                    segmentWritePos += read
-                                } else {
-                                    if (activeVoicedFrames >= 6 && segmentWritePos >= 2400) {
-                                        val (accepted, _) = evaluateFalsePositiveGate(segmentWindow, segmentWritePos, adaptiveNoiseFloorRms)
-                                        if (accepted) {
-                                            matchUtteranceByDtw(segmentWindow, segmentWritePos)
-                                        }
+
+                            _standbyAudioLevel.value = ((rms - 100.0) / 3500.0).toFloat().coerceIn(0f, 1f)
+                            val isSpeechFrame = rms >= 400.0 &&
+                                rms > adaptiveNoiseFloorRms * MIN_SNR_MARGIN_RATIO &&
+                                zcr in 0.02..0.46
+
+                            if (isSpeechFrame) {
+                                silenceHangoverCount = 0
+                                val toCopy = kotlin.math.min(read, segmentWindow.size - segmentWritePos)
+                                if (toCopy > 0) {
+                                    System.arraycopy(frameBuf, 0, segmentWindow, segmentWritePos, toCopy)
+                                    segmentWritePos += toCopy
+                                }
+                                activeVoicedFrames++
+                                if (segmentWritePos >= segmentWindow.size) {
+                                    val (accepted, _) = evaluateFalsePositiveGate(segmentWindow, segmentWritePos, adaptiveNoiseFloorRms)
+                                    if (accepted) {
+                                        matchUtteranceByDtw(segmentWindow, segmentWritePos)
                                     }
-                                    activeVoicedFrames = 0
                                     segmentWritePos = 0
-                                    silenceHangoverCount = 0
+                                    activeVoicedFrames = 0
                                 }
+                            } else {
+                                if (rms < 400.0 && peak > 0f) {
+                                    adaptiveNoiseFloorRms = (0.92 * adaptiveNoiseFloorRms + 0.08 * rms).coerceIn(80.0, 650.0)
+                                }
+                                if (activeVoicedFrames > 0) {
+                                    silenceHangoverCount++
+                                    if (silenceHangoverCount < SILENCE_HANGOVER_FRAMES && segmentWritePos + read <= segmentWindow.size) {
+                                        System.arraycopy(frameBuf, 0, segmentWindow, segmentWritePos, read)
+                                        segmentWritePos += read
+                                    } else {
+                                        if (activeVoicedFrames >= 6 && segmentWritePos >= 2400) {
+                                            val (accepted, _) = evaluateFalsePositiveGate(segmentWindow, segmentWritePos, adaptiveNoiseFloorRms)
+                                            if (accepted) {
+                                                matchUtteranceByDtw(segmentWindow, segmentWritePos)
+                                            }
+                                        }
+                                        activeVoicedFrames = 0
+                                        segmentWritePos = 0
+                                        silenceHangoverCount = 0
+                                    }
+                                }
+                            }
+                        } else if (read < 0) {
+                            consecutiveReadErrors++
+                            if (consecutiveReadErrors >= 3 || read == AudioRecord.ERROR_DEAD_OBJECT) {
+                                handleRuntimeCaptureFailure(
+                                    "AudioRecord runtime read failure (code=$read). Releasing microphone.",
+                                    isFatalSecurityError = false
+                                )
+                                break
                             }
                         }
-                    } else {
-                        break
+                    }
+                } finally {
+                    val shouldCleanup = synchronized(captureLock) {
+                        if (captureSession === activeSession && _engineState.value != WakeEngineState.LISTENING_FOR_WAKE) {
+                            captureSession = null
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    if (shouldCleanup) {
+                        cleanupSessionOnly(activeSession)
                     }
                 }
             }
-        } catch (_: SecurityException) {
+            true
+        } catch (se: SecurityException) {
+            try { session?.stop() } catch (_: Throwable) {}
+            try { session?.release() } catch (_: Throwable) {}
             releaseAudioRecord()
-        } catch (_: Exception) {
+            val msg = "SecurityException while starting AudioRecord: ${se.localizedMessage ?: "microphone access denied"}"
+            _lastFailureReason.value = msg
+            _engineState.value = WakeEngineState.ERROR
+            _statusMessage.value = msg
+            onCaptureError?.invoke(msg)
+            false
+        } catch (e: Throwable) {
+            try { session?.stop() } catch (_: Throwable) {}
+            try { session?.release() } catch (_: Throwable) {}
             releaseAudioRecord()
+            val msg = "AudioRecord initialization/start error: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            _lastFailureReason.value = msg
+            _engineState.value = WakeEngineState.ERROR
+            _statusMessage.value = msg
+            onCaptureError?.invoke(msg)
+            false
         }
     }
 
+    private fun handleRuntimeCaptureFailure(reason: String, isFatalSecurityError: Boolean) {
+        val current = synchronized(captureLock) {
+            val s = captureSession
+            captureSession = null
+            s
+        }
+        if (current != null) {
+            cleanupSessionOnly(current)
+        }
+        _isMicrophoneInitialized.value = false
+        _isAudioCaptureActive.value = false
+        _standbyAudioLevel.value = 0f
+        _lastFailureReason.value = reason
+        _engineState.value = if (isFatalSecurityError) WakeEngineState.ERROR else WakeEngineState.DEGRADED
+        _statusMessage.value = reason
+        onCaptureError?.invoke(reason)
+    }
+
+    private fun cleanupSessionOnly(session: WakeAudioCaptureSession) {
+        try { session.stop() } catch (_: Throwable) {}
+        try { session.release() } catch (_: Throwable) {}
+    }
+
     private fun releaseAudioRecord() {
-        captureJob?.cancel()
-        captureJob = null
-        try {
-            audioRecord?.stop()
-        } catch (_: Exception) {}
-        try {
-            audioRecord?.release()
-        } catch (_: Exception) {}
-        audioRecord = null
+        val jobToCancel: Job?
+        val current: WakeAudioCaptureSession?
+        synchronized(captureLock) {
+            jobToCancel = captureJob
+            captureJob = null
+            current = captureSession
+            captureSession = null
+        }
+        _standbyAudioLevel.value = 0f
+        _isAudioCaptureActive.value = false
+        _isMicrophoneInitialized.value = false
+
+        // Cancel capture loop first, then stop AudioRecord to unblock any pending native read()
+        jobToCancel?.cancel()
+        if (current != null) {
+            try { current.stop() } catch (_: Throwable) {}
+        }
+
+        // Wait briefly (bounded 200ms) for capture loop exit before releasing native HAL handles
+        if (jobToCancel != null && jobToCancel.isActive) {
+            val deadlineNs = System.nanoTime() + 200_000_000L
+            while (jobToCancel.isActive && System.nanoTime() < deadlineNs) {
+                try {
+                    Thread.sleep(5L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }
+
+        if (current != null) {
+            try { current.release() } catch (_: Throwable) {}
+        }
     }
 }

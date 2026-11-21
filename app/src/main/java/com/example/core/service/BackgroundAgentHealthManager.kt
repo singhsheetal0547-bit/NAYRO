@@ -23,6 +23,9 @@ enum class BackgroundHealthState {
     SERVICE_STOPPED,
     SERVICE_STARTING,
     SERVICE_RUNNING,
+    BACKGROUND_VOICE_READY,
+    PIPELINE_DEGRADED,
+    PIPELINE_ERROR,
     MICROPHONE_UNAVAILABLE,
     MICROPHONE_GRANTED,
     WAKE_WORD_ACTIVE,
@@ -37,7 +40,7 @@ enum class BackgroundHealthState {
 }
 
 /**
- * Detailed real-time health evaluation report for NAYRO Background Agent Engine.
+ * Detailed real-time health evaluation report for NAYRO Background Agent Engine (P0-3).
  */
 data class BackgroundAgentHealthReport(
     val serviceLifecycleState: ServiceLifecycleState,
@@ -51,12 +54,15 @@ data class BackgroundAgentHealthReport(
     val isBatteryOptimized: Boolean,
     val isBackgroundRestricted: Boolean,
     val activeStates: List<BackgroundHealthState>,
-    val healthSummaryMessage: String
+    val healthSummaryMessage: String,
+    val pipelineState: BackgroundVoicePipelineState = BackgroundVoicePipelineState.STOPPED,
+    val isBackgroundVoiceReady: Boolean = false,
+    val pipelineDetail: String = ""
 )
 
 /**
  * Central Health Evaluator for NAYRO Background & Agent Lifecycle.
- * Operates purely on live Android system APIs without hardcoded success states.
+ * Operates purely on live Android system APIs and verified pipeline state without hardcoded success states.
  */
 class BackgroundAgentHealthManager(
     private val context: Context,
@@ -82,16 +88,22 @@ class BackgroundAgentHealthManager(
 
     private fun evaluateHealthInternal(): BackgroundAgentHealthReport {
         val foregroundStatus = ServiceStateRepository.foregroundServiceStatus.value
+        val pipelineStatus = ServiceStateRepository.backgroundVoicePipelineStatus.value
         val floatingStatus = ServiceStateRepository.floatingServiceStatus.value
 
-        val isForegroundRunning = foregroundStatus.state == ServiceLifecycleState.RUNNING
+        val isForegroundRunning = foregroundStatus.state.isActiveOrRunning
+        val isBgVoiceReady = pipelineStatus.state == BackgroundVoicePipelineState.BACKGROUND_VOICE_READY &&
+            pipelineStatus.isMicrophoneVerified &&
+            pipelineStatus.isWakeEngineVerified &&
+            pipelineStatus.isAudioCaptureVerified
         val isFloatingActive = floatingStatus.state == ServiceLifecycleState.RUNNING
 
         val overlayGranted = Settings.canDrawOverlays(context)
         val micGranted = permissionManager.isMicrophoneGranted()
 
         val wakeState = voiceManager.wakeWordEngine.engineState.value
-        val isWakeActive = wakeState == WakeEngineState.LISTENING_FOR_WAKE
+        val isWakeActive = wakeState == WakeEngineState.LISTENING_FOR_WAKE &&
+            voiceManager.wakeWordEngine.isAudioCaptureActive.value
 
         val isAccConn = NayroAccessibilityService.isConnected() ||
                 AccessibilityConnectionManager.checkStatus(context) == AccessibilityConnectionState.OPERATIONAL
@@ -116,9 +128,22 @@ class BackgroundAgentHealthManager(
         val statesList = mutableListOf<BackgroundHealthState>()
 
         when (foregroundStatus.state) {
-            ServiceLifecycleState.RUNNING -> statesList.add(BackgroundHealthState.SERVICE_RUNNING)
+            ServiceLifecycleState.RUNNING,
+            ServiceLifecycleState.ACTIVE,
+            ServiceLifecycleState.LISTENING,
+            ServiceLifecycleState.PROCESSING -> statesList.add(BackgroundHealthState.SERVICE_RUNNING)
             ServiceLifecycleState.STARTING -> statesList.add(BackgroundHealthState.SERVICE_STARTING)
             else -> statesList.add(BackgroundHealthState.SERVICE_STOPPED)
+        }
+
+        when (pipelineStatus.state) {
+            BackgroundVoicePipelineState.BACKGROUND_VOICE_READY ->
+                if (isBgVoiceReady) statesList.add(BackgroundHealthState.BACKGROUND_VOICE_READY)
+            BackgroundVoicePipelineState.DEGRADED ->
+                statesList.add(BackgroundHealthState.PIPELINE_DEGRADED)
+            BackgroundVoicePipelineState.ERROR ->
+                statesList.add(BackgroundHealthState.PIPELINE_ERROR)
+            else -> {}
         }
 
         if (micGranted) {
@@ -155,12 +180,18 @@ class BackgroundAgentHealthManager(
             statesList.add(BackgroundHealthState.BACKGROUND_RESTRICTED)
         }
 
+        val primaryWakePhrase = voiceManager.configuration.value.wakePhrase.ifBlank {
+            voiceManager.wakeWordEngine.getConfiguredWakePhrases().firstOrNull() ?: "Hi Nayro"
+        }
+
         val summary = buildSummaryMessage(
             isForegroundRunning = isForegroundRunning,
+            pipelineStatus = pipelineStatus,
+            isBgVoiceReady = isBgVoiceReady,
+            primaryWakePhrase = primaryWakePhrase,
             micGranted = micGranted,
             isWakeActive = isWakeActive,
             isAccConn = isAccConn,
-            overlayGranted = overlayGranted,
             isFloatingActive = isFloatingActive,
             isBatteryRestricted = isBatteryRestricted,
             isBgRestricted = isBgRestricted
@@ -178,23 +209,38 @@ class BackgroundAgentHealthManager(
             isBatteryOptimized = isBatteryRestricted,
             isBackgroundRestricted = isBgRestricted,
             activeStates = statesList,
-            healthSummaryMessage = summary
+            healthSummaryMessage = summary,
+            pipelineState = pipelineStatus.state,
+            isBackgroundVoiceReady = isBgVoiceReady,
+            pipelineDetail = pipelineStatus.detail
         )
     }
 
     private fun buildSummaryMessage(
         isForegroundRunning: Boolean,
+        pipelineStatus: BackgroundVoicePipelineStatus,
+        isBgVoiceReady: Boolean,
+        primaryWakePhrase: String,
         micGranted: Boolean,
         isWakeActive: Boolean,
         isAccConn: Boolean,
-        overlayGranted: Boolean,
         isFloatingActive: Boolean,
         isBatteryRestricted: Boolean,
         isBgRestricted: Boolean
     ): String {
         val parts = mutableListOf<String>()
-        if (isForegroundRunning) parts.add("Foreground Agent Active") else parts.add("Agent Service Stopped")
-        if (isWakeActive) parts.add("Wake Word ('Hey Babu') Listening") else if (!micGranted) parts.add("Microphone Permission Missing")
+        when {
+            isBgVoiceReady -> parts.add("Background Voice Ready")
+            pipelineStatus.state == BackgroundVoicePipelineState.ERROR -> parts.add("Voice Pipeline Error")
+            pipelineStatus.state == BackgroundVoicePipelineState.DEGRADED -> parts.add("Voice Pipeline Degraded")
+            isForegroundRunning -> parts.add("Foreground Service Running (Voice Not Ready)")
+            else -> parts.add("Agent Service Stopped")
+        }
+        if (isWakeActive) {
+            parts.add("Wake Word ('$primaryWakePhrase') Listening")
+        } else if (!micGranted) {
+            parts.add("Microphone Permission Missing")
+        }
         if (isAccConn) parts.add("Accessibility Connected") else parts.add("Accessibility Disconnected")
         if (isFloatingActive) parts.add("Floating Overlay Visible")
         if (isBatteryRestricted) parts.add("Battery Optimized (May delay background wake)")

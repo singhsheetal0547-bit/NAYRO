@@ -58,23 +58,27 @@ import com.example.core.agent.AgentState
 import com.example.core.agent.AgentTask
 import com.example.core.agent.toUserFriendlyDescription
 import com.example.core.agent.toUserFriendlyIntentLabel
+import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import com.example.core.voice.VoiceState
 import com.example.data.local.entities.ConversationEntity
 import com.example.ui.components.AssistantOrb
+import com.example.ui.components.NayroAudioVisualizer
 import com.example.ui.components.SpeechToTextVoicePanel
 import com.example.ui.components.StatusBadge
 import com.example.ui.components.TaskExecutionCard
 import com.example.ui.theme.Coral
 import com.example.ui.theme.ForestGreen
 import com.example.ui.theme.SoftSage
+import com.example.ui.theme.SuccessGreen
 
 data class QuickAction(val title: String, val subtitle: String, val icon: ImageVector, val tag: String)
 
 @Composable
 fun HomeScreen(
-    assistantName: String = "Babu",
+    assistantName: String = "NAYRO",
     agentState: AgentState = AgentState.Idle,
     voiceState: VoiceState = VoiceState.DISABLED,
     liveTranscript: String = "",
@@ -100,10 +104,17 @@ fun HomeScreen(
     onCancelTask: () -> Unit = {},
     onPauseTask: () -> Unit = {},
     onResumeTask: () -> Unit = {},
-    onQuickActionClick: (String) -> Unit = {}
+    onQuickActionClick: (String) -> Unit = {},
+    standbyAudioLevel: Float = 0f,
+    isBackgroundListeningEnabled: Boolean = false,
+    isFollowUpSessionActive: Boolean = false,
+    backgroundListeningStatus: String = "",
+    onToggleBackgroundListening: (Boolean) -> Unit = {},
+    onEndConversationSession: () -> Unit = {}
 ) {
     var textInput by remember { mutableStateOf("") }
     val scrollState = rememberScrollState()
+    val cleanAssistantName = assistantName.trim().ifEmpty { "NAYRO" }
     val isVoiceCapturing = voiceState == VoiceState.LISTENING ||
         voiceState == VoiceState.FOLLOW_UP_LISTENING ||
         voiceState == VoiceState.TRANSCRIBING ||
@@ -113,21 +124,24 @@ fun HomeScreen(
     val quickActions = listOf(
         QuickAction("Agent Control Center", "Autonomy levels, workflows, automations & Emergency Stop", Icons.Default.Tune, "action_dashboard"),
         QuickAction("Permissions & Wizard", "Verify runtime permissions, Accessibility & Overlay access", Icons.Default.Security, "action_perm"),
-        QuickAction("Background & Floating", "Toggle foreground service & Andee-style Babu bubble", Icons.Default.Layers, "action_background"),
+        QuickAction("Background & Floating", "Background listening ON/OFF & floating $cleanAssistantName bubble", Icons.Default.Layers, "action_background"),
         QuickAction("Capability Registry", "Inspect live Android device & feature readiness", Icons.Default.Build, "action_caps"),
         QuickAction("Memory & Notebook", "View saved preferences, notes, and context", Icons.Default.Psychology, "action_memory"),
         QuickAction("Set Provider API Key", "Configure Gemini, OpenAI, Grok, or Local Ollama", Icons.Default.VpnKey, "action_api")
     )
 
-    val suggestedCommands = listOf(
-        "Babu NAYRO cute baby, time kya hua hai?",
-        "Babu NAYRO cute baby, YouTube kholo aur Android AI search karo",
-        "Screen par kya likha hai?",
-        "Settings kholo aur Wi-Fi section tak jao",
-        "Summarize my recent notifications",
-        "Run workflow: Read Screen & Save Summary Note",
-        "Note banao: NAYRO release checklist"
-    )
+    val suggestedCommands = remember(cleanAssistantName) {
+        listOf(
+            "What is artificial intelligence?",
+            "Explain it with an example",
+            "Hi $cleanAssistantName, time kya hua hai?",
+            "YouTube kholo aur Android AI search karo",
+            "Screen par kya likha hai?",
+            "Settings kholo aur Wi-Fi section tak jao",
+            "Summarize my recent notifications",
+            "Note banao: NAYRO release checklist"
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -143,8 +157,8 @@ fun HomeScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             StatusBadge(
-                label = if (isForegroundActive) "Bg Agent: ON" else "Bg Agent: OFF",
-                isActive = isForegroundActive,
+                label = if (isBackgroundListeningEnabled || isForegroundActive) "Bg Voice: ON" else "Bg Voice: OFF",
+                isActive = isBackgroundListeningEnabled || isForegroundActive,
                 modifier = Modifier.weight(1f),
                 testTag = "badge_agent_service"
             )
@@ -162,7 +176,76 @@ fun HomeScreen(
             )
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // Dedicated Master Background Voice Listening ON/OFF Card
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(
+                width = 1.dp,
+                color = if (isBackgroundListeningEnabled) SuccessGreen.copy(alpha = 0.65f) else MaterialTheme.colorScheme.outline
+            ),
+            shape = RoundedCornerShape(18.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("home_bg_listening_card")
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Hearing,
+                        contentDescription = "Background Voice Listening",
+                        tint = if (isBackgroundListeningEnabled) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = if (isBackgroundListeningEnabled) {
+                                "Background Voice Listening: ON"
+                            } else {
+                                "Background Voice Listening: OFF"
+                            },
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                        Text(
+                            text = backgroundListeningStatus.ifBlank {
+                                if (isBackgroundListeningEnabled) {
+                                    "Listening locally for wake phrases while using other apps."
+                                } else {
+                                    "Microphone released. In-app voice & chat remain ready."
+                                }
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Switch(
+                    checked = isBackgroundListeningEnabled,
+                    onCheckedChange = onToggleBackgroundListening,
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor = Coral,
+                        checkedTrackColor = ForestGreen
+                    ),
+                    modifier = Modifier.testTag("home_bg_listening_switch")
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
 
         // Hero Assistant Workspace Card (Crisp White Surface)
         Card(
@@ -185,13 +268,13 @@ fun HomeScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "Namaste! I'm $assistantName",
+                            text = "Namaste! I'm $cleanAssistantName",
                             style = MaterialTheme.typography.headlineSmall,
                             fontWeight = FontWeight.Bold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
                         Text(
-                            text = "Autonomous Android Agent • Voice, Screen & 52 Native Tools",
+                            text = "Open-Ended Autonomous Android Agent • Voice, Reasoning & Native Tools",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -241,7 +324,7 @@ fun HomeScreen(
                     color = Coral
                 )
 
-                if (isVoiceCapturing || liveTranscript.isNotBlank()) {
+                if (isVoiceCapturing || liveTranscript.isNotBlank() || voiceState == VoiceState.SPEAKING || agentState is AgentState.Thinking || agentState is AgentState.ExecutingTask) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Card(
                         colors = CardDefaults.cardColors(
@@ -263,12 +346,19 @@ fun HomeScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = if (isVoiceCapturing) "Voice-to-Text Active" else "Last Spoken Command",
+                                    text = if (isVoiceCapturing) "Voice-to-Text Active" else "Live Agent Audio & Status",
                                     style = MaterialTheme.typography.labelSmall,
                                     fontWeight = FontWeight.SemiBold,
                                     color = if (isVoiceCapturing) Coral else ForestGreen
                                 )
-                                if (isVoiceCapturing) {
+                                if (isFollowUpSessionActive) {
+                                    TextButton(
+                                        onClick = onEndConversationSession,
+                                        modifier = Modifier.testTag("home_end_session_button")
+                                    ) {
+                                        Text("End Session", style = MaterialTheme.typography.labelSmall, color = Coral)
+                                    }
+                                } else if (isVoiceCapturing) {
                                     Text(
                                         text = "Speak naturally in Hindi / English / Hinglish",
                                         style = MaterialTheme.typography.labelSmall,
@@ -286,18 +376,15 @@ fun HomeScreen(
                                     modifier = Modifier.testTag("live_voice_transcript_text")
                                 )
                             }
-                            if (isVoiceCapturing) {
-                                Spacer(modifier = Modifier.height(6.dp))
-                                LinearProgressIndicator(
-                                    progress = { audioLevel.coerceIn(0.08f, 1f) },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(4.dp)
-                                        .clip(RoundedCornerShape(2.dp)),
-                                    color = Coral,
-                                    trackColor = SoftSage
-                                )
-                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            NayroAudioVisualizer(
+                                voiceState = voiceState,
+                                agentState = agentState,
+                                audioLevel = audioLevel,
+                                standbyAudioLevel = standbyAudioLevel,
+                                barCount = 18,
+                                height = 28.dp
+                            )
                         }
                     }
                 }
@@ -315,7 +402,7 @@ fun HomeScreen(
                         modifier = Modifier
                             .weight(1f)
                             .testTag("text_input_field"),
-                        placeholder = { Text("Ask $assistantName anything (Hindi, English, Hinglish)...") },
+                        placeholder = { Text("Ask $cleanAssistantName anything (Hindi, English, Hinglish)...") },
                         shape = RoundedCornerShape(24.dp),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = ForestGreen,
@@ -364,9 +451,9 @@ fun HomeScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
-        // Dedicated Android Speech-to-Text Voice Command Interface for "Babu NAYRO cute baby"
+        // Dedicated Android Speech-to-Text & Autonomous Voice Panel
         SpeechToTextVoicePanel(
-            assistantName = assistantName,
+            assistantName = cleanAssistantName,
             voiceState = voiceState,
             isMicrophoneGranted = isMicrophoneGranted,
             isSpeechRecognitionAvailable = isSpeechRecognitionAvailable,
@@ -381,7 +468,13 @@ fun HomeScreen(
             onMicrophonePermissionResult = onMicrophonePermissionResult,
             onLanguageSelected = onLanguageSelected,
             onSendRecognizedCommand = onSendText,
-            onClearTranscript = onClearTranscript
+            onClearTranscript = onClearTranscript,
+            agentState = agentState,
+            standbyAudioLevel = standbyAudioLevel,
+            isBackgroundListeningEnabled = isBackgroundListeningEnabled,
+            isFollowUpSessionActive = isFollowUpSessionActive,
+            onToggleBackgroundListening = onToggleBackgroundListening,
+            onEndConversationSession = onEndConversationSession
         )
 
         Spacer(modifier = Modifier.height(16.dp))

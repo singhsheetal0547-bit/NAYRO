@@ -87,6 +87,8 @@ class NayroApplication : Application() {
         private set
     lateinit var voiceManager: VoiceManager
         private set
+    lateinit var backgroundVoiceController: com.example.core.voice.BackgroundVoiceController
+        private set
     lateinit var healthManager: BackgroundAgentHealthManager
         private set
 
@@ -143,8 +145,14 @@ class NayroApplication : Application() {
         agentBrain = agentRuntime.agentBrain
         agentRuntime.setAssistantIdentity(assistantIdentityStore.getDisplayName())
 
-        voiceManager = VoiceManager(this)
+        voiceManager = VoiceManager(this, encryptedStorageManager)
         voiceManager.bindIdentityStore(assistantIdentityStore)
+        backgroundVoiceController = com.example.core.voice.BackgroundVoiceController(
+            context = this,
+            identityStore = assistantIdentityStore,
+            permissionManager = permissionManager,
+            voiceManager = voiceManager
+        )
         healthManager = BackgroundAgentHealthManager(this, permissionManager, capabilityManager, voiceManager)
 
         // Section 10 — Connect real incoming notifications to AutomationEngine notification watch rules

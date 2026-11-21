@@ -19,6 +19,12 @@ object ServiceStateRepository {
     )
     val foregroundServiceStatus: StateFlow<ServiceStatus> = _foregroundServiceStatus.asStateFlow()
 
+    private val _backgroundVoicePipelineStatus = MutableStateFlow(
+        BackgroundVoicePipelineStatus()
+    )
+    val backgroundVoicePipelineStatus: StateFlow<BackgroundVoicePipelineStatus> =
+        _backgroundVoicePipelineStatus.asStateFlow()
+
     private val _floatingServiceStatus = MutableStateFlow(
         ServiceStatus(ServiceLifecycleState.STOPPED)
     )
@@ -46,8 +52,76 @@ object ServiceStateRepository {
             _isBackgroundAgentPaused.value = false
             _pausedUntilTimestampMs.value = null
             _pauseReason.value = null
+            _backgroundVoicePipelineStatus.value = BackgroundVoicePipelineStatus(
+                state = BackgroundVoicePipelineState.STOPPED,
+                detail = error ?: "Background voice service is stopped.",
+                isMicrophoneVerified = false,
+                isWakeEngineVerified = false,
+                isAudioCaptureVerified = false,
+                retryCount = 0,
+                lastUpdatedTimestamp = System.currentTimeMillis()
+            )
+        } else if (state == ServiceLifecycleState.STARTING) {
+            _backgroundVoicePipelineStatus.value = _backgroundVoicePipelineStatus.value.copy(
+                state = BackgroundVoicePipelineState.SERVICE_STARTING,
+                detail = error ?: "Starting foreground service...",
+                isMicrophoneVerified = false,
+                isWakeEngineVerified = false,
+                isAudioCaptureVerified = false,
+                lastUpdatedTimestamp = System.currentTimeMillis()
+            )
+        } else if (state == ServiceLifecycleState.FAILED || state == ServiceLifecycleState.ERROR || state == ServiceLifecycleState.PERMISSION_DENIED) {
+            _backgroundVoicePipelineStatus.value = _backgroundVoicePipelineStatus.value.copy(
+                state = BackgroundVoicePipelineState.ERROR,
+                detail = error ?: "Foreground service failed ($state).",
+                isMicrophoneVerified = false,
+                isWakeEngineVerified = false,
+                isAudioCaptureVerified = false,
+                lastUpdatedTimestamp = System.currentTimeMillis()
+            )
         }
         appendActivityLog("Foreground Service -> ${state.name}${if (error != null) " ($error)" else ""}")
+    }
+
+    /**
+     * Publishes a granular P0-3 background voice pipeline state.
+     * Enforces an invariant: [BackgroundVoicePipelineState.BACKGROUND_VOICE_READY] can NEVER be published
+     * unless [isMicrophoneVerified], [isWakeEngineVerified], and [isAudioCaptureVerified] are ALL true.
+     * If any prerequisite is false, downgrades automatically and honestly to [BackgroundVoicePipelineState.DEGRADED].
+     */
+    fun updateBackgroundVoicePipeline(
+        state: BackgroundVoicePipelineState,
+        detail: String,
+        isMicrophoneVerified: Boolean = _backgroundVoicePipelineStatus.value.isMicrophoneVerified,
+        isWakeEngineVerified: Boolean = _backgroundVoicePipelineStatus.value.isWakeEngineVerified,
+        isAudioCaptureVerified: Boolean = _backgroundVoicePipelineStatus.value.isAudioCaptureVerified,
+        retryCount: Int = _backgroundVoicePipelineStatus.value.retryCount,
+        maxRetries: Int = _backgroundVoicePipelineStatus.value.maxRetries,
+        isScreenOff: Boolean = _backgroundVoicePipelineStatus.value.isScreenOff
+    ) {
+        val allVerified = isMicrophoneVerified && isWakeEngineVerified && isAudioCaptureVerified
+        val effectiveState = if (state == BackgroundVoicePipelineState.BACKGROUND_VOICE_READY && !allVerified) {
+            BackgroundVoicePipelineState.DEGRADED
+        } else {
+            state
+        }
+        val effectiveDetail = if (effectiveState != state) {
+            "Downgraded to DEGRADED: cannot claim BACKGROUND_VOICE_READY without verified microphone ($isMicrophoneVerified), wake engine ($isWakeEngineVerified), and audio capture ($isAudioCaptureVerified)."
+        } else {
+            detail
+        }
+        _backgroundVoicePipelineStatus.value = BackgroundVoicePipelineStatus(
+            state = effectiveState,
+            detail = effectiveDetail,
+            isMicrophoneVerified = isMicrophoneVerified,
+            isWakeEngineVerified = isWakeEngineVerified,
+            isAudioCaptureVerified = isAudioCaptureVerified,
+            retryCount = retryCount,
+            maxRetries = maxRetries,
+            isScreenOff = isScreenOff,
+            lastUpdatedTimestamp = System.currentTimeMillis()
+        )
+        appendActivityLog("Voice Pipeline -> ${effectiveState.name}: $effectiveDetail")
     }
 
     fun updateFloatingStatus(state: ServiceLifecycleState, error: String? = null) {
@@ -72,6 +146,12 @@ object ServiceStateRepository {
         _pausedUntilTimestampMs.value = untilMs
         _pauseReason.value = reason
         _foregroundServiceStatus.value = ServiceStatus(ServiceLifecycleState.PAUSED)
+        _backgroundVoicePipelineStatus.value = _backgroundVoicePipelineStatus.value.copy(
+            state = BackgroundVoicePipelineState.DEGRADED,
+            detail = "Background voice paused: $reason",
+            isAudioCaptureVerified = false,
+            lastUpdatedTimestamp = nowMs
+        )
         val durationDesc = if (durationMinutes != null && durationMinutes > 0) {
             "for ${durationMinutes}m"
         } else {
@@ -88,7 +168,7 @@ object ServiceStateRepository {
         _pausedUntilTimestampMs.value = null
         _pauseReason.value = null
         _foregroundServiceStatus.value = ServiceStatus(ServiceLifecycleState.RUNNING)
-        appendActivityLog("Background Agent RESUMED and operational.")
+        appendActivityLog("Background Agent RESUMED; awaiting voice pipeline verification.")
     }
 
     fun appendActivityLog(entry: String) {
@@ -99,6 +179,7 @@ object ServiceStateRepository {
 
     fun clearForTesting() {
         _foregroundServiceStatus.value = ServiceStatus(ServiceLifecycleState.STOPPED)
+        _backgroundVoicePipelineStatus.value = BackgroundVoicePipelineStatus()
         _floatingServiceStatus.value = ServiceStatus(ServiceLifecycleState.STOPPED)
         _isBackgroundAgentPaused.value = false
         _pausedUntilTimestampMs.value = null

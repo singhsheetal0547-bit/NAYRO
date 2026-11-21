@@ -117,16 +117,54 @@ class AgentBrain(
             }
         }
 
-        // Check for compound multi-step instructions joined by "and then", "then", "aur phir", "after that"
-        val clauses = trimmed.split(Regex("(?i)\\s*,?\\s*(?:and then|then|aur phir|after that)\\s+"))
-            .map { it.trim() }
-            .filter { it.isNotBlank() }
+        // Check for compound multi-step instructions across English, Hinglish, and Devanagari Hindi
+        val clauses = splitCompoundClausesMultilingual(trimmed)
 
         if (clauses.size > 1) {
             val taskId = existingTaskId
             val mergedActions = mutableListOf<AgentAction>()
-            clauses.forEach { clause ->
-                val subActions = planSingleOrDynamicClause(clause, taskId)
+            var lastNamedEntity: String? = null
+            clauses.forEach { rawClause ->
+                val resolvedClause = carryForwardClauseEntity(rawClause, lastNamedEntity)
+                val subActions = planSingleOrDynamicClause(resolvedClause, taskId).map { act ->
+                    // If a follow-up communication action has no explicit recipient ("Contact"), inherit the previous clause's contact entity
+                    val entity = lastNamedEntity
+                    val currentRecipient = act.parameters["recipient"] ?: act.target
+                    if (entity != null &&
+                        act.actionType in setOf(
+                            ActionType.MESSAGE_DRAFT_SEND,
+                            ActionType.ASK_USER_CONFIRMATION,
+                            ActionType.SEND_SMS,
+                            ActionType.MAKE_PHONE_CALL
+                        ) &&
+                        (currentRecipient.isNullOrBlank() || currentRecipient.equals("Contact", ignoreCase = true))
+                    ) {
+                        act.copy(
+                            target = entity,
+                            parameters = act.parameters.toMutableMap().apply {
+                                put("recipient", entity)
+                                if (act.actionType == ActionType.MAKE_PHONE_CALL) put("target", entity)
+                            }
+                        )
+                    } else if (entity != null &&
+                        act.actionType in setOf(ActionType.SET_TEXT, ActionType.CLICK_ELEMENT) &&
+                        (act.target.equals("Contact", ignoreCase = true) || act.parameters["text"].equals("Contact", ignoreCase = true))
+                    ) {
+                        act.copy(
+                            target = if (act.target.equals("Contact", ignoreCase = true)) entity else act.target,
+                            parameters = act.parameters.toMutableMap().apply {
+                                if (get("text").equals("Contact", ignoreCase = true)) put("text", entity)
+                                if (get("target").equals("Contact", ignoreCase = true)) put("target", entity)
+                            }
+                        )
+                    } else {
+                        act
+                    }
+                }
+                // Capture concrete contact/recipient entity from this clause for downstream pronouns or implicit recipients
+                extractPrimaryEntityFromClause(resolvedClause, subActions)?.let { entity ->
+                    lastNamedEntity = entity
+                }
                 for (act in subActions) {
                     // Deduplicate consecutive identical LAUNCH_APP actions (e.g. "open WhatsApp, message Rahul...")
                     val last = mergedActions.lastOrNull()
@@ -158,6 +196,10 @@ class AgentBrain(
                 ActionType.CHECK_INCOMING_CALL,
                 ActionType.READ_CALL_HISTORY,
                 ActionType.READ_SMS,
+                ActionType.COMPOSE_EMAIL,
+                ActionType.READ_EMAIL_NOTIFICATIONS,
+                ActionType.CHECK_COMMUNICATION_SPAM,
+                ActionType.MANAGE_SCREEN_RECORDING,
                 ActionType.CREATE_REMINDER,
                 ActionType.SCHEDULE_ALARM,
                 ActionType.WHATSAPP_READ_CONVERSATION,
@@ -471,6 +513,80 @@ class AgentBrain(
         return DynamicReasoningDecision.ContinueNextPlanned(
             thought = "Step verified; continuing to next action (${nextPlanned?.actionType?.name})."
         )
+    }
+
+    /**
+     * Splits compound multi-step user instructions across English, Hinglish, and Devanagari Hindi.
+     * Supports sequential connectors ("and then", "then", "aur phir", "after that", "और फिर", "उसके बाद", "फिर")
+     * as well as action-joining "और" / "aur" when both sides represent distinct actionable commands
+     * (e.g. "Open WhatsApp और Amit को message भेज दो।").
+     */
+    private fun splitCompoundClausesMultilingual(text: String): List<String> {
+        val cleaned = text.trim().removeSuffix("।").trim()
+        val primaryParts = cleaned.split(
+            Regex("(?i)\\s*,?\\s*(?:and\\s+then|then|aur\\s+phir|after\\s+that|और\\s+फिर|उसके\\s+बाद|फिर)\\s+")
+        ).map { it.trim().removeSuffix("।").trim() }.filter { it.isNotBlank() }
+
+        val actionIndicator = Regex(
+            "(?i)(?:\\b(?:open|launch|start|call|dial|message|msg|send|sms|whatsapp|email|play|search|read|check|set|create|remind|kholo|bhejo|bhej|bhejna|karo|chalao|lagao)\\b|खोलो|खोल|कॉल|फ़ोन|फोन|मैसेज|संदेश|भेजो|भेज|भेजना|चलाओ|लगाओ|पढ़ो|बताओ|ढूंढो)"
+        )
+
+        val expanded = mutableListOf<String>()
+        for (part in primaryParts) {
+            // Do not split unified single-intent media/YouTube commands like "YouTube kholo aur Arijit Singh ke songs chalao"
+            val wholeIntent = TaskClassifier.classify(part)
+            val isUnifiedSingleMediaOrSearch = wholeIntent.type == UserIntentType.MEDIA_CONTROL ||
+                wholeIntent.type == UserIntentType.YOUTUBE_SEARCH
+            if (isUnifiedSingleMediaOrSearch) {
+                expanded.add(part)
+                continue
+            }
+
+            // Split Devanagari action-joining "और" (e.g. "Open WhatsApp और Amit को message भेज दो")
+            val subParts = part.split(Regex("\\s+और\\s+"))
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+            if (subParts.size > 1 && subParts.all { actionIndicator.containsMatchIn(it) }) {
+                expanded.addAll(subParts)
+            } else {
+                expanded.add(part)
+            }
+        }
+        return expanded
+    }
+
+    private fun carryForwardClauseEntity(clause: String, previousEntity: String?): String {
+        val entity = previousEntity?.takeIf { it.isNotBlank() } ?: return clause
+        var updated = clause
+        // Hinglish / Hindi Roman pronoun replacement: "use call karo" / "usko message bhejo" / "unko call karo"
+        updated = updated.replace(Regex("(?i)\\b(?:use|usko|unko|unhe)\\s+(call|phone|whatsapp|message|msg|sms)\\b"), "$entity ko $1")
+        // Devanagari pronoun replacement: "उसे कॉल करो" / "उसको message भेज दो" / "उनको व्हाट्सएप पर मैसेज भेजो"
+        updated = updated.replace(Regex("(?:उसे|उसको|उनको|उन्हें)\\s+(call|phone|whatsapp|message|msg|sms|कॉल|फ़ोन|फोन|व्हाट्सएप|वॉट्सऐप|मैसेज|संदेश)"), "$entity को $1")
+        // English pronoun replacement: "call him" / "call her" / "message him"
+        updated = updated.replace(Regex("(?i)\\b(call|phone|message|text|sms|whatsapp)\\s+(?:him|her|them)\\b"), "$1 $entity")
+        return updated
+    }
+
+    private fun extractPrimaryEntityFromClause(clause: String, actions: List<AgentAction>): String? {
+        val fromAction = actions.firstNotNullOfOrNull { act ->
+            when (act.actionType) {
+                ActionType.MESSAGE_DRAFT_SEND,
+                ActionType.SEND_SMS,
+                ActionType.MAKE_PHONE_CALL,
+                ActionType.RESOLVE_CONTACT,
+                ActionType.ASK_USER_CONFIRMATION -> {
+                    val candidate = (act.parameters["recipient"] ?: act.parameters["query"] ?: act.target)?.trim()
+                    candidate?.takeIf { it.isNotBlank() && !it.equals("Contact", ignoreCase = true) }
+                }
+                else -> null
+            }
+        }
+        if (fromAction != null) return fromAction
+
+        val hindiMatch = Regex("(?i)([\\p{L}\\p{M}0-9_+]+)\\s+(?:ko|को)\\s+(?:whatsapp|व्हाट्सएप|वॉट्सऐप|message|मैसेज|संदेश|msg|call|कॉल|phone|फ़ोन|फोन|sms|email)").find(clause)
+        return hindiMatch?.groupValues?.getOrNull(1)?.trim()?.takeIf {
+            it.isNotBlank() && it.lowercase() !in setOf("use", "usko", "unko", "unhe", "mujhe", "humko", "उसे", "उसको", "उनको", "उन्हें", "मुझे")
+        }
     }
 
     private fun planSingleOrDynamicClause(clause: String, taskId: String): List<AgentAction> {
@@ -1173,6 +1289,76 @@ class AgentBrain(
                     idempotencyClassification = "IDEMPOTENT"
                 )
             )
+        }
+        if (lower.contains("screen record") || lower.contains("record screen") || lower.contains("screen recording")) {
+            val op = when {
+                lower.contains("stop") || lower.contains("band") -> "STOP"
+                lower.contains("status") -> "STATUS"
+                else -> "START"
+            }
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.MANAGE_SCREEN_RECORDING,
+                    target = op,
+                    parameters = mapOf("operation" to op),
+                    riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+        if ((lower.contains("email") || lower.contains("e-mail") || lower.contains("gmail")) &&
+            (lower.contains("send") || lower.contains("compose") || lower.contains("write") || lower.contains("bhejo") || lower.contains("likho"))
+        ) {
+            val emailRegex = Regex("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+            val recipient = emailRegex.find(instruction)?.value.orEmpty()
+            val subjectMatch = Regex("(?i)subject\\s*[:\\-]?\\s*([^,.\\n]+)").find(instruction)
+            val bodyMatch = Regex("(?i)(?:saying|body|message|ki)\\s*[:\\-]?\\s*(.+)$").find(instruction)
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.COMPOSE_EMAIL,
+                    target = recipient.ifBlank { "Email Recipient" },
+                    parameters = buildMap {
+                        put("recipient", recipient)
+                        put("subject", subjectMatch?.groupValues?.getOrNull(1)?.trim() ?: "Message from NAYRO")
+                        put("body", bodyMatch?.groupValues?.getOrNull(1)?.trim() ?: "")
+                    },
+                    riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                    idempotencyClassification = "NON_IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+        if ((lower.contains("email") || lower.contains("e-mail") || lower.contains("gmail")) &&
+            (lower.contains("read") || lower.contains("check") || lower.contains("padho") || lower.contains("batao") || lower.contains("latest"))
+        ) {
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.READ_EMAIL_NOTIFICATIONS,
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+            return actions
+        }
+        if (lower.contains("spam") || lower.contains("phishing") || lower.contains("scam") || lower.contains("suspicious call") || lower.contains("suspicious message")) {
+            val phoneMatch = Regex("(\\+?\\d[\\d\\s-]{5,15}\\d)").find(instruction)?.value?.trim()
+            actions.add(
+                AgentAction(
+                    taskId = taskId,
+                    actionType = ActionType.CHECK_COMMUNICATION_SPAM,
+                    target = phoneMatch,
+                    parameters = buildMap {
+                        if (!phoneMatch.isNullOrBlank()) put("phoneNumber", phoneMatch)
+                    },
+                    riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                    idempotencyClassification = "IDEMPOTENT"
+                )
+            )
+            return actions
         }
         if (lower.contains("take screenshot") || lower.contains("take a screenshot") || lower.contains("capture screen")) {
             actions.add(

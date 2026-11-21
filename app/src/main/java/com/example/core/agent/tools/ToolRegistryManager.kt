@@ -922,6 +922,58 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.MANAGE_SCREEN_RECORDING,
+                toolId = "screen.manage_screen_recording",
+                displayName = "Screen Recording (MediaProjection)",
+                description = "Requests explicit per-session Android MediaProjection user consent to start or stop screen recording honestly without silent capture.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = mapOf("operation" to "String - START, STOP, or STATUS"),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.COMPOSE_EMAIL,
+                toolId = "comm.compose_email",
+                displayName = "Compose Email",
+                description = "Opens an installed email app via mailto: intent with pre-filled recipient, subject, and body for user review and sending.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf(
+                    "recipient" to "String - Recipient email address",
+                    "subject" to "String - Email subject line",
+                    "body" to "String - Email message body"
+                ),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.READ_EMAIL_NOTIFICATIONS,
+                toolId = "comm.read_email_notifications",
+                displayName = "Read Recent Email Previews",
+                description = "Reads recent email alert previews from authorized Notification Listener access (Gmail, Outlook, Yahoo Mail).",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf("limit" to "Int - Max email notifications to list"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CHECK_COMMUNICATION_SPAM,
+                toolId = "comm.check_communication_spam",
+                displayName = "Spam & Phishing Detector",
+                description = "Analyzes incoming phone numbers, recent SMS messages, or provided text for telemarketer patterns, OTP theft, and phishing links.",
+                category = ToolCategory.COMMUNICATION,
+                parametersSchema = mapOf(
+                    "phoneNumber" to "String - Optional phone number to assess",
+                    "sender" to "String - Optional message sender",
+                    "body" to "String - Optional message content"
+                ),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
     }
 
     /**
@@ -1003,6 +1055,12 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
 
     override fun getToolsByCategory(category: ToolCategory): List<DynamicToolDefinition> =
         catalog.values.filter { it.category == category }
+
+    fun getToolsByDomain(domain: com.example.core.agent.ExecutionDomain): List<DynamicToolDefinition> =
+        catalog.values.filter { com.example.core.agent.ConversationalIntelligenceEngine.domainForAction(it.actionType) == domain }
+
+    fun getDomainSummary(): Map<com.example.core.agent.ExecutionDomain, Int> =
+        com.example.core.agent.ExecutionDomain.entries.associateWith { domain -> getToolsByDomain(domain).size }
 
     override fun generateLlmToolPromptSummary(): String {
         return catalog.values.joinToString("\n") { tool ->

@@ -92,7 +92,9 @@ class ActionExecutor(
         context,
         screenIntelligenceManager,
         memoryManager
-    )
+    ),
+    val emailManager: com.example.core.communication.EmailOperationManager = com.example.core.communication.EmailOperationManager(context),
+    val conversationalEngine: ConversationalIntelligenceEngine = ConversationalIntelligenceEngine()
 ) {
 
     companion object {
@@ -1091,35 +1093,87 @@ class ActionExecutor(
 
             ActionType.QUERY_LLM -> {
                 val prompt = action.parameters["prompt"] ?: ""
+                val identityProfile = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getCurrentProfile()
+                val activeAssistantName = identityProfile?.assistantDisplayName
+                    ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
+                val preferredTone = identityProfile?.responseTone ?: "Balanced"
+                val openEndedContext = action.parameters["openEndedContext"].orEmpty()
+                val memoryContext = action.parameters["memoryContext"].orEmpty()
+                val conversationHistory = action.parameters["conversationHistory"].orEmpty()
+
+                val analysis = conversationalEngine.analyzeUserMessage(prompt)
+                conversationalEngine.recordTurn("user", prompt, analysis.language)
+
                 val activeProvider = providerManager.activeProvider.value
                 if (activeProvider == null || !activeProvider.hasKeySaved) {
+                    val localReply = conversationalEngine.buildLocalConversationalReply(
+                        assistantName = activeAssistantName,
+                        analysis = analysis,
+                        userMessage = prompt
+                    )
+                    if (localReply != null) {
+                        conversationalEngine.recordTurn("assistant", localReply, analysis.language)
+                        return ActionExecutionResult(true, localReply, VerificationStatus.VERIFIED)
+                    }
                     return ActionExecutionResult(
                         false,
-                        "No AI Provider is configured yet. Please open the Providers tab and enter your Gemini, OpenAI, or Local Model settings.",
+                        "No AI Provider is configured yet. Please open the Providers tab and enter your Gemini, Grok, OpenRouter, OpenAI, or Local Model settings.",
                         VerificationStatus.FAILED
                     )
                 }
 
-                val activeAssistantName = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
-                    ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
                 val systemPrompt = buildString {
-                    append("You are $activeAssistantName, the intelligent voice-first personal AI assistant inside NAYRO for Android. ")
-                    append("Respond naturally in the user's language (Hindi, English, or Hinglish). Keep responses concise, helpful, and honest. ")
+                    append(
+                        conversationalEngine.buildConversationalSystemPrompt(
+                            assistantName = activeAssistantName,
+                            language = analysis.language,
+                            memoryContext = memoryContext.ifBlank { null }
+                        )
+                    )
+                    append("Tone preference: $preferredTone.\n")
+                    if (openEndedContext.isNotBlank()) {
+                        append(openEndedContext).append("\n")
+                    } else if (conversationHistory.isNotBlank()) {
+                        append("Recent conversation history: ").append(conversationHistory).append("\n")
+                    }
                     append("Available Dynamic Tools:\n")
                     append(ToolRegistryManager.generateLlmToolPromptSummary())
                 }
 
-                when (val res = providerManager.sendRequest(userPrompt = prompt, systemPrompt = systemPrompt)) {
-                    is AIResult.Success -> ActionExecutionResult(
-                        true,
-                        res.response.content,
-                        VerificationStatus.VERIFIED
-                    )
-                    is AIResult.Error -> ActionExecutionResult(
-                        false,
-                        "AI Provider error (${res.code}): ${res.message}",
-                        VerificationStatus.FAILED
-                    )
+                val recentTurns = conversationalEngine.getRecentHistory(limit = 8)
+                    .dropLastWhile { it.role == "user" && it.content == prompt.trim() }
+                    .map { com.example.core.provider.model.AIChatMessage(role = it.role, content = it.content) }
+
+                when (val res = providerManager.sendRequest(
+                    userPrompt = prompt,
+                    history = recentTurns,
+                    systemPrompt = systemPrompt
+                )) {
+                    is AIResult.Success -> {
+                        conversationalEngine.recordTurn("assistant", res.response.content, analysis.language)
+                        ActionExecutionResult(
+                            true,
+                            res.response.content,
+                            VerificationStatus.VERIFIED
+                        )
+                    }
+                    is AIResult.Error -> {
+                        val fallbackReply = conversationalEngine.buildLocalConversationalReply(
+                            assistantName = activeAssistantName,
+                            analysis = analysis,
+                            userMessage = prompt
+                        )
+                        if (fallbackReply != null) {
+                            conversationalEngine.recordTurn("assistant", fallbackReply, analysis.language)
+                            ActionExecutionResult(true, fallbackReply, VerificationStatus.VERIFIED)
+                        } else {
+                            ActionExecutionResult(
+                                false,
+                                "AI Provider error (${res.code}): ${res.message}",
+                                VerificationStatus.FAILED
+                            )
+                        }
+                    }
                 }
             }
 
@@ -1479,6 +1533,101 @@ class ActionExecutor(
                     isConfirmed = isConfirmed,
                     onlyIfNewNumber = onlyIfNew
                 )
+            }
+
+            ActionType.MANAGE_SCREEN_RECORDING -> {
+                val operation = (action.parameters["operation"] ?: action.target ?: "STATUS").trim().uppercase()
+                when (operation) {
+                    "STOP" -> {
+                        com.example.core.screen.ScreenRecordingController.stopRecording()
+                        ActionExecutionResult(
+                            isSuccess = true,
+                            outputMessage = com.example.core.screen.ScreenRecordingController.status.value.detail,
+                            status = VerificationStatus.VERIFIED
+                        )
+                    }
+                    "STATUS" -> {
+                        val snap = com.example.core.screen.ScreenRecordingController.status.value
+                        ActionExecutionResult(
+                            isSuccess = true,
+                            outputMessage = "Screen recording status: ${snap.state.name} — ${snap.detail}",
+                            status = VerificationStatus.VERIFIED
+                        )
+                    }
+                    else -> {
+                        val consentIntent = com.example.core.screen.ScreenRecordingController.createUserConsentIntent(context)
+                        if (consentIntent == null) {
+                            ActionExecutionResult(
+                                isSuccess = false,
+                                outputMessage = com.example.core.screen.ScreenRecordingController.status.value.detail,
+                                status = VerificationStatus.NOT_SUPPORTED
+                            )
+                        } else {
+                            ActionExecutionResult(
+                                isSuccess = false,
+                                outputMessage = "Screen recording requires explicit per-session Android MediaProjection user consent. Please approve the system screen capture dialog to begin recording.",
+                                status = VerificationStatus.REQUIRES_PERMISSION
+                            )
+                        }
+                    }
+                }
+            }
+
+            ActionType.COMPOSE_EMAIL -> {
+                val recipient = (action.parameters["recipient"] ?: action.target).orEmpty().trim()
+                val subject = (action.parameters["subject"] ?: "Message from NAYRO").trim()
+                val body = (action.parameters["body"] ?: action.parameters["message"] ?: "").trim()
+                emailManager.openEmailComposer(
+                    com.example.core.communication.EmailDraftRequest(
+                        recipientEmail = recipient,
+                        subject = subject,
+                        body = body
+                    )
+                )
+            }
+
+            ActionType.READ_EMAIL_NOTIFICATIONS -> {
+                val limit = (action.parameters["limit"]?.toIntOrNull() ?: 8).coerceIn(1, 30)
+                emailManager.readEmailNotificationPreviews(maxItems = limit)
+            }
+
+            ActionType.CHECK_COMMUNICATION_SPAM -> {
+                val phone = action.parameters["phoneNumber"] ?: action.parameters["number"]
+                val sender = action.parameters["sender"]
+                val body = action.parameters["body"] ?: action.parameters["message"]
+                val activeTelecom = com.example.core.telephony.TelecomCallControlBridge.activeCallInfo.value
+                val lastSms = com.example.core.telephony.SmsIntelligenceManager.lastInspectedSms
+                val assessment = when {
+                    !body.isNullOrBlank() -> com.example.core.telephony.CommunicationSpamDetector.assessMessage(
+                        sender = sender ?: phone,
+                        body = body
+                    )
+                    !phone.isNullOrBlank() -> com.example.core.telephony.CommunicationSpamDetector.assessIncomingCall(
+                        phoneNumber = phone,
+                        isKnownContact = callIntelligenceManager.resolveContactByPhoneNumber(phone) != null
+                    )
+                    activeTelecom?.spamAssessment != null -> activeTelecom.spamAssessment
+                    lastSms != null -> com.example.core.telephony.CommunicationSpamDetector.assessMessage(
+                        sender = lastSms.address,
+                        body = lastSms.body,
+                        isKnownContact = !lastSms.resolvedContactName.isNullOrBlank()
+                    )
+                    else -> null
+                }
+                if (assessment == null) {
+                    ActionExecutionResult(
+                        isSuccess = true,
+                        outputMessage = "No active call or recent SMS message found to inspect for spam/phishing risk.",
+                        status = VerificationStatus.VERIFIED
+                    )
+                } else {
+                    val reasonsText = assessment.reasons.joinToString("; ")
+                    ActionExecutionResult(
+                        isSuccess = true,
+                        outputMessage = "Spam Check (${assessment.riskLevel.label}, score=${assessment.score}/100): $reasonsText",
+                        status = VerificationStatus.VERIFIED
+                    )
+                }
             }
         }
     }

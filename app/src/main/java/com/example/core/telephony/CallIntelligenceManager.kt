@@ -843,6 +843,31 @@ class CallIntelligenceManager(
             }
         }
 
+        // Prefer official bound NayroInCallService (TelecomCallControlBridge) when holding live Telecom Call
+        if (TelecomCallControlBridge.hasLiveTelecomCall()) {
+            when (op) {
+                "ANSWER" -> {
+                    if (TelecomCallControlBridge.answerActiveRingingCall()) {
+                        return ActionExecutionResult(
+                            true,
+                            "Answered incoming ringing call via Android InCallService (AI audio remains muted).",
+                            VerificationStatus.VERIFIED
+                        )
+                    }
+                }
+                "REJECT", "DECLINE", "END", "HANGUP" -> {
+                    if (TelecomCallControlBridge.rejectOrEndCurrentCall()) {
+                        val verb = if (op == "REJECT" || op == "DECLINE") "Rejected" else "Ended"
+                        return ActionExecutionResult(
+                            true,
+                            "$verb phone call via Android InCallService.",
+                            VerificationStatus.VERIFIED
+                        )
+                    }
+                }
+            }
+        }
+
         val telecom = ctx.getSystemService(Context.TELECOM_SERVICE) as? TelecomManager
         if (telecom != null && (hasAnswerPhoneCallsPermission() || isDefaultDialerRoleHeld())) {
             try {

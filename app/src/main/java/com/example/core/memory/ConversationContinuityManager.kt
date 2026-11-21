@@ -15,6 +15,12 @@ data class PendingSlotContinuation(
     fun isExpired(nowMs: Long = System.currentTimeMillis()): Boolean = nowMs >= expiresAtMs
 }
 
+data class ConversationTurn(
+    val role: String, // "user" or "assistant"
+    val content: String,
+    val timestampMs: Long = System.currentTimeMillis()
+)
+
 data class ShortTermSessionContext(
     var lastMentionedContact: String? = null,
     var lastMentionedFile: String? = null,
@@ -23,6 +29,8 @@ data class ShortTermSessionContext(
     var lastExecutedInstruction: String? = null,
     var lastCalendarEventTitle: String? = null,
     var lastDraftedOrSentMessage: String? = null,
+    var lastDiscussedTopic: String? = null,
+    var lastSearchQuery: String? = null,
     var recentCandidateContacts: List<String> = emptyList(),
     var updatedAtMs: Long = System.currentTimeMillis()
 )
@@ -48,6 +56,64 @@ class ConversationContinuityManager {
 
     private var pendingSlot: PendingSlotContinuation? = null
     private val sessionContext = ShortTermSessionContext()
+    private val recentTurns = mutableListOf<ConversationTurn>()
+
+    fun recordConversationTurn(role: String, content: String) {
+        val clean = content.trim()
+        if (clean.isEmpty()) return
+        recentTurns.add(ConversationTurn(role = role, content = clean))
+        while (recentTurns.size > 10) {
+            recentTurns.removeAt(0)
+        }
+        if (role.equals("user", ignoreCase = true)) {
+            extractTopicFromQuestion(clean)?.let { topic ->
+                sessionContext.lastDiscussedTopic = topic
+            }
+        }
+        sessionContext.updatedAtMs = System.currentTimeMillis()
+    }
+
+    fun getRecentTurns(limit: Int = 8): List<ConversationTurn> = recentTurns.takeLast(limit)
+
+    fun clearConversationTurns() {
+        recentTurns.clear()
+        sessionContext.lastDiscussedTopic = null
+        sessionContext.lastSearchQuery = null
+    }
+
+    fun buildOpenEndedContextSummary(maxTurns: Int = 6): String {
+        val turns = recentTurns.takeLast(maxTurns)
+        if (turns.isEmpty() && sessionContext.lastDiscussedTopic.isNullOrBlank()) return ""
+        return buildString {
+            sessionContext.lastDiscussedTopic?.takeIf { it.isNotBlank() }?.let {
+                append("Active topic: ").append(it).append("\n")
+            }
+            if (turns.isNotEmpty()) {
+                append("Recent conversation:\n")
+                for (t in turns) {
+                    val label = if (t.role.equals("user", ignoreCase = true)) "User" else "Assistant"
+                    append(label).append(": ").append(t.content.take(280)).append("\n")
+                }
+            }
+        }.trim()
+    }
+
+    private fun extractTopicFromQuestion(prompt: String): String? {
+        val patterns = listOf(
+            Regex("(?i)^(?:what\\s+is|what\\s+are|explain|tell\\s+me\\s+about|define|who\\s+is|how\\s+does)\\s+(.+?)(?:\\s+in\\s+simple.*|\\?|$)"),
+            Regex("(?i)^(.+?)\\s+(?:kya\\s+hai|kya\\s+hota\\s+hai|ke\\s+baare\\s+mein\\s+batao|samjhao)[?.!\\s]*$")
+        )
+        for (p in patterns) {
+            val match = p.find(prompt.trim())
+            val candidate = match?.groupValues?.getOrNull(1)?.trim()?.trimEnd('?', '.', '!')
+            if (!candidate.isNullOrBlank() && candidate.length in 2..80 &&
+                candidate.lowercase() !in setOf("it", "this", "that", "is", "them")
+            ) {
+                return candidate
+            }
+        }
+        return null
+    }
 
     fun getPendingSlot(nowMs: Long = System.currentTimeMillis()): PendingSlotContinuation? {
         val current = pendingSlot ?: return null
@@ -99,6 +165,16 @@ class ConversationContinuityManager {
         }
         if (!candidateContacts.isNullOrEmpty()) {
             sessionContext.recentCandidateContacts = candidateContacts.map { it.trim() }.filter { it.isNotEmpty() }
+        }
+        sessionContext.updatedAtMs = System.currentTimeMillis()
+    }
+
+    fun recordTopicAndSearchContext(topic: String? = null, searchQuery: String? = null) {
+        if (!topic.isNullOrBlank()) {
+            sessionContext.lastDiscussedTopic = topic.trim()
+        }
+        if (!searchQuery.isNullOrBlank()) {
+            sessionContext.lastSearchQuery = searchQuery.trim()
         }
         sessionContext.updatedAtMs = System.currentTimeMillis()
     }
@@ -174,6 +250,45 @@ class ConversationContinuityManager {
         if (lower.startsWith("remind me after the meeting") || lower.contains("meeting ke baad yaad dilana")) {
             val evTitle = sessionContext.lastCalendarEventTitle ?: "the meeting"
             return "Remind me in 60 minutes to follow up after $evTitle"
+        }
+
+        // 5b. Open-ended topic follow-up: "Now search for a good video about it" / "is par video dikhao"
+        val activeTopic = sessionContext.lastDiscussedTopic
+        if (!activeTopic.isNullOrBlank()) {
+            val videoFollowUp = Regex(
+                "(?i)(?:search\\s+(?:for\\s+)?(?:a\\s+)?(?:good\\s+)?video\\s+(?:about|on)\\s+(?:it|this|that)|(?:is|us)\\s+(?:par|pe|ke\\s+baare\\s+mein)\\s+video\\s+(?:search|dikhao|chalao))"
+            ).containsMatchIn(trimmed)
+            if (videoFollowUp) {
+                sessionContext.lastSearchQuery = activeTopic
+                return "Open YouTube and search $activeTopic video"
+            }
+            val genericSearchFollowUp = Regex(
+                "(?i)^(?:now\\s+)?(?:search|find|research)\\s+(?:more\\s+)?(?:about|on)\\s+(?:it|this|that)\\.?$"
+            ).containsMatchIn(trimmed)
+            if (genericSearchFollowUp) {
+                sessionContext.lastSearchQuery = activeTopic
+                return "Research $activeTopic"
+            }
+        }
+
+        // 5c. Ordinal screen result selection: "Open the second result" / "Open the first result" / "Dusra result kholo"
+        val ordinalResultMatch = Regex(
+            "(?i)^(?:open|play|click|tap|select|kholo|chalao)\\s+(?:the\\s+)?(first|second|third|1st|2nd|3rd|pehla|pehle|dusra|dusre|teesra)\\s+(?:result|video|link|option|item)(?:\\s+(?:kholo|chalao))?\\.?$"
+        ).find(trimmed)
+        if (ordinalResultMatch != null) {
+            val ordinalWord = ordinalResultMatch.groupValues[1].lowercase()
+            val indexLabel = when (ordinalWord) {
+                "first", "1st", "pehla", "pehle" -> "1"
+                "second", "2nd", "dusra", "dusre" -> "2"
+                "third", "3rd", "teesra" -> "3"
+                else -> "1"
+            }
+            val topicHint = sessionContext.lastSearchQuery ?: sessionContext.lastDiscussedTopic ?: ""
+            return if (topicHint.isNotBlank()) {
+                "Tap result $indexLabel for $topicHint"
+            } else {
+                "Tap result $indexLabel on screen"
+            }
         }
 
         // 6. Ordinal candidate contact references: "Pehle wala" / "Dusra wala"
