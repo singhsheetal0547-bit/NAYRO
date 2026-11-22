@@ -21,6 +21,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 
 /**
@@ -408,6 +409,14 @@ class NayroForegroundService : Service() {
                             val app = NayroApplication.instance
                             app.agentRuntime.recordHeartbeat()
                             ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.PROCESSING)
+                            val lastStoredTurn = app.repository.conversations.firstOrNull().orEmpty().lastOrNull()
+                            if (!lastStoredTurn?.sender.equals("user", ignoreCase = true) ||
+                                lastStoredTurn?.content?.trim() != instruction.trim()
+                            ) {
+                                app.repository.addConversationMessage(
+                                    ConversationEntity(sender = "user", content = instruction)
+                                )
+                            }
                             val response = app.agentRuntime.executeUserInstruction(instruction)
                             app.repository.addConversationMessage(
                                 ConversationEntity(sender = "babu", content = response)
