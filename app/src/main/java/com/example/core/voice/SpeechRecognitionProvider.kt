@@ -98,6 +98,9 @@ class AndroidSpeechRecognitionProvider(
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var activeLanguageTag: String = "en-IN"
+    private var detectedLanguageTag: String? = null
+    private var preferOfflineForSession: Boolean = false
+    private var hasAttemptedLanguageFallback: Boolean = false
 
     private val mainHandler: Handler? = try {
         val looper = Looper.getMainLooper()
@@ -194,6 +197,9 @@ class AndroidSpeechRecognitionProvider(
         onError: ((Int, String) -> Unit)?
     ) {
         activeLanguageTag = languageTag.ifBlank { "en-IN" }
+        detectedLanguageTag = null
+        preferOfflineForSession = preferOffline
+        hasAttemptedLanguageFallback = false
         onReadyCallback = onReady
         onBeginningCallback = onBeginningOfSpeech
         onPartialCallback = onPartialText
@@ -282,12 +288,30 @@ class AndroidSpeechRecognitionProvider(
                 _isListening.value = false
                 _rmsDb.value = 0f
                 _normalizedAudioLevel.value = 0f
-                // Automatic one-time multilingual fallback if requested locale pack is unavailable (Android 13+ codes 12/13)
-                if ((error == 12 || error == 13) && !activeLanguageTag.equals("en-IN", ignoreCase = true)) {
-                    activeLanguageTag = "en-IN"
+
+                // Android recognizers may have only one locale pack available on the device.
+                // Retry once in the alternate Indian language for no-match/unsupported locale
+                // errors so Hindi-first and English-first sessions both get a chance.
+                val canTryAlternateLanguage = !hasAttemptedLanguageFallback &&
+                    error in setOf(
+                        SpeechRecognizer.ERROR_NO_MATCH,
+                        12, // ERROR_LANGUAGE_NOT_SUPPORTED
+                        13  // ERROR_LANGUAGE_UNAVAILABLE
+                    )
+                if (canTryAlternateLanguage) {
+                    hasAttemptedLanguageFallback = true
+                    val fallbackLanguage = if (activeLanguageTag.startsWith("hi", ignoreCase = true)) {
+                        "en-IN"
+                    } else {
+                        "hi-IN"
+                    }
+                    activeLanguageTag = fallbackLanguage
                     postToMain {
                         try {
-                            val fallbackIntent = buildRecognizerIntent(languageTag = "en-IN", preferOffline = false)
+                            val fallbackIntent = buildRecognizerIntent(
+                                languageTag = fallbackLanguage,
+                                preferOffline = preferOfflineForSession && isOfflineRecognitionAvailable()
+                            )
                             speechRecognizer?.startListening(fallbackIntent)
                         } catch (_: Throwable) {
                             val message = mapSpeechRecognizerError(error)
@@ -297,6 +321,7 @@ class AndroidSpeechRecognitionProvider(
                     }
                     return
                 }
+
                 val message = mapSpeechRecognizerError(error)
                 _lastError.value = message
                 onErrorCallback?.invoke(error, message)
@@ -336,10 +361,7 @@ class AndroidSpeechRecognitionProvider(
                     primaryText = primary,
                     alternatives = matches.drop(1),
                     confidenceScore = topConfidence,
-                    languageTag = if (activeLanguageTag.isNotBlank() &&
-                        activeLanguageTag != "en-IN" &&
-                        activeLanguageTag != "hi-IN"
-                    ) activeLanguageTag else inferredLanguage,
+                    languageTag = detectedLanguageTag?.takeIf { it.isNotBlank() } ?: inferredLanguage,
                     isFinal = true
                 )
                 _lastResult.value = structured
@@ -363,7 +385,10 @@ class AndroidSpeechRecognitionProvider(
             // API 34+: retain the recognizer's language-detection result when provided.
             override fun onLanguageDetection(results: Bundle) {
                 val detected = results.getString(SpeechRecognizer.DETECTED_LANGUAGE)?.trim()
-                if (!detected.isNullOrEmpty()) activeLanguageTag = detected
+                if (!detected.isNullOrEmpty()) {
+                    detectedLanguageTag = detected
+                    activeLanguageTag = detected
+                }
             }
         }
     }
