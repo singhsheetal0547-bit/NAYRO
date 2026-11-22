@@ -416,7 +416,7 @@ class FullAuditRepairVerificationTests {
         continuity.restoreRecentTurnsFromStorage(persistedTurns)
         val summary = continuity.buildOpenEndedContextSummary()
         assertTrue(summary.contains("artificial intelligence", ignoreCase = true))
-        val resolvedFollowUp = continuity.resolveReferencesInPrompt("Find a video about it")
+        val resolvedFollowUp = continuity.resolveReferencesInPrompt("Search for a good video about it")
         assertTrue(resolvedFollowUp.contains("artificial intelligence", ignoreCase = true))
 
         val conversational = com.example.core.agent.ConversationalIntelligenceEngine()
