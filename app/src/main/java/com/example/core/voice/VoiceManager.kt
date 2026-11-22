@@ -655,7 +655,14 @@ class VoiceManager(
         ) ?: return false
 
         val started = wakeWordEngine.startListening()
-        if (started && wakeWordEngine.engineState.value == WakeEngineState.LISTENING_FOR_WAKE) {
+        val captureVerified = context == null || (
+            wakeWordEngine.isMicrophoneInitialized.value &&
+                wakeWordEngine.isAudioCaptureActive.value
+            )
+        if (started &&
+            wakeWordEngine.engineState.value == WakeEngineState.LISTENING_FOR_WAKE &&
+            captureVerified
+        ) {
             activeCaptureSessionId = token
             _voiceState.value = VoiceState.STANDBY
             return true
