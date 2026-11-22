@@ -667,11 +667,13 @@ class VoiceManager(
             _voiceState.value = VoiceState.STANDBY
             return true
         }
+        // A failed/partial start must not leave a stale AudioRecord or capture loop alive.
+        wakeWordEngine.stopListening()
         microphoneOwnership.release(
             expectedOwner = AudioSessionOwner.WAKE_WORD_ENGINE,
             sessionId = token,
             nextPhase = MicrophoneLifecyclePhase.ERROR,
-            reason = wakeWordEngine.lastFailureReason.value ?: "Wake engine failed to start capture"
+            reason = wakeWordEngine.lastFailureReason.value ?: "Wake engine failed to start verified capture"
         )
         return false
     }
