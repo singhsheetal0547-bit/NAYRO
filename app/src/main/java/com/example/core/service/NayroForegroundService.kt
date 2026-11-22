@@ -48,6 +48,7 @@ class NayroForegroundService : Service() {
         val status: StateFlow<ServiceStatus> = ServiceStateRepository.foregroundServiceStatus
 
         const val MAX_PIPELINE_RECOVERY_RETRIES = 3
+        const val RECOVERY_COOLDOWN_MS = 60_000L
         val RECOVERY_BACKOFF_MS = longArrayOf(2_000L, 5_000L, 12_000L)
 
         /**
@@ -365,6 +366,11 @@ class NayroForegroundService : Service() {
                 recoveryRetryJob?.cancel()
                 recoveryRetryCount = 0
                 ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
+                try {
+                    NayroApplication.instance.voiceManager.updateConfiguration(
+                        NayroApplication.instance.voiceManager.configuration.value.copy(isWakeWordEnabled = false)
+                    )
+                } catch (_: Exception) {}
                 stopWakeWordEngine()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -651,7 +657,7 @@ class NayroForegroundService : Service() {
             }
             if (!wakeEngine.hasUsableAcousticTemplates()) {
                 val reason = wakeEngine.lastFailureReason.value
-                    ?: "Wake-word acoustic templates are missing or invalid. Enroll a wake phrase in Settings."
+                    ?: "No production-trusted wake model is active. Bundled MFCC references are test fixtures; record at least two real voice samples for a configured wake phrase in Settings."
                 ServiceStateRepository.updateBackgroundVoicePipeline(
                     state = BackgroundVoicePipelineState.DEGRADED,
                     detail = reason,
@@ -718,6 +724,8 @@ class NayroForegroundService : Service() {
                     isScreenOff = isScreenCurrentlyOff
                 )
                 recoveryRetryCount = 0
+                recoveryRetryJob?.cancel()
+                recoveryRetryJob = null
                 val phrases = wakeEngine.getConfiguredWakePhrases().take(2).joinToString(" / ")
                 ServiceStateRepository.updateBackgroundVoicePipeline(
                     state = BackgroundVoicePipelineState.BACKGROUND_VOICE_READY,
@@ -874,7 +882,7 @@ class NayroForegroundService : Service() {
         } else {
             ServiceStateRepository.updateBackgroundVoicePipeline(
                 state = BackgroundVoicePipelineState.ERROR,
-                detail = "Background voice failed after $MAX_PIPELINE_RECOVERY_RETRIES recovery attempts: $reason. Use manual/floating mic or tap to retry.",
+                detail = "Background voice failed after $MAX_PIPELINE_RECOVERY_RETRIES recovery attempts: $reason. A controlled retry will be attempted after a cooldown.",
                 isMicrophoneVerified = false,
                 isWakeEngineVerified = app.voiceManager.wakeWordEngine.hasUsableAcousticTemplates(),
                 isAudioCaptureVerified = false,
@@ -883,9 +891,22 @@ class NayroForegroundService : Service() {
             )
             updateActiveNotification(
                 title = "NAYRO Voice Error ($personaName)",
-                content = "Microphone capture unavailable. Open NAYRO to retry or use manual voice.",
+                content = "Microphone capture unavailable. Retrying after a 60-second recovery cooldown.",
                 isPaused = false
             )
+            // Avoid a hot restart loop when the Audio HAL or OEM service is unavailable.
+            if (recoveryRetryJob?.isActive != true) {
+                recoveryRetryJob = serviceScope.launch {
+                    delay(RECOVERY_COOLDOWN_MS)
+                    if (isRunningInForeground &&
+                        !ServiceStateRepository.isBackgroundAgentPaused.value &&
+                        hasRecordAudioPermission()
+                    ) {
+                        recoveryRetryCount = 0
+                        setupBackgroundVoicePipeline()
+                    }
+                }
+            }
         }
         app.backgroundVoiceController.refreshState()
     }
@@ -902,9 +923,10 @@ class NayroForegroundService : Service() {
             val app = NayroApplication.instance
             app.voiceManager.wakeWordEngine.onCaptureError = null
             app.voiceManager.detachServiceListener()
-            val config = app.voiceManager.configuration.value.copy(isWakeWordEnabled = false)
-            app.voiceManager.updateConfiguration(config)
-        } catch (e: Exception) {}
+            // Release audio resources only. Android may destroy/recreate a START_STICKY service;
+            // that lifecycle event must not silently change the user's persisted ON preference.
+            app.voiceManager.endConversationSession(returnToStandby = false)
+        } catch (_: Exception) {}
     }
 
     override fun onDestroy() {
