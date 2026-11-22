@@ -82,8 +82,17 @@ class WhatsAppAutomationManager(
             if (prev != null && (nowMs - prev) in 0 until DUPLICATE_SEND_WINDOW_MS) {
                 return true
             }
-            recentWhatsAppSignatures[sig] = nowMs
+            if (prev != null) recentWhatsAppSignatures.remove(sig)
             return false
+        }
+
+        @Synchronized
+        private fun markSuccessfulSend(recipientKey: String, body: String, nowMs: Long) {
+            val sig = "${recipientKey.lowercase().trim()}|${body.trim()}"
+            recentWhatsAppSignatures[sig] = nowMs
+            recentWhatsAppSignatures.entries.removeAll {
+                nowMs < it.value || nowMs - it.value >= DUPLICATE_SEND_WINDOW_MS
+            }
         }
     }
 
@@ -294,14 +303,15 @@ class WhatsAppAutomationManager(
                     VerificationStatus.FAILED
                 )
             }
-            if (testOverrideHeaderVerified == false) {
+            if (testOverrideHeaderVerified != true) {
                 return ActionExecutionResult(
                     false,
-                    "Aborted WhatsApp send: active conversation header did not match expected recipient '$resolvedDisplayName'.",
+                    "Aborted simulated WhatsApp send: recipient header was not explicitly verified for '$resolvedDisplayName'.",
                     VerificationStatus.FAILED
                 )
             }
             return if (simulatedVerified) {
+                markSuccessfulSend(recipientSignatureKey, message, System.currentTimeMillis())
                 ActionExecutionResult(
                     true,
                     "WhatsApp conversation identity verified for $resolvedDisplayName, Send button clicked, and message '$message' verified in conversation view [WHATSAPP_SENT_BUBBLE_VERIFIED=true] (remote delivery/read status is not claimed).",
@@ -376,9 +386,10 @@ class WhatsAppAutomationManager(
         // Step 4: Verify conversation identity before clicking Send
         val activeHeaderText = screenIntelligenceManager?.describeScreenContent().orEmpty()
         val headerMatches = testOverrideHeaderVerified ?: (
-            activeHeaderText.isBlank() ||
+            activeHeaderText.isNotBlank() && (
                 activeHeaderText.contains(resolvedDisplayName, ignoreCase = true) ||
-                (resolvedPhone != null && activeHeaderText.contains(resolvedPhone.takeLast(6)))
+                    (resolvedPhone != null && activeHeaderText.contains(resolvedPhone.takeLast(6)))
+                )
             )
         if (!headerMatches) {
             return ActionExecutionResult(
@@ -407,6 +418,7 @@ class WhatsAppAutomationManager(
         )
         lastMessageLifecycleState = lifecycleState
         return if (lifecycleState != WhatsAppMessageLifecycleState.ACTION_INCONCLUSIVE) {
+            markSuccessfulSend(recipientSignatureKey, message, System.currentTimeMillis())
             ActionExecutionResult(
                 true,
                 "WhatsApp conversation identity verified for $resolvedDisplayName, Send button clicked, and message '$message' verified in conversation view [WHATSAPP_SENT_BUBBLE_VERIFIED=true] [STATE=${lifecycleState.name}] (remote delivery/read status is not claimed unless explicitly visible).",
