@@ -325,11 +325,21 @@ class AndroidSpeechRecognitionProvider(
                 val primary = matches.firstOrNull().orEmpty()
                 _partialTranscript.value = primary
 
+                val inferredLanguage = when (
+                    com.example.core.agent.ConversationalIntelligenceEngine.detectLanguage(primary)
+                ) {
+                    com.example.core.agent.ConversationLanguage.HINDI -> "hi-IN"
+                    com.example.core.agent.ConversationLanguage.HINGLISH,
+                    com.example.core.agent.ConversationLanguage.ENGLISH -> "en-IN"
+                }
                 val structured = SpeechRecognitionResult(
                     primaryText = primary,
                     alternatives = matches.drop(1),
                     confidenceScore = topConfidence,
-                    languageTag = activeLanguageTag,
+                    languageTag = if (activeLanguageTag.isNotBlank() &&
+                        activeLanguageTag != "en-IN" &&
+                        activeLanguageTag != "hi-IN"
+                    ) activeLanguageTag else inferredLanguage,
                     isFinal = true
                 )
                 _lastResult.value = structured
@@ -349,6 +359,12 @@ class AndroidSpeechRecognitionProvider(
             }
 
             override fun onEvent(eventType: Int, params: Bundle?) {}
+
+            // API 34+: retain the recognizer's language-detection result when provided.
+            override fun onLanguageDetection(results: Bundle) {
+                val detected = results.getString(SpeechRecognizer.DETECTED_LANGUAGE)?.trim()
+                if (!detected.isNullOrEmpty()) activeLanguageTag = detected
+            }
         }
     }
 
