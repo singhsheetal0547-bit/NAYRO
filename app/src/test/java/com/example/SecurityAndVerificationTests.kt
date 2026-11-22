@@ -2915,6 +2915,9 @@ class SecurityAndVerificationTests {
     fun testCustomAssistantIdentityAndHonestWakePhraseSupport() {
         val voiceManager = VoiceManager(null)
         val wakeEngine = voiceManager.wakeWordEngine
+        // Load bundled reference fixtures explicitly for this headless test only. They are
+        // never treated as a production-trained model by an Android runtime.
+        assertTrue(wakeEngine.loadAcousticModel(allowEmbeddedFallbackInTests = true))
 
         // 1. Default persona ("Babu") uses bundled acoustic templates
         assertEquals(
@@ -2941,14 +2944,26 @@ class SecurityAndVerificationTests {
         )
         assertFalse(wakeEngine.isWakePhraseAcousticallyActive("Hi Jarvis"))
 
-        // 4. Enroll "Hi Jarvis" with a genuine recorded PCM sample (missing mic fails first, then real audio succeeds)
+        // 4. Production readiness requires two separate enrollment samples, not one synthetic or partial sample.
         assertFalse(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis").first)
-        val recordedJarvisPcm = ShortArray(1600) { i ->
+        val firstJarvisPcm = ShortArray(3200) { i ->
             val f1 = kotlin.math.sin(2.0 * Math.PI * 240.0 * i / 16000.0)
             val f2 = 0.55 * kotlin.math.sin(2.0 * Math.PI * 515.0 * i / 16000.0)
             ((f1 + f2) * 2600.0).toInt().coerceIn(-32767, 32767).toShort()
         }
-        assertTrue(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis", recordedPcmOverride = recordedJarvisPcm).first)
+        assertTrue(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis", recordedPcmOverride = firstJarvisPcm).first)
+        assertEquals(
+            com.example.core.voice.engine.WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT,
+            wakeEngine.getWakePhraseSupportStatus("Hi Jarvis")
+        )
+        assertFalse(wakeEngine.isWakePhraseAcousticallyActive("Hi Jarvis"))
+
+        val secondJarvisPcm = ShortArray(3200) { i ->
+            val f1 = kotlin.math.sin(2.0 * Math.PI * 260.0 * i / 16000.0)
+            val f2 = 0.50 * kotlin.math.sin(2.0 * Math.PI * 545.0 * i / 16000.0)
+            ((f1 + f2) * 2800.0).toInt().coerceIn(-32767, 32767).toShort()
+        }
+        assertTrue(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis", recordedPcmOverride = secondJarvisPcm).first)
         assertEquals(
             com.example.core.voice.engine.WakePhraseSupportStatus.READY_USER_ENROLLED_DTW,
             wakeEngine.getWakePhraseSupportStatus("Hi Jarvis")
