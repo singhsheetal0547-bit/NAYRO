@@ -320,15 +320,18 @@ class LocalWakeWordEngine(private val context: Context?) {
         val phrases = getConfiguredWakePhrases()
         return phrases.any { phrase ->
             val t = loadedTemplates[phrase.lowercase()] ?: return@any false
-            val hasEnrolled = t.enrolledSamples.any { seq ->
-                seq.isNotEmpty() && seq.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
+            val hasEnrolled = t.enrolledSamples.size >= 2 && t.enrolledSamples.all { seq ->
+                seq.size >= 4 && seq.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
             }
-            val hasValidatedBundled = t.isFromValidatedBundledAsset &&
+            // Bundled MFCC vectors are reference fixtures, not a provenance-verified trained
+            // acoustic model. They are accepted only by headless deterministic unit tests.
+            val mayUseBundledFixture = context == null && isEmbeddedModelEnabledForTesting
+            val hasValidatedBundledFixture = mayUseBundledFixture && t.isFromValidatedBundledAsset &&
                 t.mfccCentroid.size == NUM_MFCC &&
                 t.mfccCentroid.all { it.isFinite() } &&
                 t.mfccSequence.size >= 4 &&
                 t.mfccSequence.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
-            hasEnrolled || hasValidatedBundled
+            hasEnrolled || hasValidatedBundledFixture
         }
     }
 
@@ -589,7 +592,8 @@ class LocalWakeWordEngine(private val context: Context?) {
         )
         _lastValidationResult.value = result
         _lastFailureReason.value = null
-        _lastDiagnosticSummary.value = "Loaded ${loadedTemplates.size} validated MFCC+DTW acoustic templates (${parsed.sampleRateHz}Hz, ${parsed.numMfccCoefficients}-dim)."
+        isEmbeddedModelEnabledForTesting = context == null
+        _lastDiagnosticSummary.value = "Loaded ${loadedTemplates.size} structurally validated MFCC reference templates (${parsed.sampleRateHz}Hz, ${parsed.numMfccCoefficients}-dim); production activation requires real user voice enrollment."
         return result
     }
 
@@ -1521,14 +1525,21 @@ class LocalWakeWordEngine(private val context: Context?) {
         val clean = phrase.trim()
         if (clean.length < 3) return WakePhraseSupportStatus.INVALID_PHRASE
         val template = loadedTemplates[clean.lowercase()]
-        if (template != null && template.enrolledSamples.isNotEmpty()) {
+        if (template != null && template.enrolledSamples.size >= 2 &&
+            template.enrolledSamples.all { seq ->
+                seq.size >= 4 && seq.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
+            }
+        ) {
             return WakePhraseSupportStatus.READY_USER_ENROLLED_DTW
         }
-        if (template != null && template.isFromValidatedBundledAsset && template.mfccSequence.size >= 4) {
+        // Bundled references are accepted only by headless deterministic tests. In production,
+        // every configured wake phrase must have at least two valid microphone enrollment samples.
+        if (context == null && isEmbeddedModelEnabledForTesting &&
+            template != null && template.isFromValidatedBundledAsset && template.mfccSequence.size >= 4
+        ) {
             return WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
         }
-        // Only treat SUPPORTED_PHRASES as bundled-ready before model load if the model has not failed validation
-        if (loadedTemplates.isEmpty() && detectedAssetFormat != WakeAssetFormat.INVALID &&
+        if (loadedTemplates.isEmpty() && context == null && isEmbeddedModelEnabledForTesting &&
             SUPPORTED_PHRASES.any { it.equals(clean, ignoreCase = true) }
         ) {
             return WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
@@ -1904,7 +1915,9 @@ class LocalWakeWordEngine(private val context: Context?) {
             }
 
             // 2. Validated bundled multi-frame reference templates from nayro_kws_templates.json (P0-1)
-            if (template.isFromValidatedBundledAsset && template.mfccSequence.size >= 4) {
+            if (context == null && isEmbeddedModelEnabledForTesting &&
+                template.isFromValidatedBundledAsset && template.mfccSequence.size >= 4
+            ) {
                 val envelopeOk = voicedRatio in template.minVoicedRatio..template.maxVoicedRatio &&
                     zcr.toFloat() in template.minZcr..template.maxZcr
                 if (envelopeOk) {
