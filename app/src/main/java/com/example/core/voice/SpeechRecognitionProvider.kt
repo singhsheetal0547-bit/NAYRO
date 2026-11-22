@@ -305,6 +305,7 @@ class AndroidSpeechRecognitionProvider(
                     } else {
                         "hi-IN"
                     }
+                    detectedLanguageTag = null
                     activeLanguageTag = fallbackLanguage
                     postToMain {
                         try {
