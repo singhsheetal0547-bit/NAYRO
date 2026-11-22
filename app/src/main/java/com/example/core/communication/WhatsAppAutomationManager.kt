@@ -87,7 +87,7 @@ class WhatsAppAutomationManager(
         }
 
         @Synchronized
-        private fun markSuccessfulSend(recipientKey: String, body: String, nowMs: Long) {
+        private fun markSendAttempt(recipientKey: String, body: String, nowMs: Long) {
             val sig = "${recipientKey.lowercase().trim()}|${body.trim()}"
             recentWhatsAppSignatures[sig] = nowMs
             recentWhatsAppSignatures.entries.removeAll {
@@ -312,7 +312,7 @@ class WhatsAppAutomationManager(
                 return ActionExecutionResult(false, reason, VerificationStatus.FAILED)
             }
             return if (simulatedVerified) {
-                markSuccessfulSend(recipientSignatureKey, message, System.currentTimeMillis())
+                markSendAttempt(recipientSignatureKey, message, System.currentTimeMillis())
                 ActionExecutionResult(
                     true,
                     "WhatsApp conversation identity verified for $resolvedDisplayName, Send button clicked, and message '$message' verified in conversation view [WHATSAPP_SENT_BUBBLE_VERIFIED=true] (remote delivery/read status is not claimed).",
@@ -410,6 +410,9 @@ class WhatsAppAutomationManager(
             )
         }
 
+        // Once the Send button has been clicked, reserve this signature even if the UI cannot
+        // prove the bubble. An inconclusive external send must not be blindly repeated.
+        markSendAttempt(recipientSignatureKey, message, System.currentTimeMillis())
         delay(350)
         val postScreen = screenIntelligenceManager?.describeScreenContent().orEmpty()
         val lifecycleState = evaluateWhatsAppMessageLifecycleState(
@@ -419,7 +422,6 @@ class WhatsAppAutomationManager(
         )
         lastMessageLifecycleState = lifecycleState
         return if (lifecycleState != WhatsAppMessageLifecycleState.ACTION_INCONCLUSIVE) {
-            markSuccessfulSend(recipientSignatureKey, message, System.currentTimeMillis())
             ActionExecutionResult(
                 true,
                 "WhatsApp conversation identity verified for $resolvedDisplayName, Send button clicked, and message '$message' verified in conversation view [WHATSAPP_SENT_BUBBLE_VERIFIED=true] [STATE=${lifecycleState.name}] (remote delivery/read status is not claimed unless explicitly visible).",
