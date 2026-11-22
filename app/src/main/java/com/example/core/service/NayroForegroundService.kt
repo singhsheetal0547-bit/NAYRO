@@ -218,12 +218,21 @@ class NayroForegroundService : Service() {
 
         fun stopService(context: Context) {
             ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPING)
-            val intent = Intent(context, NayroForegroundService::class.java).apply {
-                action = ACTION_STOP
-            }
+            // Context.stopService() does not deliver ACTION_STOP to onStartCommand. Persist the
+            // explicit user OFF choice here before Android invokes onDestroy(), which otherwise
+            // must preserve the preference for START_STICKY service recreation.
             try {
-                context.stopService(intent)
-            } catch (e: Exception) {
+                val app = NayroApplication.instance
+                app.voiceManager.updateConfiguration(
+                    app.voiceManager.configuration.value.copy(isWakeWordEnabled = false)
+                )
+                app.assistantIdentityStore.updateVoiceAndLanguage(isWakeWordEnabled = false)
+                app.backgroundVoiceController.refreshState()
+            } catch (_: Exception) {}
+            try {
+                context.stopService(Intent(context, NayroForegroundService::class.java))
+                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
+            } catch (_: Exception) {
                 ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.STOPPED)
             }
         }
