@@ -231,7 +231,7 @@ fun SettingsScreen(
                         )
                         Text(
                             text = backgroundListeningStatus.ifBlank {
-                                "Listens locally on-device using 13-MFCC + Sakoe-Chiba DTW. Custom wake phrases require real microphone voice enrollment to activate acoustic DTW matching."
+                                "Local wake detection requires at least two real microphone voice samples for a configured phrase. Bundled MFCC references are test fixtures, not a production-trained wake model."
                             },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -288,9 +288,10 @@ fun SettingsScreen(
                         engine?.getWakePhraseSupportStatus(phrase) ?: WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT
                     }
                     val statusLabel = when {
-                        sampleCount > 0 -> "Enrolled ($sampleCount/5)"
-                        supportStatus == WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE -> "Bundled (Enroll for accuracy)"
-                        else -> "Needs Enrollment"
+                        sampleCount >= 2 -> "Enrolled ($sampleCount/5)"
+                        sampleCount == 1 -> "1/2 samples recorded — add one more"
+                        supportStatus == WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE -> "Test reference only — enroll 2 samples"
+                        else -> "Needs 2 voice samples"
                     }
 
                     Card(
