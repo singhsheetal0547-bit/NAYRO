@@ -2127,8 +2127,12 @@ class LocalWakeWordEngine(private val context: Context?) {
      * Returns `true` ONLY when listening genuinely started; `false` on any failure (`ERROR` / `NOT_CONFIGURED` / `MODEL_UNAVAILABLE`).
      */
     fun startListening(): Boolean {
+        val hardwareCaptureAlreadyVerified =
+            _isMicrophoneInitialized.value && _isAudioCaptureActive.value
+        val headlessTestListening =
+            context == null && customAudioCaptureFactory == null && isEmbeddedModelEnabledForTesting
         if (_engineState.value == WakeEngineState.LISTENING_FOR_WAKE &&
-            (_isAudioCaptureActive.value || (context == null && customAudioCaptureFactory == null && isEmbeddedModelEnabledForTesting))
+            (hardwareCaptureAlreadyVerified || headlessTestListening)
         ) {
             return true
         }
