@@ -304,11 +304,12 @@ class WhatsAppAutomationManager(
                 )
             }
             if (testOverrideHeaderVerified != true) {
-                return ActionExecutionResult(
-                    false,
-                    "Aborted simulated WhatsApp send: recipient header was not explicitly verified for '$resolvedDisplayName'.",
-                    VerificationStatus.FAILED
-                )
+                val reason = if (testOverrideHeaderVerified == false) {
+                    "Aborted WhatsApp send: active conversation header did not match expected recipient '$resolvedDisplayName'."
+                } else {
+                    "Aborted simulated WhatsApp send: recipient header was not explicitly verified for '$resolvedDisplayName'."
+                }
+                return ActionExecutionResult(false, reason, VerificationStatus.FAILED)
             }
             return if (simulatedVerified) {
                 markSuccessfulSend(recipientSignatureKey, message, System.currentTimeMillis())
