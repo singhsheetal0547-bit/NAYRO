@@ -74,8 +74,10 @@ class BackgroundVoiceController(
             NayroForegroundService.startService(ctx)
         } else {
             ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
-            val wakeListening = voiceManager.wakeWordEngine.engineState.value ==
-                com.example.core.voice.engine.WakeEngineState.LISTENING_FOR_WAKE
+            val wakeListening =
+                voiceManager.wakeWordEngine.engineState.value == com.example.core.voice.engine.WakeEngineState.LISTENING_FOR_WAKE &&
+                    voiceManager.wakeWordEngine.isMicrophoneInitialized.value &&
+                    voiceManager.wakeWordEngine.isAudioCaptureActive.value
             ServiceStateRepository.updateBackgroundVoicePipeline(
                 state = if (wakeListening) {
                     com.example.core.service.BackgroundVoicePipelineState.BACKGROUND_VOICE_READY
@@ -159,7 +161,10 @@ class BackgroundVoiceController(
         val hasMic = checkMicrophonePermission()
         val fgRunning = ServiceStateRepository.foregroundServiceStatus.value.state.isActiveOrRunning
         val pipelineStatus = ServiceStateRepository.backgroundVoicePipelineStatus.value
-        val wakeListening = voiceManager.wakeWordEngine.engineState.value == com.example.core.voice.engine.WakeEngineState.LISTENING_FOR_WAKE
+        val wakeListening =
+            voiceManager.wakeWordEngine.engineState.value == com.example.core.voice.engine.WakeEngineState.LISTENING_FOR_WAKE &&
+                voiceManager.wakeWordEngine.isMicrophoneInitialized.value &&
+                voiceManager.wakeWordEngine.isAudioCaptureActive.value
         val batteryExempt = isBatteryOptimizationIgnored()
         val manufacturer = try {
             Build.MANUFACTURER.orEmpty()
