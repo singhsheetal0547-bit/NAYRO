@@ -2,7 +2,7 @@ name: NAYRO Android Debug APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, repair/p0-background-voice-reliability]
   workflow_dispatch:
 
 permissions:
