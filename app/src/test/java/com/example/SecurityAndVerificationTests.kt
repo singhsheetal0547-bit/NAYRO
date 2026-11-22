@@ -1018,6 +1018,7 @@ class SecurityAndVerificationTests {
             screenIntelligenceManager = null
         ).apply {
             testOverrideInstalled = true
+            testOverrideHeaderVerified = true
             testOverrideSendVerified = true
             testOverrideVisibleMessages = listOf("Amit: Tomorrow's meeting is moved to 11 AM", "You: Got it, thanks!")
         }
@@ -1807,6 +1808,7 @@ class SecurityAndVerificationTests {
             screenIntelligenceManager = null
         ).apply {
             testOverrideInstalled = true
+            testOverrideHeaderVerified = true
             testOverrideSendVerified = true
         }
         val outcomeUnanswered = brain.executeTaskIterative(task) { action, ctx ->
@@ -2039,11 +2041,35 @@ class SecurityAndVerificationTests {
         assertTrue(CallIntelligenceManager.lastOutgoingCallInitiated)
         assertTrue(CallIntelligenceManager.lastOutgoingCallAnswered)
 
-        // Duplicate call guard within 4 seconds must block accidental re-dial
+        // Duplicate call guard must block accidental repeat dialing while telephony callbacks settle.
         val dupCallRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
         assertFalse(dupCallRes.isSuccess)
         assertEquals(VerificationStatus.FAILED, dupCallRes.status)
         assertTrue(dupCallRes.outputMessage.contains("Duplicate call prevented"))
+
+        // An already active or ringing SIM call blocks a second dial to any recipient.
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideCallState = com.example.core.telephony.CallStateSnapshot(
+            isRinging = false,
+            isOffhook = true,
+            callerDisplayName = "Existing call",
+            statusSummary = "Active call in progress"
+        )
+        val activeLineBlocked = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertFalse(activeLineBlocked.isSuccess)
+        assertTrue(activeLineBlocked.outputMessage.contains("already ringing or active"))
+        callMgr.testOverrideCallState = null
+
+        // A failed telephony dispatch must release the duplicate reservation so retry can work.
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideLastOutgoingCallAnswered = null
+        callMgr.testOverrideCallInitiated = false
+        val failedDispatch = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertFalse(failedDispatch.isSuccess)
+        callMgr.testOverrideCallInitiated = true
+        val retryAfterDispatchFailure = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertTrue(retryAfterDispatchFailure.isSuccess)
+        callMgr.testOverrideCallInitiated = null
 
         // Workflow 2: Call direct phone number when unanswered (Rule B)
         callMgr.resetDuplicateCallGuard()
@@ -2221,6 +2247,14 @@ class SecurityAndVerificationTests {
         assertFalse(unverifiedWa.isSuccess)
         assertEquals(VerificationStatus.INCONCLUSIVE, unverifiedWa.status)
         assertTrue(unverifiedWa.outputMessage.contains("[WHATSAPP_SENT_BUBBLE_VERIFIED=false]"))
+
+        // Blank or unavailable recipient identity must fail closed before sending.
+        com.example.core.communication.WhatsAppAutomationManager.clearDuplicateSendHistory()
+        waMgr.testOverrideHeaderVerified = null
+        waMgr.testOverrideSendVerified = true
+        val noHeaderWa = waMgr.sendOrDraftMessage("Rahul", "No identity proof", isConfirmed = true)
+        assertFalse(noHeaderWa.isSuccess)
+        assertEquals(VerificationStatus.FAILED, noHeaderWa.status)
 
         // Mismatched conversation header must abort before clicking Send
         com.example.core.communication.WhatsAppAutomationManager.clearDuplicateSendHistory()
