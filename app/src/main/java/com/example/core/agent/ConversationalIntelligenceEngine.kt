@@ -1,5 +1,7 @@
 package com.example.core.agent
 
+import com.example.data.local.entities.ConversationEntity
+
 import com.example.core.provider.model.AIChatMessage
 import java.util.UUID
 
@@ -169,6 +171,24 @@ class ConversationalIntelligenceEngine {
                 rollingHistory.removeFirst()
             }
             rollingHistory.addLast(ConversationTurn(role = role, content = clean, language = detected))
+        }
+    }
+
+    /**
+     * Restores the provider's multi-turn prompt window from durable Room conversation history.
+     */
+    fun restoreHistoryFromStorage(messages: List<ConversationEntity>) {
+        if (messages.isEmpty()) return
+        synchronized(lock) {
+            rollingHistory.clear()
+            messages.sortedBy { it.timestamp }.takeLast(MAX_ROLLING_TURNS).forEach { message ->
+                val role = if (message.sender.equals("user", ignoreCase = true)) "user" else "assistant"
+                val detected = if (role == "user") detectLanguage(message.content) else currentLanguage
+                rollingHistory.addLast(
+                    ConversationTurn(role = role, content = message.content, language = detected)
+                )
+                if (role == "user") currentLanguage = detected
+            }
         }
     }
 
