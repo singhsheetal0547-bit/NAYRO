@@ -396,4 +396,37 @@ class FullAuditRepairVerificationTests {
 
         voiceManager.release()
     }
+
+    @Test
+    fun testConversationContinuityRehydratesPersistedRoomHistoryAfterProcessRestart() {
+        val persistedTurns = listOf(
+            com.example.data.local.entities.ConversationEntity(
+                sender = "user",
+                content = "What is artificial intelligence?",
+                timestamp = 100L
+            ),
+            com.example.data.local.entities.ConversationEntity(
+                sender = "assistant",
+                content = "Artificial intelligence is a field of computer science.",
+                timestamp = 200L
+            )
+        )
+
+        val continuity = com.example.core.memory.ConversationContinuityManager()
+        continuity.restoreRecentTurnsFromStorage(persistedTurns)
+        val summary = continuity.buildOpenEndedContextSummary()
+        assertTrue(summary.contains("artificial intelligence", ignoreCase = true))
+        val resolvedFollowUp = continuity.resolveReferencesInPrompt("Find a video about it")
+        assertTrue(resolvedFollowUp.contains("artificial intelligence", ignoreCase = true))
+
+        val conversational = com.example.core.agent.ConversationalIntelligenceEngine()
+        conversational.restoreHistoryFromStorage(persistedTurns)
+        val providerMessages = conversational.buildProviderMessages("Find a video about it")
+        assertTrue(providerMessages.any {
+            it.role == "user" && it.content.contains("artificial intelligence", ignoreCase = true)
+        })
+        assertTrue(providerMessages.any {
+            it.role == "assistant" && it.content.contains("field of computer science", ignoreCase = true)
+        })
+    }
 }
