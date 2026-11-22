@@ -550,7 +550,16 @@ class AgentRuntime(
      * Returns the user-facing response text after executing through the unified AgentBrain + AgentRuntime pipeline.
      */
     suspend fun executeUserInstruction(userPrompt: String): String {
-        return executeUserInstructionDetailed(userPrompt).message
+        val response = executeUserInstructionDetailed(userPrompt).message
+        val lastContinuityTurn = continuityManager.getRecentTurns(1).lastOrNull()
+        if (lastContinuityTurn?.role != "assistant" || lastContinuityTurn.content != response) {
+            continuityManager.recordConversationTurn("assistant", response)
+        }
+        val lastProviderTurn = conversationalEngine.getRecentHistory(1).lastOrNull()
+        if (lastProviderTurn?.role != "assistant" || lastProviderTurn.content != response) {
+            conversationalEngine.recordTurn("assistant", response)
+        }
+        return response
     }
 
     /**
@@ -561,6 +570,19 @@ class AgentRuntime(
         recordHeartbeat()
         val nowMs = System.currentTimeMillis()
         val trimmedPrompt = userPrompt.trim()
+        // Room is the durable source of conversational continuity. UI callers persist the current
+        // user turn before entering this method, so exclude that matching last row and add it once
+        // below after resolving references.
+        try {
+            val storedTurns = repository.conversations.firstOrNull().orEmpty().takeLast(20)
+            val lastStored = storedTurns.lastOrNull()
+            val priorTurns = if (
+                lastStored?.sender.equals("user", ignoreCase = true) &&
+                lastStored?.content?.trim() == trimmedPrompt
+            ) storedTurns.dropLast(1) else storedTurns
+            continuityManager.restoreRecentTurnsFromStorage(priorTurns)
+            conversationalEngine.restoreHistoryFromStorage(priorTurns)
+        } catch (_: Exception) {}
         val activeTask = _currentTask.value
         // Duplicate task dispatch prevention (Section 3B & Section 10)
         if (trimmedPrompt.isNotEmpty() &&
@@ -607,6 +629,8 @@ class AgentRuntime(
             val greetingReply = "$activationCue ($assistantName)"
             continuityManager.recordConversationTurn("user", trimmedPrompt)
             continuityManager.recordConversationTurn("assistant", greetingReply)
+            conversationalEngine.recordTurn("user", trimmedPrompt)
+            conversationalEngine.recordTurn("assistant", greetingReply)
             val greetingTask = AgentTask(
                 userInstruction = userPrompt,
                 resolvedIntent = "WAKE_GREETING",
@@ -627,6 +651,7 @@ class AgentRuntime(
         // 0. Resolve pronouns ("him", "usko", "that file", "video about it", "open the second result") and check multi-turn continuation (Part 9)
         val resolvedPrompt = continuityManager.resolveReferencesInPrompt(userPrompt)
         continuityManager.recordConversationTurn("user", resolvedPrompt)
+        conversationalEngine.recordTurn("user", resolvedPrompt)
         try {
             memoryManager.processPromptForMemory(resolvedPrompt)
         } catch (_: Exception) {}
