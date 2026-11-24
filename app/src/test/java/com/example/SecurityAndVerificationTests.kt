@@ -1018,6 +1018,7 @@ class SecurityAndVerificationTests {
             screenIntelligenceManager = null
         ).apply {
             testOverrideInstalled = true
+            testOverrideHeaderVerified = true
             testOverrideSendVerified = true
             testOverrideVisibleMessages = listOf("Amit: Tomorrow's meeting is moved to 11 AM", "You: Got it, thanks!")
         }
@@ -1807,6 +1808,7 @@ class SecurityAndVerificationTests {
             screenIntelligenceManager = null
         ).apply {
             testOverrideInstalled = true
+            testOverrideHeaderVerified = true
             testOverrideSendVerified = true
         }
         val outcomeUnanswered = brain.executeTaskIterative(task) { action, ctx ->
@@ -2039,11 +2041,35 @@ class SecurityAndVerificationTests {
         assertTrue(CallIntelligenceManager.lastOutgoingCallInitiated)
         assertTrue(CallIntelligenceManager.lastOutgoingCallAnswered)
 
-        // Duplicate call guard within 4 seconds must block accidental re-dial
+        // Duplicate call guard must block accidental repeat dialing while telephony callbacks settle.
         val dupCallRes = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
         assertFalse(dupCallRes.isSuccess)
         assertEquals(VerificationStatus.FAILED, dupCallRes.status)
         assertTrue(dupCallRes.outputMessage.contains("Duplicate call prevented"))
+
+        // An already active or ringing SIM call blocks a second dial to any recipient.
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideCallState = com.example.core.telephony.CallStateSnapshot(
+            isRinging = false,
+            isOffhook = true,
+            callerDisplayName = "Existing call",
+            statusSummary = "Active call in progress"
+        )
+        val activeLineBlocked = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertFalse(activeLineBlocked.isSuccess)
+        assertTrue(activeLineBlocked.outputMessage.contains("already ringing or active"))
+        callMgr.testOverrideCallState = null
+
+        // A failed telephony dispatch must release the duplicate reservation so retry can work.
+        callMgr.resetDuplicateCallGuard()
+        callMgr.testOverrideLastOutgoingCallAnswered = null
+        callMgr.testOverrideCallInitiated = false
+        val failedDispatch = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertFalse(failedDispatch.isSuccess)
+        callMgr.testOverrideCallInitiated = true
+        val retryAfterDispatchFailure = callMgr.initiateOutgoingCall("Rahul", isConfirmed = true, observeCallState = true)
+        assertTrue(retryAfterDispatchFailure.isSuccess)
+        callMgr.testOverrideCallInitiated = null
 
         // Workflow 2: Call direct phone number when unanswered (Rule B)
         callMgr.resetDuplicateCallGuard()
@@ -2221,6 +2247,14 @@ class SecurityAndVerificationTests {
         assertFalse(unverifiedWa.isSuccess)
         assertEquals(VerificationStatus.INCONCLUSIVE, unverifiedWa.status)
         assertTrue(unverifiedWa.outputMessage.contains("[WHATSAPP_SENT_BUBBLE_VERIFIED=false]"))
+
+        // Blank or unavailable recipient identity must fail closed before sending.
+        com.example.core.communication.WhatsAppAutomationManager.clearDuplicateSendHistory()
+        waMgr.testOverrideHeaderVerified = null
+        waMgr.testOverrideSendVerified = true
+        val noHeaderWa = waMgr.sendOrDraftMessage("Rahul", "No identity proof", isConfirmed = true)
+        assertFalse(noHeaderWa.isSuccess)
+        assertEquals(VerificationStatus.FAILED, noHeaderWa.status)
 
         // Mismatched conversation header must abort before clicking Send
         com.example.core.communication.WhatsAppAutomationManager.clearDuplicateSendHistory()
@@ -2881,6 +2915,9 @@ class SecurityAndVerificationTests {
     fun testCustomAssistantIdentityAndHonestWakePhraseSupport() {
         val voiceManager = VoiceManager(null)
         val wakeEngine = voiceManager.wakeWordEngine
+        // Load bundled reference fixtures explicitly for this headless test only. They are
+        // never treated as a production-trained model by an Android runtime.
+        assertTrue(wakeEngine.loadAcousticModel(allowEmbeddedFallbackInTests = true))
 
         // 1. Default persona ("Babu") uses bundled acoustic templates
         assertEquals(
@@ -2907,14 +2944,26 @@ class SecurityAndVerificationTests {
         )
         assertFalse(wakeEngine.isWakePhraseAcousticallyActive("Hi Jarvis"))
 
-        // 4. Enroll "Hi Jarvis" with a genuine recorded PCM sample (missing mic fails first, then real audio succeeds)
+        // 4. Production readiness requires two separate enrollment samples, not one synthetic or partial sample.
         assertFalse(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis").first)
-        val recordedJarvisPcm = ShortArray(1600) { i ->
+        val firstJarvisPcm = ShortArray(3200) { i ->
             val f1 = kotlin.math.sin(2.0 * Math.PI * 240.0 * i / 16000.0)
             val f2 = 0.55 * kotlin.math.sin(2.0 * Math.PI * 515.0 * i / 16000.0)
             ((f1 + f2) * 2600.0).toInt().coerceIn(-32767, 32767).toShort()
         }
-        assertTrue(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis", recordedPcmOverride = recordedJarvisPcm).first)
+        assertTrue(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis", recordedPcmOverride = firstJarvisPcm).first)
+        assertEquals(
+            com.example.core.voice.engine.WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT,
+            wakeEngine.getWakePhraseSupportStatus("Hi Jarvis")
+        )
+        assertFalse(wakeEngine.isWakePhraseAcousticallyActive("Hi Jarvis"))
+
+        val secondJarvisPcm = ShortArray(3200) { i ->
+            val f1 = kotlin.math.sin(2.0 * Math.PI * 260.0 * i / 16000.0)
+            val f2 = 0.50 * kotlin.math.sin(2.0 * Math.PI * 545.0 * i / 16000.0)
+            ((f1 + f2) * 2800.0).toInt().coerceIn(-32767, 32767).toShort()
+        }
+        assertTrue(wakeEngine.recordOrEnrollPhraseFromUi("Hi Jarvis", recordedPcmOverride = secondJarvisPcm).first)
         assertEquals(
             com.example.core.voice.engine.WakePhraseSupportStatus.READY_USER_ENROLLED_DTW,
             wakeEngine.getWakePhraseSupportStatus("Hi Jarvis")

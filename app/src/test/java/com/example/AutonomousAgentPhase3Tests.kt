@@ -85,6 +85,7 @@ class AutonomousAgentPhase3Tests {
         setField("uncertainExternalActionSignatures", java.util.Collections.synchronizedSet(mutableSetOf<String>()))
         setField("assistantName", identityStore.getDisplayName())
         setField("continuityManager", ConversationContinuityManager())
+        setField("conversationalEngine", com.example.core.agent.ConversationalIntelligenceEngine())
         setField("operatingStateManager", DeviceOperatingStateManager(null))
         return instance
     }

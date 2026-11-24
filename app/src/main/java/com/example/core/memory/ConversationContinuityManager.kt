@@ -1,5 +1,7 @@
 package com.example.core.memory
 
+import com.example.data.local.entities.ConversationEntity
+
 import com.example.core.agent.ResolvedIntent
 import com.example.core.agent.UserIntentType
 
@@ -71,6 +73,19 @@ class ConversationContinuityManager {
             }
         }
         sessionContext.updatedAtMs = System.currentTimeMillis()
+    }
+
+    /**
+     * Rehydrates the short-term conversation window from Room after Android recreates the process.
+     * The caller passes prior turns, excluding the current user utterance if it was already saved.
+     */
+    fun restoreRecentTurnsFromStorage(messages: List<ConversationEntity>) {
+        if (messages.isEmpty()) return
+        recentTurns.clear()
+        messages.sortedBy { it.timestamp }.takeLast(10).forEach { message ->
+            val role = if (message.sender.equals("user", ignoreCase = true)) "user" else "assistant"
+            recordConversationTurn(role, message.content)
+        }
     }
 
     fun getRecentTurns(limit: Int = 8): List<ConversationTurn> = recentTurns.takeLast(limit)
