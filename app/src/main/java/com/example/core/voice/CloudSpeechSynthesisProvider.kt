@@ -17,6 +17,7 @@ import java.io.File
 import java.io.IOException
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -45,6 +46,7 @@ class CloudSpeechSynthesisProvider(
     private val appContext = context?.applicationContext
     private val executor: ExecutorService = Executors.newSingleThreadExecutor()
     private val lock = Any()
+    private val operationGeneration = AtomicLong(0L)
     private var config = TtsSynthesisConfig()
     private var player: MediaPlayer? = null
     private var activeRequest: okhttp3.Call? = null
@@ -128,6 +130,7 @@ class CloudSpeechSynthesisProvider(
             return false
         }
 
+        val generation = operationGeneration.incrementAndGet()
         synchronized(lock) {
             releasePlayerLocked()
             activeRequest?.cancel()
@@ -185,21 +188,24 @@ class CloudSpeechSynthesisProvider(
                     activeRequest = null
                 }
                 mediaPlayer.setOnPreparedListener { mp ->
+                    if (operationGeneration.get() != generation) return@setOnPreparedListener
                     _isSpeaking.value = true
                     onStart?.invoke()
                     try {
                         mp.start()
                     } catch (e: Throwable) {
-                        finishWithError("Cloud TTS playback failed: ${e.localizedMessage ?: e.javaClass.simpleName}", onError)
+                        finishWithError("Cloud TTS playback failed: ${e.localizedMessage ?: e.javaClass.simpleName}", generation, onError)
                     }
                 }
                 mediaPlayer.setOnCompletionListener {
-                    _isSpeaking.value = false
-                    synchronized(lock) { releasePlayerLocked() }
-                    onDone?.invoke(utteranceId)
+                    if (operationGeneration.get() == generation) {
+                        _isSpeaking.value = false
+                        synchronized(lock) { releasePlayerLocked() }
+                        onDone?.invoke(utteranceId)
+                    }
                 }
                 mediaPlayer.setOnErrorListener { _, what, extra ->
-                    finishWithError("Cloud TTS media playback error ($what/$extra).", onError)
+                    finishWithError("Cloud TTS media playback error ($what/$extra).", generation, onError)
                     true
                 }
                 mediaPlayer.setDataSource(file.absolutePath)
@@ -207,21 +213,31 @@ class CloudSpeechSynthesisProvider(
             } catch (e: Throwable) {
                 audioFile?.delete()
                 synchronized(lock) {
-                    activeRequest = null
-                    _isSpeaking.value = false
+                    if (operationGeneration.get() == generation) {
+                        activeRequest = null
+                        _isSpeaking.value = false
+                    }
                 }
-                onError?.invoke(e.localizedMessage ?: "Cloud TTS request failed.")
+                if (operationGeneration.get() == generation) {
+                    onError?.invoke(e.localizedMessage ?: "Cloud TTS request failed.")
+                }
             }
         }
         return true
     }
 
-    private fun finishWithError(message: String, onError: ((String) -> Unit)?) {
+    private fun finishWithError(
+        message: String,
+        generation: Long,
+        onError: ((String) -> Unit)?
+    ) {
+        if (operationGeneration.get() != generation) return
         synchronized(lock) {
+            if (operationGeneration.get() != generation) return
             _isSpeaking.value = false
             releasePlayerLocked()
         }
-        onError?.invoke(message)
+        if (operationGeneration.get() == generation) onError?.invoke(message)
     }
 
     private fun releasePlayerLocked() {
@@ -236,6 +252,7 @@ class CloudSpeechSynthesisProvider(
     }
 
     override fun stop() {
+        operationGeneration.incrementAndGet()
         synchronized(lock) {
             activeRequest?.cancel()
             activeRequest = null
