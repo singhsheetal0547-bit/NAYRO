@@ -235,6 +235,9 @@ class OnlineAutonomousAgentAuditTests {
         )
 
         val manager = AIProviderManager(storage, monitor)
+        // This test isolates provider failover/token delivery; bounded transient retry behaviour
+        // is covered independently, so each provider is expected to be attempted once here.
+        manager.maxTransientRetriesPerProvider = 0
         manager.saveApiKey("gemini_default", "key-gemini")
         manager.saveApiKey("openrouter_custom", "key-openrouter")
         manager.selectPreferredProvider("gemini_default")
