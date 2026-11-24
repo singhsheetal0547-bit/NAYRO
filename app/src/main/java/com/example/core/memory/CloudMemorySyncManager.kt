@@ -65,7 +65,7 @@ class CloudMemorySyncManager(
 
             remote.filter {
                 it.userConfirmed && it.category.isNotBlank() && it.keyName.isNotBlank() &&
-                    MemoryPrivacyGuard.isAllowedToPersist(it.memoryValue)
+                    MemoryPrivacyGuard.isAllowedToPersist("${it.category} ${it.keyName} ${it.memoryValue}")
             }.forEach { candidate ->
                 val k = key(candidate)
                 val current = merged[k]
@@ -126,7 +126,14 @@ class CloudMemorySyncManager(
                 if (!response.isSuccessful) {
                     throw IOException("Memory sync download failed with HTTP ${response.code}: ${response.message}")
                 }
-                val payload = response.body?.string().orEmpty()
+                val body = response.body ?: throw IOException("Memory sync API returned an empty response body.")
+                if (body.contentLength() > 5L * 1024L * 1024L) {
+                    throw IOException("Memory sync response exceeds the 5 MB safety limit.")
+                }
+                val payload = body.string()
+                if (payload.length > 5 * 1024 * 1024) {
+                    throw IOException("Memory sync response exceeds the 5 MB safety limit.")
+                }
                 if (payload.isBlank()) emptyList() else decodeSnapshot(JSONObject(payload))
             }
 
