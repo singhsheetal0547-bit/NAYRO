@@ -1035,6 +1035,18 @@ fun NayroAppContent(
                             onDeleteMemorySyncConfiguration = {
                                 (context.applicationContext as NayroApplication).memorySyncManager.clearConfiguration()
                             },
+                            onSaveRemoteDevGateway = { endpoint, bearerToken ->
+                                try {
+                                    (context.applicationContext as NayroApplication)
+                                        .remoteDevelopmentGateway.configure(endpoint, bearerToken)
+                                    true to "Remote execution gateway configured. Python/Node code will be sent only when the execution tool is invoked."
+                                } catch (e: Exception) {
+                                    false to (e.localizedMessage ?: "Remote development gateway configuration failed.")
+                                }
+                            },
+                            onDeleteRemoteDevGateway = {
+                                (context.applicationContext as NayroApplication).remoteDevelopmentGateway.clearConfiguration()
+                            },
                             providerTestStatusMessage = providerTestStatus,
                             identityProfile = identityProfile,
                             isFloatingIconRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
