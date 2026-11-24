@@ -17,6 +17,7 @@ import java.io.File
 import java.io.IOException
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -31,7 +32,12 @@ import java.util.concurrent.Executors
 class CloudSpeechSynthesisProvider(
     context: Context?,
     private val secureStorage: EncryptedStorageManager,
-    private val httpClient: OkHttpClient = OkHttpClient()
+    private val httpClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(90, TimeUnit.SECONDS)
+        .writeTimeout(15, TimeUnit.SECONDS)
+        .callTimeout(120, TimeUnit.SECONDS)
+        .build()
 ) : SpeechSynthesisProvider {
 
     companion object {
@@ -177,16 +183,29 @@ class CloudSpeechSynthesisProvider(
                     }
                 }
 
+                if (operationGeneration.get() != generation) return@execute
                 val cache = appContext?.cacheDir ?: throw IOException("Cloud TTS requires an Android cache directory.")
-                audioFile = File(cache, "nayro-tts-${UUID.randomUUID()}.mp3")
-                audioFile.writeBytes(bytes)
-                val file = audioFile
-                val mediaPlayer = MediaPlayer()
-                synchronized(lock) {
-                    player = mediaPlayer
-                    activeAudioFile = file
-                    activeRequest = null
+                val file = File(cache, "nayro-tts-${UUID.randomUUID()}.mp3")
+                audioFile = file
+                file.writeBytes(bytes)
+                if (operationGeneration.get() != generation) {
+                    file.delete()
+                    return@execute
                 }
+                val mediaPlayer = MediaPlayer()
+                val stillCurrent = synchronized(lock) {
+                    if (operationGeneration.get() != generation) {
+                        mediaPlayer.release()
+                        file.delete()
+                        false
+                    } else {
+                        player = mediaPlayer
+                        activeAudioFile = file
+                        activeRequest = null
+                        true
+                    }
+                }
+                if (!stillCurrent) return@execute
                 mediaPlayer.setOnPreparedListener { mp ->
                     if (operationGeneration.get() != generation) return@setOnPreparedListener
                     _isSpeaking.value = true
