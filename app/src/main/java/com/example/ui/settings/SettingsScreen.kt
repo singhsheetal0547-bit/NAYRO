@@ -103,6 +103,8 @@ fun SettingsScreen(
     onSaveMemorySyncConfiguration: (String, String) -> Pair<Boolean, String> = { _, _ -> false to "Memory sync configuration is unavailable." },
     onSyncMemoryNow: (suspend () -> Pair<Boolean, String>)? = null,
     onDeleteMemorySyncConfiguration: () -> Unit = {},
+    onSaveRemoteDevGateway: (String, String) -> Pair<Boolean, String> = { _, _ -> false to "Remote development gateway is unavailable." },
+    onDeleteRemoteDevGateway: () -> Unit = {},
     providerTestStatusMessage: String = "",
     identityProfile: AssistantIdentityProfile = AssistantIdentityProfile(assistantDisplayName = assistantName),
     isFloatingIconRunning: Boolean = false,
@@ -145,6 +147,9 @@ fun SettingsScreen(
     var memorySyncEndpoint by remember { mutableStateOf("") }
     var memorySyncToken by remember { mutableStateOf("") }
     var memorySyncStatusNote by remember { mutableStateOf("") }
+    var remoteDevEndpoint by remember { mutableStateOf("") }
+    var remoteDevToken by remember { mutableStateOf("") }
+    var remoteDevStatusNote by remember { mutableStateOf("") }
     var customBaseUrl by remember { mutableStateOf("") }
     var customModelId by remember { mutableStateOf("") }
     var customApiKey by remember { mutableStateOf("") }
@@ -1074,6 +1079,50 @@ fun SettingsScreen(
                         memorySyncStatusNote,
                         style = MaterialTheme.typography.bodySmall,
                         color = if (memorySyncStatusNote.contains("failed", true) || memorySyncStatusNote.contains("disabled", true)) Coral else SuccessGreen
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+                Text("Real Python / Node / TypeScript Execution Gateway", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "The on-device Kotlin evaluator remains limited. Configure a user-operated isolated HTTPS runner for real CPython, Node.js and TypeScript. Contract: POST /v1/nayro/execute with JSON {language,code,timeoutMs}; response must contain exitCode, stdout and stderr. NAYRO does not include a public execution server.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = remoteDevEndpoint,
+                    onValueChange = { remoteDevEndpoint = it },
+                    label = { Text("Remote development HTTPS base URL") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = remoteDevToken,
+                    onValueChange = { remoteDevToken = it },
+                    label = { Text("Remote execution bearer token") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            val (ok, message) = onSaveRemoteDevGateway(remoteDevEndpoint, remoteDevToken)
+                            remoteDevStatusNote = message
+                            if (ok) remoteDevToken = ""
+                        },
+                        enabled = remoteDevEndpoint.startsWith("https://", ignoreCase = true) && remoteDevToken.isNotBlank()
+                    ) { Text("Save Dev Gateway") }
+                    OutlinedButton(onClick = {
+                        onDeleteRemoteDevGateway()
+                        remoteDevToken = ""
+                        remoteDevStatusNote = "Remote Dev Gateway credentials removed. Restricted local evaluator remains available."
+                    }) { Text("Disable Gateway") }
+                }
+                if (remoteDevStatusNote.isNotBlank()) {
+                    Text(
+                        remoteDevStatusNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (remoteDevStatusNote.contains("failed", true) || remoteDevStatusNote.contains("must", true)) Coral else SuccessGreen
                     )
                 }
 
