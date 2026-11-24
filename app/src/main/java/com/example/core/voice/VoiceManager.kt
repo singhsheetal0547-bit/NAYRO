@@ -968,7 +968,10 @@ class VoiceManager(
         }
         _lastSpeechBlockedReason.value = null
 
-        if (!_configuration.value.isTtsEnabled || !isTtsReady) {
+        val providerStatus = voiceProviderRouter.refreshStatus()
+        val useCloudTts = providerStatus.effectiveTtsEngine == SpeechSynthesisEngineType.OPENAI_COMPATIBLE_CLOUD
+        val activeTtsProvider = if (useCloudTts) voiceProviderRouter.cloudTtsProvider else speechSynthesisProvider
+        if (!_configuration.value.isTtsEnabled || (useCloudTts && !activeTtsProvider.isReady.value) || (!useCloudTts && !isTtsReady)) {
             if (expectFollowUp && _isFollowUpSessionActive.value) {
                 startFollowUpListeningWindow()
             } else {
@@ -985,9 +988,18 @@ class VoiceManager(
         requestTransientAudioFocus()
 
         // Dynamically resolve Hindi / English / Hinglish TTS locale for natural multilingual speech
-        val resolvedLocale = speechSynthesisProvider.resolveLocaleForText(
+        val resolvedLocale = activeTtsProvider.resolveLocaleForText(
             text = text,
             fallbackLanguageTag = _configuration.value.languageTag
+        )
+        activeTtsProvider.configure(
+            TtsSynthesisConfig(
+                languageTag = _configuration.value.languageTag,
+                speechRate = _configuration.value.speechRate,
+                pitch = _configuration.value.voicePitch,
+                voiceGender = _configuration.value.voiceGender,
+                autoDetectUtteranceLanguage = true
+            )
         )
         try {
             tts?.language = resolvedLocale
@@ -1014,6 +1026,59 @@ class VoiceManager(
         } else {
             "nayro_utterance_final_${System.currentTimeMillis()}"
         }
+        if (useCloudTts) {
+            val accepted = activeTtsProvider.speak(
+                text = text,
+                utteranceId = utteranceId,
+                onStart = {
+                    _voiceState.value = VoiceState.SPEAKING
+                },
+                onDone = { completedId ->
+                    mainHandler?.post { handleTtsCompleted(completedId) } ?: handleTtsCompleted(completedId)
+                },
+                onError = { error ->
+                    val fallbackMessage = "Cloud TTS failed: $error. Falling back to Android Native TextToSpeech."
+                    mainHandler?.post {
+                        voiceProviderRouter.markCloudTtsFallback(fallbackMessage)
+                        val fallbackResult = try {
+                            tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId) ?: TextToSpeech.ERROR
+                        } catch (_: Throwable) {
+                            TextToSpeech.ERROR
+                        }
+                        if (fallbackResult == TextToSpeech.ERROR) {
+                            abandonTransientAudioFocus()
+                            microphoneOwnership.release(
+                                AudioSessionOwner.TTS_PLAYBACK,
+                                nextPhase = MicrophoneLifecyclePhase.IDLE,
+                                reason = "Cloud and Android TTS both failed"
+                            )
+                            if (expectAfterSpeech && isMicrophonePermissionGranted() && !isPhoneCallActiveOrRinging()) {
+                                startFollowUpListeningWindow()
+                            } else {
+                                returnToStandbyOrIdle()
+                            }
+                        } else {
+                            scheduleTtsWatchdog(
+                                utteranceId,
+                                estimatedDurationMs = (text.length * 85L).coerceIn(3_500L, 18_000L)
+                            )
+                        }
+                    } ?: run {
+                        abandonTransientAudioFocus()
+                        returnToStandbyOrIdle()
+                    }
+                }
+            )
+            if (accepted) {
+                // Cloud synthesis includes network latency as well as playback; allow a longer bounded watchdog.
+                scheduleTtsWatchdog(
+                    utteranceId,
+                    estimatedDurationMs = (text.length * 120L + 45_000L).coerceIn(45_000L, 180_000L)
+                )
+                return true
+            }
+        }
+
         val speakResult = try {
             tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId) ?: TextToSpeech.ERROR
         } catch (_: Throwable) {
@@ -1086,6 +1151,7 @@ class VoiceManager(
         val runnable = Runnable {
             if (_voiceState.value == VoiceState.SPEAKING) {
                 try { tts?.stop() } catch (_: Throwable) {}
+                try { speechSynthesisProvider.stop() } catch (_: Throwable) {}
                 handleTtsCompleted(utteranceId)
             }
         }
