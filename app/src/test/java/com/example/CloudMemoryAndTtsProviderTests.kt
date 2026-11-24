@@ -44,7 +44,8 @@ class CloudMemoryAndTtsProviderTests {
         val remote = listOf(
             MemoryEntity(category = "NOTE", keyName = "safe", memoryValue = "I prefer concise answers", userConfirmed = true, createdAt = 10),
             MemoryEntity(category = "NOTE", keyName = "unconfirmed", memoryValue = "temporary detail", userConfirmed = false, createdAt = 20),
-            MemoryEntity(category = "NOTE", keyName = "secret", memoryValue = "my API key is sk-abcdefghijklmnopqrstuvwxyz123456", userConfirmed = true, createdAt = 30)
+            MemoryEntity(category = "NOTE", keyName = "secret", memoryValue = "my API key is sk-abcdefghijklmnopqrstuvwxyz123456", userConfirmed = true, createdAt = 30),
+            MemoryEntity(category = "NOTE", keyName = "api_key", memoryValue = "configured remotely", userConfirmed = true, createdAt = 40)
         )
 
         val merged = CloudMemorySyncManager.mergeSnapshots(emptyList(), remote)
