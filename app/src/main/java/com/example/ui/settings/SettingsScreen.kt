@@ -100,6 +100,9 @@ fun SettingsScreen(
     onSelectTtsEngine: (SpeechSynthesisEngineType) -> Unit = {},
     onSaveCloudTtsConfiguration: (String, String, String, String) -> Pair<Boolean, String> = { _, _, _, _ -> false to "Cloud TTS configuration is unavailable." },
     onDeleteCloudTtsKey: () -> Unit = {},
+    onSaveMemorySyncConfiguration: (String, String) -> Pair<Boolean, String> = { _, _ -> false to "Memory sync configuration is unavailable." },
+    onSyncMemoryNow: (suspend () -> Pair<Boolean, String>)? = null,
+    onDeleteMemorySyncConfiguration: () -> Unit = {},
     providerTestStatusMessage: String = "",
     identityProfile: AssistantIdentityProfile = AssistantIdentityProfile(assistantDisplayName = assistantName),
     isFloatingIconRunning: Boolean = false,
@@ -139,6 +142,9 @@ fun SettingsScreen(
     var cloudTtsVoice by remember { mutableStateOf("alloy") }
     var cloudTtsKey by remember { mutableStateOf("") }
     var cloudTtsStatusNote by remember { mutableStateOf("") }
+    var memorySyncEndpoint by remember { mutableStateOf("") }
+    var memorySyncToken by remember { mutableStateOf("") }
+    var memorySyncStatusNote by remember { mutableStateOf("") }
     var customBaseUrl by remember { mutableStateOf("") }
     var customModelId by remember { mutableStateOf("") }
     var customApiKey by remember { mutableStateOf("") }
@@ -1017,6 +1023,57 @@ fun SettingsScreen(
                         cloudTtsStatusNote,
                         style = MaterialTheme.typography.bodySmall,
                         color = if (cloudTtsStatusNote.contains("failed", true) || cloudTtsStatusNote.contains("must", true)) Coral else SuccessGreen
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+                Text("Persistent Cloud Memory Synchronization", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Optional, manual two-way sync for approved memories only. Configure your own HTTPS API implementing GET/PUT /v1/nayro/memory. No cloud endpoint is enabled by default.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = memorySyncEndpoint,
+                    onValueChange = { memorySyncEndpoint = it },
+                    label = { Text("Memory sync HTTPS base URL") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = memorySyncToken,
+                    onValueChange = { memorySyncToken = it },
+                    label = { Text("Bearer token") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            val (ok, message) = onSaveMemorySyncConfiguration(memorySyncEndpoint, memorySyncToken)
+                            memorySyncStatusNote = message
+                            if (ok) memorySyncToken = ""
+                        },
+                        enabled = memorySyncEndpoint.startsWith("https://", ignoreCase = true) && memorySyncToken.isNotBlank()
+                    ) { Text("Save Sync Settings") }
+                    OutlinedButton(onClick = {
+                        scope.launch {
+                            val (ok, message) = onSyncMemoryNow?.invoke()
+                                ?: (false to "Cloud memory sync is unavailable.")
+                            memorySyncStatusNote = message
+                        }
+                    }, enabled = onSyncMemoryNow != null) { Text("Sync Now") }
+                }
+                OutlinedButton(onClick = {
+                    onDeleteMemorySyncConfiguration()
+                    memorySyncToken = ""
+                    memorySyncStatusNote = "Cloud memory sync credentials removed. Local memory was not deleted."
+                }) { Text("Disable Cloud Sync") }
+                if (memorySyncStatusNote.isNotBlank()) {
+                    Text(
+                        memorySyncStatusNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (memorySyncStatusNote.contains("failed", true) || memorySyncStatusNote.contains("disabled", true)) Coral else SuccessGreen
                     )
                 }
 
