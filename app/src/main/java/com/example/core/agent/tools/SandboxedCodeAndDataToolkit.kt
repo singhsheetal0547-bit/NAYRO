@@ -630,7 +630,6 @@ object DevProjectToolkit {
         val safeName = projectName.trim().replace(Regex("[^a-zA-Z0-9_-]"), "_").ifBlank { "nayro_project" }
         val normalizedTemplate = template.trim().lowercase()
         val packageName = safeName.lowercase().replace('_', '-')
-        val packageName = safeName.lowercase().replace('_', '-')
         val files: Map<String, String> = when (normalizedTemplate) {
             "python", "py" -> mapOf(
                 "$safeName/main.py" to """# $safeName (Python)
