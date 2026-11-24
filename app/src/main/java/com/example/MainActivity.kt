@@ -985,13 +985,15 @@ fun NayroAppContent(
                             onSaveCloudTtsConfiguration = { endpoint, model, voice, apiKey ->
                                 try {
                                     voiceManager.voiceProviderRouter.saveCloudTtsConfiguration(endpoint, model, voice, apiKey)
-                                    repository.logAuditAction(
-                                        actionType = "VOICE_TTS_PROVIDER_CONFIGURED",
-                                        target = "openai_compatible_cloud_tts",
-                                        riskLevel = "R1",
-                                        outcome = "SUCCESS",
-                                        details = "Cloud TTS endpoint, model and voice saved; API key stored in Android Keystore."
-                                    )
+                                    coroutineScope.launch {
+                                        repository.logAuditAction(
+                                            actionType = "VOICE_TTS_PROVIDER_CONFIGURED",
+                                            target = "openai_compatible_cloud_tts",
+                                            riskLevel = "R1",
+                                            outcome = "SUCCESS",
+                                            details = "Cloud TTS endpoint, model and voice saved; API key stored in Android Keystore."
+                                        )
+                                    }
                                     true to "Cloud TTS credentials saved. Select Cloud TTS to use the configured HTTPS provider."
                                 } catch (e: Exception) {
                                     false to (e.localizedMessage ?: "Cloud TTS configuration failed.")
