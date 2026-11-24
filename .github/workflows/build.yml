@@ -112,8 +112,13 @@ jobs:
         with:
           accept-android-sdk-licenses: false
           packages: ''
-      - name: Install compile SDK
+      - name: Accept Android SDK licenses and install compile SDK
+        shell: bash
         run: |
+          set -euo pipefail
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
           sdkmanager --install "platforms;android-36.1" "build-tools;36.0.0" "platform-tools"
       - name: Run JVM unit tests
         run: |
@@ -139,10 +144,13 @@ jobs:
         with:
           accept-android-sdk-licenses: false
           packages: ''
-      - name: Install compile SDK and debug signing key
+      - name: Accept Android SDK licenses, install compile SDK and generate debug signing key
         shell: bash
         run: |
           set -euo pipefail
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
           sdkmanager --install "platforms;android-36.1" "build-tools;36.0.0" "platform-tools"
           keytool -genkeypair -v -keystore "$GITHUB_WORKSPACE/debug.keystore" -storetype JKS -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
       - name: Run Android instrumentation tests on emulator
