@@ -12,7 +12,9 @@ permissions:
   actions: write
 
 concurrency:
-  group: nayro-android-ci-${{ github.ref }}
+  # Isolate each source revision so a slow Gradle build from an older PR head
+  # cannot hold the verification queue for the corrected commit.
+  group: nayro-android-ci-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
