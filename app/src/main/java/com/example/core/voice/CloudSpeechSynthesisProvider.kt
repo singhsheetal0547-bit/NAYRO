@@ -66,6 +66,7 @@ class CloudSpeechSynthesisProvider(
             "Cloud TTS endpoint must use HTTPS."
         }
         require(cleanEndpoint.length <= 512) { "Cloud TTS endpoint is too long." }
+        require(apiKey.isNotBlank()) { "Cloud TTS API key is required." }
         require(cleanModel.length <= 120 && cleanVoice.length <= 80) {
             "Cloud TTS model or voice value is too long."
         }
@@ -142,14 +143,14 @@ class CloudSpeechSynthesisProvider(
                     base.endsWith("/v1", true) -> "$base/audio/speech"
                     else -> "$base/v1/audio/speech"
                 }
-                val lang = resolveLocaleForText(cleanText, config.languageTag).language
+                // The configured provider infers Hindi/English/Hinglish from the text; send only
+                // fields supported by the OpenAI-compatible audio/speech request schema.
                 val requestJson = JSONObject()
                     .put("model", configuredModel())
                     .put("input", cleanText)
                     .put("voice", configuredVoice())
                     .put("response_format", "mp3")
                     .put("speed", config.speechRate.coerceIn(0.5f, 2.0f))
-                    .put("language", lang)
                 val body = requestJson.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
                 val request = Request.Builder()
                     .url(speechUrl)
