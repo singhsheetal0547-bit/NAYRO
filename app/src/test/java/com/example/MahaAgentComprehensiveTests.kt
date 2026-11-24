@@ -174,7 +174,7 @@ class MahaAgentComprehensiveTests {
                     }
                 }
                 override suspend fun testConnection(apiKey: String): AIResult =
-                    AIResult.Success(AIResponse("Connection OK", cfg.modelId, cfg.name))
+                    AIResult.Error(501, "This deterministic test adapter does not perform live provider connection checks.")
             }
         }
 
