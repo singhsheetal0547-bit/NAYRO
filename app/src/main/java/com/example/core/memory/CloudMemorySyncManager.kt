@@ -54,7 +54,7 @@ class CloudMemorySyncManager(
 
             local.filter {
                 it.userConfirmed && it.category.isNotBlank() && it.keyName.isNotBlank() &&
-                    MemoryPrivacyGuard.isAllowedToPersist(it.memoryValue)
+                    MemoryPrivacyGuard.isAllowedToPersist("${it.category} ${it.keyName} ${it.memoryValue}")
             }.forEach { candidate ->
                 val k = key(candidate)
                 val current = merged[k]
@@ -188,7 +188,7 @@ class CloudMemorySyncManager(
             val value = item.optString("memoryValue")
             if (category.isBlank() || keyName.isBlank() || value.isBlank()) continue
             if (!item.optBoolean("userConfirmed", false)) continue
-            if (!MemoryPrivacyGuard.isAllowedToPersist(value)) continue
+            if (!MemoryPrivacyGuard.isAllowedToPersist("$category $keyName $value")) continue
             result += MemoryEntity(
                 category = category,
                 keyName = keyName,
@@ -202,7 +202,9 @@ class CloudMemorySyncManager(
 
     private fun encodeSnapshot(memories: List<MemoryEntity>): JSONArray {
         val array = JSONArray()
-        memories.filter { it.userConfirmed && MemoryPrivacyGuard.isAllowedToPersist(it.memoryValue) }
+        memories.filter {
+            it.userConfirmed && MemoryPrivacyGuard.isAllowedToPersist("${it.category} ${it.keyName} ${it.memoryValue}")
+        }
             .forEach { memory ->
                 array.put(
                     JSONObject()
