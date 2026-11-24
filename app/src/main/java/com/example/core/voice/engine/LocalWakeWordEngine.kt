@@ -218,6 +218,7 @@ class LocalWakeWordEngine(private val context: Context?) {
         const val NUM_MFCC = 13
         const val MIN_SNR_MARGIN_RATIO = 1.6
         const val SILENCE_HANGOVER_FRAMES = 4
+        const val MIN_ENROLLMENT_SAMPLES_FOR_ACTIVE = 2
     }
 
     private val _engineState = MutableStateFlow(WakeEngineState.STOPPED)
@@ -336,9 +337,10 @@ class LocalWakeWordEngine(private val context: Context?) {
         val phrases = getConfiguredWakePhrases()
         return phrases.any { phrase ->
             val t = loadedTemplates[phrase.lowercase()] ?: return@any false
-            val hasEnrolled = t.enrolledSamples.any { seq ->
+            val validEnrollmentCount = t.enrolledSamples.count { seq ->
                 seq.isNotEmpty() && seq.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
             }
+            val hasEnrolled = validEnrollmentCount >= MIN_ENROLLMENT_SAMPLES_FOR_ACTIVE
             val hasValidatedBundled = t.isFromValidatedBundledAsset &&
                 t.mfccCentroid.size == NUM_MFCC &&
                 t.mfccCentroid.all { it.isFinite() } &&
@@ -1537,8 +1539,13 @@ class LocalWakeWordEngine(private val context: Context?) {
         val clean = phrase.trim()
         if (clean.length < 3) return WakePhraseSupportStatus.INVALID_PHRASE
         val template = loadedTemplates[clean.lowercase()]
-        if (template != null && template.enrolledSamples.isNotEmpty()) {
-            return WakePhraseSupportStatus.READY_USER_ENROLLED_DTW
+        if (template != null) {
+            val validEnrollmentCount = template.enrolledSamples.count { seq ->
+                seq.isNotEmpty() && seq.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
+            }
+            if (validEnrollmentCount >= MIN_ENROLLMENT_SAMPLES_FOR_ACTIVE) {
+                return WakePhraseSupportStatus.READY_USER_ENROLLED_DTW
+            }
         }
         if (template != null && template.isFromValidatedBundledAsset && template.mfccSequence.size >= 4) {
             return WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
@@ -1908,14 +1915,20 @@ class LocalWakeWordEngine(private val context: Context?) {
         for (phrase in getConfiguredWakePhrases()) {
             val template = loadedTemplates[phrase.lowercase()] ?: continue
 
-            // 1. User-enrolled voice DTW templates (highest priority)
-            for (enrolledSeq in template.enrolledSamples) {
-                if (enrolledSeq.isEmpty()) continue
-                val dist = computeDtwDistance(querySeq, enrolledSeq)
-                if (dist < bestDist) {
-                    bestDist = dist
-                    bestPhrase = template.phrase
-                    matchedViaEnrolled = true
+            // 1. User-enrolled voice DTW templates (highest priority).
+            // A custom phrase becomes active only after at least two distinct accepted samples.
+            val validEnrollmentSamples = template.enrolledSamples.filter { enrolledSeq ->
+                enrolledSeq.isNotEmpty() &&
+                    enrolledSeq.all { frame -> frame.size == NUM_MFCC && frame.all { it.isFinite() } }
+            }
+            if (validEnrollmentSamples.size >= MIN_ENROLLMENT_SAMPLES_FOR_ACTIVE) {
+                for (enrolledSeq in validEnrollmentSamples) {
+                    val dist = computeDtwDistance(querySeq, enrolledSeq)
+                    if (dist < bestDist) {
+                        bestDist = dist
+                        bestPhrase = template.phrase
+                        matchedViaEnrolled = true
+                    }
                 }
             }
 
