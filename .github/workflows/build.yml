@@ -2,7 +2,7 @@ name: NAYRO Android Debug APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/agent-runtime-integration-p0]
   workflow_dispatch:
 
 permissions:
