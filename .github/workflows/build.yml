@@ -2,7 +2,7 @@ name: NAYRO Android Verification
 
 on:
   push:
-    branches: [main, fix/agent-runtime-integration-p0]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
