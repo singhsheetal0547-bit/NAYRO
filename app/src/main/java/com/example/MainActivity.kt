@@ -1009,6 +1009,32 @@ fun NayroAppContent(
                                     )
                                 }
                             },
+                            onSaveMemorySyncConfiguration = { endpoint, bearerToken ->
+                                try {
+                                    (context.applicationContext as NayroApplication)
+                                        .memorySyncManager.configure(endpoint, bearerToken)
+                                    true to "Cloud memory sync configured. Sync Now will contact the endpoint; local memory has not been uploaded yet."
+                                } catch (e: Exception) {
+                                    false to (e.localizedMessage ?: "Memory sync configuration failed.")
+                                }
+                            },
+                            onSyncMemoryNow = {
+                                val result = (context.applicationContext as NayroApplication)
+                                    .memorySyncManager.syncNow()
+                                coroutineScope.launch {
+                                    repository.logAuditAction(
+                                        actionType = "CLOUD_MEMORY_SYNC",
+                                        target = "configured_memory_endpoint",
+                                        riskLevel = "R1",
+                                        outcome = if (result.isSuccess) "SUCCESS" else "FAILED",
+                                        details = result.message
+                                    )
+                                }
+                                result.isSuccess to result.message
+                            },
+                            onDeleteMemorySyncConfiguration = {
+                                (context.applicationContext as NayroApplication).memorySyncManager.clearConfiguration()
+                            },
                             providerTestStatusMessage = providerTestStatus,
                             identityProfile = identityProfile,
                             isFloatingIconRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
