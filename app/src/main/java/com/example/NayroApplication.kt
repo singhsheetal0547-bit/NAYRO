@@ -6,6 +6,7 @@ import com.example.core.agent.AgentRuntime
 import com.example.core.agent.SelfImprovementEngine
 import com.example.core.automation.AutomationEngine
 import com.example.core.capability.CapabilityManager
+import com.example.core.memory.CloudMemorySyncManager
 import com.example.core.memory.ConversationContinuityManager
 import com.example.core.memory.MemoryManager
 import com.example.core.memory.NotebookManager
@@ -61,6 +62,8 @@ class NayroApplication : Application() {
     lateinit var providerManager: AIProviderManager
         private set
     lateinit var memoryManager: MemoryManager
+        private set
+    lateinit var memorySyncManager: CloudMemorySyncManager
         private set
     lateinit var notebookManager: NotebookManager
         private set
@@ -119,6 +122,7 @@ class NayroApplication : Application() {
 
         val screenIntelligenceManager = ScreenIntelligenceManager(this)
         memoryManager = MemoryManager(repository, encryptedStorageManager)
+        memorySyncManager = CloudMemorySyncManager(repository, memoryManager, encryptedStorageManager)
         selfImprovementEngine = SelfImprovementEngine(encryptedStorageManager)
         notebookManager = NotebookManager(repository)
         workspaceManager = WorkspaceManager(this)
