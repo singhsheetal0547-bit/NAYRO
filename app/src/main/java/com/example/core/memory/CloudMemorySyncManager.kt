@@ -53,9 +53,15 @@ class CloudMemorySyncManager(
             fun key(item: MemoryEntity) = "${item.category.trim().lowercase()}::${item.keyName.trim().lowercase()}"
 
             local.filter {
-                it.category.isNotBlank() && it.keyName.isNotBlank() &&
+                it.userConfirmed && it.category.isNotBlank() && it.keyName.isNotBlank() &&
                     MemoryPrivacyGuard.isAllowedToPersist(it.memoryValue)
-            }.forEach { merged[key(it)] = it }
+            }.forEach { candidate ->
+                val k = key(candidate)
+                val current = merged[k]
+                if (current == null || candidate.createdAt > current.createdAt) {
+                    merged[k] = candidate
+                }
+            }
 
             remote.filter {
                 it.userConfirmed && it.category.isNotBlank() && it.keyName.isNotBlank() &&
@@ -126,7 +132,6 @@ class CloudMemorySyncManager(
 
             val merged = mergeSnapshots(local, remoteSnapshot)
             val localKeys = local.map { "${it.category.lowercase()}::${it.keyName.lowercase()}" }.toSet()
-            val remoteKeys = remoteSnapshot.map { "${it.category.lowercase()}::${it.keyName.lowercase()}" }.toSet()
             val imported = merged.filter {
                 val key = "${it.category.lowercase()}::${it.keyName.lowercase()}"
                 key !in localKeys || (remoteSnapshot.any { r ->
