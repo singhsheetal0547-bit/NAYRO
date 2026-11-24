@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import com.example.data.local.entities.AppSettingsEntity
 import com.example.data.local.entities.AssistantProfileEntity
 import com.example.data.local.entities.AuditLogEntity
@@ -51,6 +52,15 @@ interface MemoryDao {
 
     @Query("DELETE FROM local_memory WHERE id = :id")
     suspend fun deleteMemory(id: Long)
+
+    @Query("DELETE FROM local_memory WHERE lower(category) = lower(:category) AND lower(keyName) = lower(:keyName)")
+    suspend fun deleteByCategoryAndKey(category: String, keyName: String)
+
+    @Transaction
+    suspend fun upsertByCategoryAndKey(memory: MemoryEntity) {
+        deleteByCategoryAndKey(memory.category, memory.keyName)
+        insertMemory(memory.copy(id = 0))
+    }
 
     @Query("DELETE FROM local_memory")
     suspend fun clearAll()

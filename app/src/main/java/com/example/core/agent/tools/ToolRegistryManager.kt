@@ -1142,7 +1142,7 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 actionType = ActionType.EXECUTE_SANDBOXED_CODE,
                 toolId = "coding.execute_sandboxed_code",
                 displayName = "Sandboxed Script Executor",
-                description = "Executes safe Python/JS computational scripts inside a Play-policy compliant pure-Kotlin sandbox with strict step/timeout caps and zero OS/shell access.",
+                description = "Runs code through the configured authenticated remote CPython/Node gateway when available; otherwise uses the restricted pure-Kotlin subset evaluator (not full CPython/Node, no pip/npm or OS shell).",
                 category = ToolCategory.CODING_AGENT,
                 parametersSchema = mapOf(
                     "code" to "String - Python or JavaScript code snippet to evaluate",
@@ -1157,7 +1157,7 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 actionType = ActionType.SCAFFOLD_DEV_PROJECT,
                 toolId = "coding.scaffold_dev_project",
                 displayName = "Scaffold Dev Project",
-                description = "Creates starter Python, JavaScript, React, or React Native project files inside NAYRO's confined workspace.",
+                description = "Creates multi-file Python, JavaScript/Node, React/Vite, or React Native project scaffolds inside NAYRO's confined workspace; building and package installation require a real development environment.",
                 category = ToolCategory.CODING_AGENT,
                 parametersSchema = mapOf(
                     "projectName" to "String - Project folder name inside workspace",

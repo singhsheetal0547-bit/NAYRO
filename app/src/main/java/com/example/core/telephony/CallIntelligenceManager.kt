@@ -85,6 +85,8 @@ class CallIntelligenceManager(
         @Volatile
         var lastDialedRecipient: String? = null
 
+        private const val CALL_DUPLICATE_WINDOW_MS = 15_000L
+
         @Volatile
         private var lastCallTimestampMs: Long = 0L
 
@@ -506,10 +508,19 @@ class CallIntelligenceManager(
             )
         }
 
-        // 6. Duplicate call guard (prevent accidental double-dialing within 4 seconds)
+        val observedCallState = if (context != null || testOverrideCallState != null) queryActiveCallState() else null
+        if (observedCallState?.isRinging == true || observedCallState?.isOffhook == true) {
+            return ActionExecutionResult(
+                false,
+                "A phone call is already ringing or active. NAYRO will not place another call until the line is idle.",
+                VerificationStatus.FAILED
+            )
+        }
+
+        // Guard against a second call while the first call's Android telephony callback is settling.
         val normDigits = normalizePhoneDigits(phoneToCall)
         val nowMs = System.currentTimeMillis()
-        if (normDigits == lastCalledNormalizedNumber && (nowMs - lastCallTimestampMs) < 4_000L) {
+        if (normDigits == lastCalledNormalizedNumber && (nowMs - lastCallTimestampMs) < CALL_DUPLICATE_WINDOW_MS) {
             return ActionExecutionResult(
                 false,
                 "Duplicate call prevented: a call to $resolvedDisplayName ($phoneToCall) was just initiated.",
@@ -527,6 +538,7 @@ class CallIntelligenceManager(
             lastOutgoingCallInitiated = initiated
             if (!initiated) {
                 lastOutgoingCallAnswered = false
+                resetDuplicateCallGuard()
                 lastCallLifecycleState = PhoneCallLifecycleState.CALL_FAILED
                 return ActionExecutionResult(
                     false,
@@ -626,6 +638,7 @@ class CallIntelligenceManager(
         } catch (e: SecurityException) {
             lastOutgoingCallInitiated = false
             lastOutgoingCallAnswered = false
+            resetDuplicateCallGuard()
             ActionExecutionResult(
                 false,
                 "Permission denied while placing call to $resolvedDisplayName ($phoneToCall): ${e.localizedMessage}",
@@ -634,6 +647,7 @@ class CallIntelligenceManager(
         } catch (e: Exception) {
             lastOutgoingCallInitiated = false
             lastOutgoingCallAnswered = false
+            resetDuplicateCallGuard()
             ActionExecutionResult(
                 false,
                 "Failed to initiate phone call to $resolvedDisplayName ($phoneToCall): ${e.localizedMessage}",

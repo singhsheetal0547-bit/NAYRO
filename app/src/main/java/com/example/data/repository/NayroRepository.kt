@@ -34,6 +34,10 @@ class NayroRepository(private val database: NayroDatabase) {
         database.memoryDao().insertMemory(memory)
     }
 
+    suspend fun upsertMemory(memory: MemoryEntity) {
+        database.memoryDao().upsertByCategoryAndKey(memory)
+    }
+
     suspend fun deleteMemory(id: Long) {
         database.memoryDao().deleteMemory(id)
     }

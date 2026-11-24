@@ -979,6 +979,76 @@ fun NayroAppContent(
                             onTestDeepgramConnection = {
                                 voiceManager.voiceProviderRouter.testDeepgramConnection()
                             },
+                            onSelectTtsEngine = { engine ->
+                                voiceManager.voiceProviderRouter.selectTtsEngine(engine)
+                            },
+                            onSaveCloudTtsConfiguration = { endpoint, model, voice, apiKey ->
+                                try {
+                                    voiceManager.voiceProviderRouter.saveCloudTtsConfiguration(endpoint, model, voice, apiKey)
+                                    coroutineScope.launch {
+                                        repository.logAuditAction(
+                                            actionType = "VOICE_TTS_PROVIDER_CONFIGURED",
+                                            target = "openai_compatible_cloud_tts",
+                                            riskLevel = "R1",
+                                            outcome = "SUCCESS",
+                                            details = "Cloud TTS endpoint, model and voice saved; API key stored in Android Keystore."
+                                        )
+                                    }
+                                    true to "Cloud TTS credentials saved. Select Cloud TTS to use the configured HTTPS provider."
+                                } catch (e: Exception) {
+                                    false to (e.localizedMessage ?: "Cloud TTS configuration failed.")
+                                }
+                            },
+                            onDeleteCloudTtsKey = {
+                                voiceManager.voiceProviderRouter.deleteCloudTtsCredentials()
+                                coroutineScope.launch {
+                                    repository.logAuditAction(
+                                        actionType = "VOICE_TTS_PROVIDER_KEY_DELETED",
+                                        target = "openai_compatible_cloud_tts",
+                                        riskLevel = "R0",
+                                        outcome = "SUCCESS",
+                                        details = "Cloud TTS API key deleted from Android Keystore."
+                                    )
+                                }
+                            },
+                            onSaveMemorySyncConfiguration = { endpoint, bearerToken ->
+                                try {
+                                    (context.applicationContext as NayroApplication)
+                                        .memorySyncManager.configure(endpoint, bearerToken)
+                                    true to "Cloud memory sync configured. Sync Now will contact the endpoint; local memory has not been uploaded yet."
+                                } catch (e: Exception) {
+                                    false to (e.localizedMessage ?: "Memory sync configuration failed.")
+                                }
+                            },
+                            onSyncMemoryNow = {
+                                val result = (context.applicationContext as NayroApplication)
+                                    .memorySyncManager.syncNow()
+                                coroutineScope.launch {
+                                    repository.logAuditAction(
+                                        actionType = "CLOUD_MEMORY_SYNC",
+                                        target = "configured_memory_endpoint",
+                                        riskLevel = "R1",
+                                        outcome = if (result.isSuccess) "SUCCESS" else "FAILED",
+                                        details = result.message
+                                    )
+                                }
+                                result.isSuccess to result.message
+                            },
+                            onDeleteMemorySyncConfiguration = {
+                                (context.applicationContext as NayroApplication).memorySyncManager.clearConfiguration()
+                            },
+                            onSaveRemoteDevGateway = { endpoint, bearerToken ->
+                                try {
+                                    (context.applicationContext as NayroApplication)
+                                        .remoteDevelopmentGateway.configure(endpoint, bearerToken)
+                                    true to "Remote execution gateway configured. Python/Node code will be sent only when the execution tool is invoked."
+                                } catch (e: Exception) {
+                                    false to (e.localizedMessage ?: "Remote development gateway configuration failed.")
+                                }
+                            },
+                            onDeleteRemoteDevGateway = {
+                                (context.applicationContext as NayroApplication).remoteDevelopmentGateway.clearConfiguration()
+                            },
                             providerTestStatusMessage = providerTestStatus,
                             identityProfile = identityProfile,
                             isFloatingIconRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,

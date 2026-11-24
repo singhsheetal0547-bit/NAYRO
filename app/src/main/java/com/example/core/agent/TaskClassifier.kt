@@ -602,11 +602,16 @@ object TaskClassifier {
                 .trim()
                 .removeSuffix(".")
 
-            val isGenericRequest = strippedForQuery.isBlank() ||
-                strippedForQuery.lowercase() in setOf(
-                    "koi achha gaana", "koi acha gaana", "achha gaana", "acha gaana",
-                    "koi gaana", "good song", "a good song", "nice song", "some music", "music", "song", "gaana"
-                )
+            val genericMusicPhrases = setOf(
+                "koi achha", "koi acha", "achha", "acha",
+                "koi achha gaana", "koi acha gaana", "achha gaana", "acha gaana",
+                "koi gaana", "good song", "a good song", "nice song", "some music", "music", "song", "gaana"
+            )
+            val normalizedQuery = strippedForQuery.lowercase()
+                .replace(Regex("[^\\p{L}\\p{M}\\s]"), " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            val isGenericRequest = normalizedQuery.isBlank() || normalizedQuery in genericMusicPhrases
 
             val finalQuery = when {
                 !isGenericRequest -> strippedForQuery

@@ -57,6 +57,7 @@ import com.example.core.identity.ResponseLengthMode
 import com.example.core.identity.VoiceGender
 import com.example.core.provider.ProviderConfig
 import com.example.core.voice.SpeechRecognitionEngineType
+import com.example.core.voice.SpeechSynthesisEngineType
 import com.example.core.voice.VoiceProviderStatus
 import com.example.core.voice.engine.WakeCalibrationTestResult
 import com.example.core.voice.engine.WakePhraseSupportStatus
@@ -96,6 +97,14 @@ fun SettingsScreen(
     onSaveDeepgramKey: (String) -> Unit = {},
     onDeleteDeepgramKey: () -> Unit = {},
     onTestDeepgramConnection: (suspend () -> Pair<Boolean, String>)? = null,
+    onSelectTtsEngine: (SpeechSynthesisEngineType) -> Unit = {},
+    onSaveCloudTtsConfiguration: (String, String, String, String) -> Pair<Boolean, String> = { _, _, _, _ -> false to "Cloud TTS configuration is unavailable." },
+    onDeleteCloudTtsKey: () -> Unit = {},
+    onSaveMemorySyncConfiguration: (String, String) -> Pair<Boolean, String> = { _, _ -> false to "Memory sync configuration is unavailable." },
+    onSyncMemoryNow: (suspend () -> Pair<Boolean, String>)? = null,
+    onDeleteMemorySyncConfiguration: () -> Unit = {},
+    onSaveRemoteDevGateway: (String, String) -> Pair<Boolean, String> = { _, _ -> false to "Remote development gateway is unavailable." },
+    onDeleteRemoteDevGateway: () -> Unit = {},
     providerTestStatusMessage: String = "",
     identityProfile: AssistantIdentityProfile = AssistantIdentityProfile(assistantDisplayName = assistantName),
     isFloatingIconRunning: Boolean = false,
@@ -130,6 +139,17 @@ fun SettingsScreen(
     var deepseekKeyInput by remember { mutableStateOf("") }
     var deepgramKeyInput by remember { mutableStateOf("") }
     var deepgramStatusNote by remember { mutableStateOf("") }
+    var cloudTtsEndpoint by remember { mutableStateOf("https://api.openai.com/v1") }
+    var cloudTtsModel by remember { mutableStateOf("gpt-4o-mini-tts") }
+    var cloudTtsVoice by remember { mutableStateOf("alloy") }
+    var cloudTtsKey by remember { mutableStateOf("") }
+    var cloudTtsStatusNote by remember { mutableStateOf("") }
+    var memorySyncEndpoint by remember { mutableStateOf("") }
+    var memorySyncToken by remember { mutableStateOf("") }
+    var memorySyncStatusNote by remember { mutableStateOf("") }
+    var remoteDevEndpoint by remember { mutableStateOf("") }
+    var remoteDevToken by remember { mutableStateOf("") }
+    var remoteDevStatusNote by remember { mutableStateOf("") }
     var customBaseUrl by remember { mutableStateOf("") }
     var customModelId by remember { mutableStateOf("") }
     var customApiKey by remember { mutableStateOf("") }
@@ -921,6 +941,188 @@ fun SettingsScreen(
                         text = deepgramStatusNote,
                         style = MaterialTheme.typography.bodySmall,
                         color = SuccessGreen
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("Speech Output Provider", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Selected: ${voiceProviderStatus.selectedTtsEngine.displayName} • Active: ${voiceProviderStatus.effectiveTtsEngine.displayName}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                voiceProviderStatus.ttsFallbackActiveReason?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = Coral)
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    SpeechSynthesisEngineType.entries.forEach { engineType ->
+                        if (voiceProviderStatus.selectedTtsEngine == engineType) {
+                            Button(
+                                onClick = { onSelectTtsEngine(engineType) },
+                                modifier = Modifier.weight(1f).testTag("tts_engine_${engineType.name.lowercase()}")
+                            ) { Text(if (engineType == SpeechSynthesisEngineType.ANDROID_TTS) "Android TTS" else "Cloud TTS") }
+                        } else {
+                            OutlinedButton(
+                                onClick = { onSelectTtsEngine(engineType) },
+                                modifier = Modifier.weight(1f).testTag("tts_engine_${engineType.name.lowercase()}")
+                            ) { Text(if (engineType == SpeechSynthesisEngineType.ANDROID_TTS) "Android TTS" else "Cloud TTS") }
+                        }
+                    }
+                }
+                Text(
+                    "Cloud TTS uses an OpenAI-compatible HTTPS /v1/audio/speech endpoint. The API key is stored in Android Keystore; audio is fetched only when Cloud TTS is selected and configured.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = cloudTtsEndpoint,
+                    onValueChange = { cloudTtsEndpoint = it },
+                    label = { Text("HTTPS API base URL") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = cloudTtsModel,
+                    onValueChange = { cloudTtsModel = it },
+                    label = { Text("TTS model") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = cloudTtsVoice,
+                    onValueChange = { cloudTtsVoice = it },
+                    label = { Text("TTS voice") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = cloudTtsKey,
+                    onValueChange = { cloudTtsKey = it },
+                    label = { Text(if (voiceProviderStatus.hasCloudTtsKey) "Replace Cloud TTS API key" else "Cloud TTS API key") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            val (ok, message) = onSaveCloudTtsConfiguration(
+                                cloudTtsEndpoint, cloudTtsModel, cloudTtsVoice, cloudTtsKey
+                            )
+                            cloudTtsStatusNote = message
+                            if (ok) cloudTtsKey = ""
+                        },
+                        enabled = cloudTtsEndpoint.startsWith("https://", ignoreCase = true) &&
+                            cloudTtsModel.isNotBlank() && cloudTtsVoice.isNotBlank() && cloudTtsKey.isNotBlank()
+                    ) { Text("Save Cloud TTS") }
+                    OutlinedButton(onClick = {
+                        onDeleteCloudTtsKey()
+                        cloudTtsKey = ""
+                        cloudTtsStatusNote = "Cloud TTS key deleted. Android TTS remains available."
+                    }) { Text("Delete Key") }
+                }
+                if (cloudTtsStatusNote.isNotBlank()) {
+                    Text(
+                        cloudTtsStatusNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (cloudTtsStatusNote.contains("failed", true) || cloudTtsStatusNote.contains("must", true)) Coral else SuccessGreen
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+                Text("Persistent Cloud Memory Synchronization", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "Optional, manual two-way sync for approved memories only. Configure your own HTTPS API implementing GET/PUT /v1/nayro/memory. No cloud endpoint is enabled by default.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = memorySyncEndpoint,
+                    onValueChange = { memorySyncEndpoint = it },
+                    label = { Text("Memory sync HTTPS base URL") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = memorySyncToken,
+                    onValueChange = { memorySyncToken = it },
+                    label = { Text("Bearer token") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            val (ok, message) = onSaveMemorySyncConfiguration(memorySyncEndpoint, memorySyncToken)
+                            memorySyncStatusNote = message
+                            if (ok) memorySyncToken = ""
+                        },
+                        enabled = memorySyncEndpoint.startsWith("https://", ignoreCase = true) && memorySyncToken.isNotBlank()
+                    ) { Text("Save Sync Settings") }
+                    OutlinedButton(onClick = {
+                        scope.launch {
+                            val (ok, message) = onSyncMemoryNow?.invoke()
+                                ?: (false to "Cloud memory sync is unavailable.")
+                            memorySyncStatusNote = message
+                        }
+                    }, enabled = onSyncMemoryNow != null) { Text("Sync Now") }
+                }
+                OutlinedButton(onClick = {
+                    onDeleteMemorySyncConfiguration()
+                    memorySyncToken = ""
+                    memorySyncStatusNote = "Cloud memory sync credentials removed. Local memory was not deleted."
+                }) { Text("Disable Cloud Sync") }
+                if (memorySyncStatusNote.isNotBlank()) {
+                    Text(
+                        memorySyncStatusNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (memorySyncStatusNote.contains("failed", true) || memorySyncStatusNote.contains("disabled", true)) Coral else SuccessGreen
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(20.dp))
+                Text("Real Python / Node / TypeScript Execution Gateway", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "The on-device Kotlin evaluator remains limited. Configure a user-operated isolated HTTPS runner for real CPython, Node.js and TypeScript. Contract: POST /v1/nayro/execute with JSON {language,code,timeoutMs}; response must contain exitCode, stdout and stderr. NAYRO does not include a public execution server.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = remoteDevEndpoint,
+                    onValueChange = { remoteDevEndpoint = it },
+                    label = { Text("Remote development HTTPS base URL") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                OutlinedTextField(
+                    value = remoteDevToken,
+                    onValueChange = { remoteDevToken = it },
+                    label = { Text("Remote execution bearer token") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            val (ok, message) = onSaveRemoteDevGateway(remoteDevEndpoint, remoteDevToken)
+                            remoteDevStatusNote = message
+                            if (ok) remoteDevToken = ""
+                        },
+                        enabled = remoteDevEndpoint.startsWith("https://", ignoreCase = true) && remoteDevToken.isNotBlank()
+                    ) { Text("Save Dev Gateway") }
+                    OutlinedButton(onClick = {
+                        onDeleteRemoteDevGateway()
+                        remoteDevToken = ""
+                        remoteDevStatusNote = "Remote Dev Gateway credentials removed. Restricted local evaluator remains available."
+                    }) { Text("Disable Gateway") }
+                }
+                if (remoteDevStatusNote.isNotBlank()) {
+                    Text(
+                        remoteDevStatusNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (remoteDevStatusNote.contains("failed", true) || remoteDevStatusNote.contains("must", true)) Coral else SuccessGreen
                     )
                 }
 

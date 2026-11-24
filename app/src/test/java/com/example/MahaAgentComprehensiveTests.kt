@@ -173,6 +173,8 @@ class MahaAgentComprehensiveTests {
                         AIResult.Success(AIResponse("Backup succeeded", cfg.modelId, cfg.name))
                     }
                 }
+                override suspend fun testConnection(apiKey: String): AIResult =
+                    AIResult.Error(501, "This deterministic test adapter does not perform live provider connection checks.")
             }
         }
 
@@ -228,6 +230,8 @@ class MahaAgentComprehensiveTests {
                         AIResult.Success(AIResponse("Recovered on retry 2", cfg.modelId, cfg.name))
                     }
                 }
+                override suspend fun testConnection(apiKey: String): AIResult =
+                    AIResult.Success(AIResponse("Connection OK", cfg.modelId, cfg.name))
             }
         }
 
