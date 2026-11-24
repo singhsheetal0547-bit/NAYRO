@@ -4,6 +4,7 @@ import android.content.Context
 import com.example.core.accessibility.ActionExecutionGuard
 import com.example.core.accessibility.AppNavigationManager
 import com.example.core.accessibility.GuardEvaluation
+import com.example.core.agent.tools.RemoteDevelopmentExecutionGateway
 import com.example.core.automation.AutomationEngine
 import com.example.core.capability.CapabilityManager
 import com.example.core.memory.ContinuationResolution
@@ -71,7 +72,8 @@ class AgentRuntime(
     val proactiveEngine: ProactiveIntelligenceEngine = ProactiveIntelligenceEngine(),
     val automationEngine: AutomationEngine = AutomationEngine(context),
     val operatingStateManager: DeviceOperatingStateManager = DeviceOperatingStateManager(context),
-    val selfImprovementEngine: SelfImprovementEngine = SelfImprovementEngine()
+    val selfImprovementEngine: SelfImprovementEngine = SelfImprovementEngine(),
+    val remoteDevelopmentGateway: RemoteDevelopmentExecutionGateway? = null
 ) {
 
     private val _currentState = MutableStateFlow<AgentState>(AgentState.Idle)
@@ -97,7 +99,8 @@ class AgentRuntime(
         callIntelligenceManager = callIntelligenceManager,
         workflowEngine = workflowEngine,
         automationEngine = automationEngine,
-        conversationalEngine = conversationalEngine
+        conversationalEngine = conversationalEngine,
+        remoteDevelopmentGateway = remoteDevelopmentGateway
     )
 
     val agentBrain = AgentBrain(
