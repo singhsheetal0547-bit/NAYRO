@@ -3,6 +3,7 @@ package com.example
 import android.app.Application
 import com.example.core.agent.AgentBrain
 import com.example.core.agent.AgentRuntime
+import com.example.core.agent.tools.RemoteDevelopmentExecutionGateway
 import com.example.core.agent.SelfImprovementEngine
 import com.example.core.automation.AutomationEngine
 import com.example.core.capability.CapabilityManager
@@ -65,6 +66,8 @@ class NayroApplication : Application() {
         private set
     lateinit var memorySyncManager: CloudMemorySyncManager
         private set
+    lateinit var remoteDevelopmentGateway: RemoteDevelopmentExecutionGateway
+        private set
     lateinit var notebookManager: NotebookManager
         private set
     lateinit var workspaceManager: WorkspaceManager
@@ -123,6 +126,7 @@ class NayroApplication : Application() {
         val screenIntelligenceManager = ScreenIntelligenceManager(this)
         memoryManager = MemoryManager(repository, encryptedStorageManager)
         memorySyncManager = CloudMemorySyncManager(repository, memoryManager, encryptedStorageManager)
+        remoteDevelopmentGateway = RemoteDevelopmentExecutionGateway(encryptedStorageManager)
         selfImprovementEngine = SelfImprovementEngine(encryptedStorageManager)
         notebookManager = NotebookManager(repository)
         workspaceManager = WorkspaceManager(this)
@@ -155,7 +159,8 @@ class NayroApplication : Application() {
             proactiveEngine = proactiveEngine,
             automationEngine = automationEngine,
             operatingStateManager = operatingStateManager,
-            selfImprovementEngine = selfImprovementEngine
+            selfImprovementEngine = selfImprovementEngine,
+            remoteDevelopmentGateway = remoteDevelopmentGateway
         )
 
         agentBrain = agentRuntime.agentBrain
