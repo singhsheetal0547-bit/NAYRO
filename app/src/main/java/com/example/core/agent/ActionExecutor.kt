@@ -6,10 +6,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.media.AudioManager
 import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.os.StatFs
 import android.provider.AlarmClock
 import android.provider.CalendarContract
@@ -40,10 +43,12 @@ import com.example.core.telephony.ContactResolutionResult
 import com.example.core.workflow.CrossAppWorkflowEngine
 import com.example.core.workspace.WorkspaceManager
 import com.example.core.workspace.WorkspaceResult
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
@@ -94,7 +99,13 @@ class ActionExecutor(
         memoryManager
     ),
     val emailManager: com.example.core.communication.EmailOperationManager = com.example.core.communication.EmailOperationManager(context),
-    val conversationalEngine: ConversationalIntelligenceEngine = ConversationalIntelligenceEngine()
+    val conversationalEngine: ConversationalIntelligenceEngine = ConversationalIntelligenceEngine(),
+    val browserManager: com.example.core.browser.BrowserAutomationManager = com.example.core.browser.BrowserAutomationManager(context),
+    val universalScreenOperator: com.example.core.screen.UniversalScreenOperator = com.example.core.screen.UniversalScreenOperator(
+        providerManager = providerManager,
+        perceptionProvider = com.example.core.screen.AndroidMultiMethodPerceptionProvider(context, screenIntelligenceManager),
+        gestureDispatcher = com.example.core.screen.AndroidScreenGestureDispatcher()
+    )
 ) {
 
     companion object {
@@ -214,6 +225,8 @@ class ActionExecutor(
                 val resolvedPkg = AppNavigationManager.resolvePackage(context, targetApp) ?: targetApp
                 val launched = AppNavigationManager.launchApp(context, resolvedPkg)
                 if (launched) {
+                    val appCategory = com.example.core.screen.UniversalScreenOperator.classifyAppCategory(resolvedPkg, null, null)
+                    universalScreenOperator.contextManager.recordLaunchedApp(resolvedPkg, appCategory)
                     ActionExecutionResult(true, "Launched $targetApp ($resolvedPkg) successfully.", VerificationStatus.VERIFIED)
                 } else {
                     ActionExecutionResult(false, "Could not find or launch app: $targetApp.", VerificationStatus.FAILED)
@@ -246,10 +259,18 @@ class ActionExecutor(
             }
 
             ActionType.GET_NETWORK_STATUS -> {
+                providerManager.refreshActiveProvider()
+                val net = providerManager.getNetworkStatus()
                 val activeProvider = providerManager.activeProvider.value
+                val providerSummary = activeProvider?.let { "${it.name} (${it.modelId})" } ?: "No Cloud AI Provider Configured"
+                val detail = if (net.isOnline) {
+                    "Online via ${net.transportType.displayName} (Internet validated). Active AI Provider: $providerSummary."
+                } else {
+                    "Offline (${net.summary}). Cloud AI providers are unreachable until Wi-Fi or Mobile Data is restored. Configured AI Provider: $providerSummary."
+                }
                 ActionExecutionResult(
                     true,
-                    "Network active. Active AI Provider: ${activeProvider?.name ?: "Local Offline Mode"}",
+                    detail,
                     VerificationStatus.VERIFIED
                 )
             }
@@ -299,12 +320,50 @@ class ActionExecutor(
                         chars.get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
                     } ?: return ActionExecutionResult(false, "No camera with flashlight hardware found on this device.", VerificationStatus.NOT_SUPPORTED)
 
-                    cameraManager.setTorchMode(torchCameraId, turnOn)
-                    val stateWord = if (turnOn) "ON" else "OFF"
+                    val confirmedState = CompletableDeferred<Boolean>()
+                    val torchCallback = object : android.hardware.camera2.CameraManager.TorchCallback() {
+                        override fun onTorchModeChanged(cameraId: String, enabled: Boolean) {
+                            if (cameraId == torchCameraId && enabled == turnOn && !confirmedState.isCompleted) {
+                                confirmedState.complete(enabled)
+                            }
+                        }
+                    }
+                    var callbackRegistered = false
+                    try {
+                        cameraManager.registerTorchCallback(torchCallback, Handler(Looper.getMainLooper()))
+                        callbackRegistered = true
+                    } catch (_: Exception) {
+                        callbackRegistered = false
+                    }
+
+                    try {
+                        cameraManager.setTorchMode(torchCameraId, turnOn)
+                        val observedCallback = if (callbackRegistered) {
+                            withTimeoutOrNull(250L) { confirmedState.await() }
+                        } else null
+                        val stateWord = if (turnOn) "ON" else "OFF"
+                        val verificationSuffix = if (observedCallback == turnOn) {
+                            " [TorchCallback verified]"
+                        } else {
+                            ""
+                        }
+                        ActionExecutionResult(
+                            true,
+                            "Flashlight turned $stateWord (cameraId=$torchCameraId).$verificationSuffix",
+                            VerificationStatus.VERIFIED
+                        )
+                    } finally {
+                        if (callbackRegistered) {
+                            try {
+                                cameraManager.unregisterTorchCallback(torchCallback)
+                            } catch (_: Exception) {}
+                        }
+                    }
+                } catch (e: SecurityException) {
                     ActionExecutionResult(
-                        true,
-                        "Flashlight turned $stateWord (cameraId=$torchCameraId).",
-                        VerificationStatus.VERIFIED
+                        false,
+                        "Permission or camera access denied while toggling flashlight: ${e.localizedMessage ?: "SecurityException"}",
+                        VerificationStatus.REQUIRES_PERMISSION
                     )
                 } catch (e: Exception) {
                     ActionExecutionResult(
@@ -315,13 +374,98 @@ class ActionExecutor(
                 }
             }
 
+            ActionType.CONTROL_VOLUME -> {
+                val operation = (action.parameters["operation"] ?: action.target ?: "UP").trim().uppercase()
+                val streamName = (action.parameters["stream"] ?: "media").trim().lowercase()
+                val streamType = when (streamName) {
+                    "ring", "ringer" -> AudioManager.STREAM_RING
+                    "alarm" -> AudioManager.STREAM_ALARM
+                    "notification" -> AudioManager.STREAM_NOTIFICATION
+                    "call", "voice" -> AudioManager.STREAM_VOICE_CALL
+                    else -> AudioManager.STREAM_MUSIC
+                }
+                val levelPercent = action.parameters["levelPercent"]?.toIntOrNull()?.coerceIn(0, 100)
+
+                return try {
+                    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+                        ?: return ActionExecutionResult(false, "AudioManager service is unavailable on this device.", VerificationStatus.NOT_SUPPORTED)
+
+                    val maxVol = audioManager.getStreamMaxVolume(streamType).coerceAtLeast(1)
+                    val beforeVol = audioManager.getStreamVolume(streamType)
+                    val beforePct = ((beforeVol * 100f) / maxVol).toInt()
+
+                    when (operation) {
+                        "STATUS", "GET" -> {
+                            return ActionExecutionResult(
+                                true,
+                                "Current $streamName volume is $beforePct% ($beforeVol/$maxVol).",
+                                VerificationStatus.VERIFIED
+                            )
+                        }
+                        "UP", "INCREASE", "RAISE" -> {
+                            val step = (maxVol / 5).coerceAtLeast(1)
+                            val targetVol = (beforeVol + step).coerceAtMost(maxVol)
+                            audioManager.setStreamVolume(streamType, targetVol, AudioManager.FLAG_SHOW_UI)
+                        }
+                        "DOWN", "DECREASE", "LOWER" -> {
+                            val step = (maxVol / 5).coerceAtLeast(1)
+                            val targetVol = (beforeVol - step).coerceAtLeast(0)
+                            audioManager.setStreamVolume(streamType, targetVol, AudioManager.FLAG_SHOW_UI)
+                        }
+                        "MUTE" -> {
+                            audioManager.setStreamVolume(streamType, 0, AudioManager.FLAG_SHOW_UI)
+                        }
+                        "UNMUTE" -> {
+                            val restoreVol = if (beforeVol == 0) (maxVol / 2).coerceAtLeast(1) else beforeVol
+                            audioManager.setStreamVolume(streamType, restoreVol, AudioManager.FLAG_SHOW_UI)
+                        }
+                        "SET" -> {
+                            val pct = levelPercent ?: 50
+                            val targetVol = kotlin.math.round((pct / 100.0) * maxVol).toInt().coerceIn(0, maxVol)
+                            audioManager.setStreamVolume(streamType, targetVol, AudioManager.FLAG_SHOW_UI)
+                        }
+                        else -> {
+                            audioManager.adjustStreamVolume(streamType, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+                        }
+                    }
+
+                    val afterVol = audioManager.getStreamVolume(streamType)
+                    val afterPct = ((afterVol * 100f) / maxVol).toInt()
+                    ActionExecutionResult(
+                        true,
+                        "Adjusted $streamName volume ($operation): $beforePct% -> $afterPct% ($afterVol/$maxVol).",
+                        VerificationStatus.VERIFIED
+                    )
+                } catch (e: SecurityException) {
+                    ActionExecutionResult(
+                        false,
+                        "Android blocked volume change for $streamName (Do Not Disturb access may be required): ${e.localizedMessage}",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                } catch (e: Exception) {
+                    ActionExecutionResult(
+                        false,
+                        "Failed to adjust $streamName volume: ${e.localizedMessage ?: e.javaClass.simpleName}",
+                        VerificationStatus.FAILED
+                    )
+                }
+            }
+
             // 2. Screen & Interaction Tools
             ActionType.READ_SCREEN, ActionType.INSPECT_ACCESSIBILITY_TREE -> {
-                val summary = screenIntelligenceManager.describeScreenContent()
-                if (summary.startsWith("Screen reading requires") || summary.startsWith("I couldn't read")) {
-                    ActionExecutionResult(false, summary, VerificationStatus.REQUIRES_PERMISSION)
+                val question = action.parameters["prompt"]?.takeIf { it.isNotBlank() }
+                if (action.actionType == ActionType.READ_SCREEN &&
+                    !question.isNullOrBlank() &&
+                    (NayroAccessibilityService.isConnected() || com.example.core.screen.ScreenRecordingController.hasActiveProjection())
+                ) {
+                    universalScreenOperator.describeOrAnswerScreen(question)
                 } else {
-                    ActionExecutionResult(true, summary, VerificationStatus.VERIFIED)
+                    val summary = screenIntelligenceManager.describeScreenContent()
+                    if (summary.startsWith("Screen reading requires") || summary.startsWith("I couldn't read")) {
+                        ActionExecutionResult(false, summary, VerificationStatus.REQUIRES_PERMISSION)
+                    } else {
+                        ActionExecutionResult(true, summary, VerificationStatus.VERIFIED)
+                    }
                 }
             }
 
@@ -359,20 +503,47 @@ class ActionExecutor(
                 if (clicked) {
                     ActionExecutionResult(true, "Clicked on element matching '${targetText.ifBlank { viewId }}'.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Could not find clickable element matching '${targetText.ifBlank { viewId }}' on screen.", VerificationStatus.FAILED)
+                    val goalFallback = action.parameters["goal"]?.takeIf { it.isNotBlank() } ?: "Click $targetText"
+                    val hasVisionOrA11y = NayroAccessibilityService.isConnected() || com.example.core.screen.ScreenRecordingController.hasActiveProjection()
+                    val hasAiProvider = try { providerManager.activeProvider.value?.hasKeySaved == true } catch (_: Exception) { false }
+                    if (hasVisionOrA11y && hasAiProvider) {
+                        val visualOutcome = universalScreenOperator.operateGoal(goalFallback, maxSteps = 2)
+                        ActionExecutionResult(
+                            visualOutcome.isSuccess,
+                            visualOutcome.finalMessage,
+                            visualOutcome.verificationStatus
+                        )
+                    } else {
+                        ActionExecutionResult(false, "Could not find clickable element matching '${targetText.ifBlank { viewId }}' on screen.", VerificationStatus.FAILED)
+                    }
                 }
             }
 
             ActionType.LONG_PRESS_ELEMENT -> {
                 val targetText = action.target ?: action.parameters["target"] ?: ""
-                if (targetText.isBlank()) {
-                    return ActionExecutionResult(false, "Missing target UI element to long-press.", VerificationStatus.FAILED)
+                val x = action.parameters["x"]?.toFloatOrNull()
+                val y = action.parameters["y"]?.toFloatOrNull()
+                if (targetText.isBlank() && (x == null || y == null)) {
+                    return ActionExecutionResult(false, "Missing target UI element or coordinates to long-press.", VerificationStatus.FAILED)
                 }
-                val pressed = AccessibilityActionController.performLongClick(targetText = targetText)
+                var pressed = if (targetText.isNotBlank()) {
+                    AccessibilityActionController.performLongClick(targetText = targetText)
+                } else false
+                if (!pressed && targetText.isNotBlank()) {
+                    val bounds = AccessibilityActionController.findTargetBoundsInScreen(targetText = targetText)
+                    if (bounds != null) {
+                        pressed = NayroAccessibilityService.instance
+                            ?.dispatchLongPressGesture(bounds.exactCenterX(), bounds.exactCenterY())
+                            ?.first == true
+                    }
+                }
+                if (!pressed && x != null && y != null) {
+                    pressed = NayroAccessibilityService.instance?.dispatchLongPressGesture(x, y)?.first == true
+                }
                 if (pressed) {
-                    ActionExecutionResult(true, "Long-pressed element matching '$targetText'.", VerificationStatus.VERIFIED)
+                    ActionExecutionResult(true, "Long-pressed target '${targetText.ifBlank { "($x, $y)" }}'.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "Could not find element matching '$targetText' to long-press.", VerificationStatus.FAILED)
+                    ActionExecutionResult(false, "Could not find element matching '${targetText.ifBlank { "($x, $y)" }}' to long-press.", VerificationStatus.FAILED)
                 }
             }
 
@@ -401,7 +572,13 @@ class ActionExecutor(
                 if (scrolled) {
                     ActionExecutionResult(true, "Scrolled screen forward.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "No scrollable container found on screen.", VerificationStatus.FAILED)
+                    val svc = NayroAccessibilityService.instance
+                    val gestureResult = svc?.dispatchDirectionalScroll("down")
+                    if (gestureResult?.first == true) {
+                        ActionExecutionResult(true, "Scrolled screen down via touch gesture.", VerificationStatus.VERIFIED)
+                    } else {
+                        ActionExecutionResult(false, "No scrollable container found on screen.", VerificationStatus.FAILED)
+                    }
                 }
             }
 
@@ -410,7 +587,13 @@ class ActionExecutor(
                 if (scrolled) {
                     ActionExecutionResult(true, "Scrolled screen backward.", VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(false, "No scrollable container found on screen.", VerificationStatus.FAILED)
+                    val svc = NayroAccessibilityService.instance
+                    val gestureResult = svc?.dispatchDirectionalScroll("up")
+                    if (gestureResult?.first == true) {
+                        ActionExecutionResult(true, "Scrolled screen up via touch gesture.", VerificationStatus.VERIFIED)
+                    } else {
+                        ActionExecutionResult(false, "No scrollable container found on screen.", VerificationStatus.FAILED)
+                    }
                 }
             }
 
@@ -441,21 +624,111 @@ class ActionExecutor(
                 }
             }
 
+            ActionType.NAVIGATE_RECENTS -> {
+                val recentsOk = AccessibilityActionController.performGlobalRecents()
+                if (recentsOk) {
+                    ActionExecutionResult(true, "Opened Recent Apps switcher.", VerificationStatus.VERIFIED)
+                } else {
+                    ActionExecutionResult(
+                        false,
+                        "Cannot open Recent Apps: NAYRO Accessibility Service is not connected.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                }
+            }
+
+            ActionType.DRAG_SCREEN -> {
+                val service = NayroAccessibilityService.instance
+                    ?: return ActionExecutionResult(
+                        false,
+                        "Cannot drag on screen: NAYRO Accessibility Service is not connected.",
+                        VerificationStatus.REQUIRES_PERMISSION
+                    )
+                val x1 = action.parameters["startX"]?.toFloatOrNull()
+                val y1 = action.parameters["startY"]?.toFloatOrNull()
+                val x2 = action.parameters["endX"]?.toFloatOrNull()
+                val y2 = action.parameters["endY"]?.toFloatOrNull()
+                val durationMs = action.parameters["durationMs"]?.toLongOrNull() ?: 500L
+                if (x1 == null || y1 == null || x2 == null || y2 == null) {
+                    return ActionExecutionResult(
+                        false,
+                        "Invalid drag coordinates: startX, startY, endX, and endY are required.",
+                        VerificationStatus.FAILED
+                    )
+                }
+                val (ok, msg) = service.dispatchDragGesture(x1, y1, x2, y2, holdMs = 350L, dragDurationMs = durationMs)
+                ActionExecutionResult(ok, msg, if (ok) VerificationStatus.VERIFIED else VerificationStatus.FAILED)
+            }
+
+            ActionType.UNIVERSAL_SCREEN_OPERATE -> {
+                val goal = (action.parameters["goal"] ?: action.target ?: "").trim()
+                if (goal.isBlank()) {
+                    return ActionExecutionResult(false, "Missing on-screen goal for Universal Screen Operator.", VerificationStatus.FAILED)
+                }
+                val maxSteps = action.parameters["maxSteps"]?.toIntOrNull()?.coerceIn(1, 10)
+                    ?: com.example.core.screen.UniversalScreenOperator.DEFAULT_MAX_STEPS
+                val outcome = universalScreenOperator.operateGoal(rawGoal = goal, maxSteps = maxSteps)
+                ActionExecutionResult(
+                    isSuccess = outcome.isSuccess,
+                    outputMessage = outcome.finalMessage,
+                    status = outcome.verificationStatus
+                )
+            }
+
             ActionType.CONTROL_MEDIA -> {
                 val op = action.parameters["operation"] ?: action.target ?: "PLAY_QUERY"
-                val query = action.parameters["query"] ?: action.target
+                val rawQuery = action.parameters["query"] ?: action.target
                 val artist = action.parameters["artist"]
                 val genre = action.parameters["genre"] ?: action.parameters["mood"]
                 val app = action.parameters["app"]
                 val memories = memoryManager.getCachedMemories()
-                mediaControlManager.executeMediaCommand(
+
+                // For mood-based generic requests, check semantic memory for the user's favourite artist/song
+                val semanticMusicMatch = if (op.equals("PLAY_BY_GENRE_OR_MOOD", ignoreCase = true) ||
+                    op.equals("PLAY_FAVOURITE_SONG", ignoreCase = true)
+                ) {
+                    memoryManager.semanticEngine.semanticSearch(
+                        query = "${rawQuery.orEmpty()} favourite song music artist singer mood",
+                        additionalRoomMemories = memories,
+                        limit = 2,
+                        minScore = 0.12f
+                    ).firstOrNull { hit ->
+                        val k = hit.record.key.lowercase()
+                        val c = hit.record.content.lowercase()
+                        k.contains("song") || k.contains("music") || k.contains("artist") || k.contains("singer") ||
+                            c.contains("song") || c.contains("gaana") || c.contains("arijit") || c.contains("music")
+                    }
+                } else {
+                    null
+                }
+
+                val effectiveQuery = when {
+                    semanticMusicMatch != null && (rawQuery.isNullOrBlank() || rawQuery.contains("feel good", ignoreCase = true) || rawQuery.contains("favourite", ignoreCase = true)) ->
+                        semanticMusicMatch.record.content
+                    else -> rawQuery
+                }
+
+                val mediaRes = mediaControlManager.executeMediaCommand(
                     operationStr = op,
-                    query = query,
+                    query = effectiveQuery,
                     artist = artist,
                     genreOrMood = genre,
                     targetApp = app,
                     savedMemories = memories
                 )
+
+                // Record music mood preference honestly without fabricating playback verification
+                if (op.equals("PLAY_BY_GENRE_OR_MOOD", ignoreCase = true) && !effectiveQuery.isNullOrBlank()) {
+                    memoryManager.semanticEngine.upsertRecord(
+                        tier = com.example.core.memory.SemanticMemoryTier.SHORT_TERM,
+                        category = "MUSIC_MOOD_CONTEXT",
+                        key = "recent_mood_music",
+                        content = "Requested mood music: $effectiveQuery",
+                        tags = setOf("music", "mood", "youtube")
+                    )
+                }
+
+                mediaRes
             }
 
             ActionType.TAKE_SCREENSHOT -> {
@@ -708,6 +981,45 @@ class ActionExecutor(
                 }
                 val summary = buildExtractiveSummary("Web Content", sourceText)
                 ActionExecutionResult(true, summary, VerificationStatus.VERIFIED)
+            }
+
+            ActionType.BROWSER_OPEN_URL -> {
+                val rawUrl = (action.parameters["url"] ?: action.target).orEmpty().trim()
+                val outcome = browserManager.openInChrome(rawUrl)
+                ActionExecutionResult(outcome.isSuccess, outcome.message, outcome.status)
+            }
+
+            ActionType.BROWSER_COMPARE_SOURCES -> {
+                val topic = (action.parameters["topic"] ?: action.target).orEmpty().trim()
+                val urls = action.parameters["urls"]
+                    ?.split(",")
+                    ?.map { it.trim() }
+                    ?.filter { it.isNotBlank() }
+                    .orEmpty()
+                if (topic.isBlank() && urls.isEmpty()) {
+                    return ActionExecutionResult(false, "Missing topic or URLs to compare.", VerificationStatus.FAILED)
+                }
+                val res = browserManager.compareSources(
+                    topic = topic.ifBlank { "Selected web sources" },
+                    urls = urls,
+                    providerManager = providerManager
+                )
+                ActionExecutionResult(res.isSuccess, res.comparisonSummary, res.status)
+            }
+
+            ActionType.BROWSER_FILL_FORM -> {
+                val field = (action.parameters["field"] ?: action.target).orEmpty().trim()
+                val value = (action.parameters["value"] ?: action.parameters["text"]).orEmpty().trim()
+                val submitBtn = action.parameters["submitButton"]?.trim()?.takeIf { it.isNotBlank() }
+                val outcome = browserManager.fillWebFormViaAccessibility(field, value, submitBtn)
+                ActionExecutionResult(outcome.isSuccess, outcome.message, outcome.status)
+            }
+
+            ActionType.BROWSER_DOWNLOAD_FILE -> {
+                val rawUrl = (action.parameters["url"] ?: action.target).orEmpty().trim()
+                val fileName = action.parameters["fileName"]?.trim()?.takeIf { it.isNotBlank() }
+                val outcome = browserManager.downloadPermittedFile(rawUrl, fileName)
+                ActionExecutionResult(outcome.isSuccess, outcome.message, outcome.status)
             }
 
             // 6. Coding Agent Tools (BUG 11 Fixed)
@@ -1104,6 +1416,7 @@ class ActionExecutor(
                 val analysis = conversationalEngine.analyzeUserMessage(prompt)
                 conversationalEngine.recordTurn("user", prompt, analysis.language)
 
+                providerManager.refreshActiveProvider()
                 val activeProvider = providerManager.activeProvider.value
                 if (activeProvider == null || !activeProvider.hasKeySaved) {
                     val localReply = conversationalEngine.buildLocalConversationalReply(
@@ -1117,11 +1430,12 @@ class ActionExecutor(
                     }
                     return ActionExecutionResult(
                         false,
-                        "No AI Provider is configured yet. Please open the Providers tab and enter your Gemini, Grok, OpenRouter, OpenAI, or Local Model settings.",
+                        "No online AI Provider is configured yet. Please open Settings and enter your Gemini, Grok, OpenRouter, OpenAI, or DeepSeek API key.",
                         VerificationStatus.FAILED
                     )
                 }
 
+                val adaptiveGuidance = action.parameters["adaptiveGuidance"].orEmpty()
                 val systemPrompt = buildString {
                     append(
                         conversationalEngine.buildConversationalSystemPrompt(
@@ -1131,6 +1445,25 @@ class ActionExecutor(
                         )
                     )
                     append("Tone preference: $preferredTone.\n")
+                    if (identityProfile != null) {
+                        if (identityProfile.userAddress.isNotBlank()) {
+                            append("Address the user naturally as '${identityProfile.userAddress}'.\n")
+                        }
+                        append("Personality mode: ${identityProfile.personalityMode.displayName}")
+                        if (identityProfile.personalityMode == com.example.core.identity.PersonalityMode.CUSTOM &&
+                            identityProfile.customPersonalityNote.isNotBlank()
+                        ) {
+                            append(" (${identityProfile.customPersonalityNote})")
+                        }
+                        append(".\n")
+                        append("Response length preference: ${identityProfile.responseLength.displayName}.\n")
+                        if (identityProfile.conversationLanguageMode != com.example.core.identity.ConversationLanguageMode.AUTO) {
+                            append("Preferred conversation language: ${identityProfile.conversationLanguageMode.displayName}.\n")
+                        }
+                    }
+                    if (adaptiveGuidance.isNotBlank()) {
+                        append(adaptiveGuidance).append("\n")
+                    }
                     if (openEndedContext.isNotBlank()) {
                         append(openEndedContext).append("\n")
                     } else if (conversationHistory.isNotBlank()) {
@@ -1144,8 +1477,10 @@ class ActionExecutor(
                     .dropLastWhile { it.role == "user" && it.content == prompt.trim() }
                     .map { com.example.core.provider.model.AIChatMessage(role = it.role, content = it.content) }
 
-                when (val res = providerManager.sendRequest(
+                val routingHint = providerManager.inferRoutingHint(prompt, hasImages = false)
+                when (val res = providerManager.sendTaskAwareRequest(
                     userPrompt = prompt,
+                    routingHint = routingHint,
                     history = recentTurns,
                     systemPrompt = systemPrompt
                 )) {
@@ -1158,21 +1493,17 @@ class ActionExecutor(
                         )
                     }
                     is AIResult.Error -> {
-                        val fallbackReply = conversationalEngine.buildLocalConversationalReply(
-                            assistantName = activeAssistantName,
-                            analysis = analysis,
-                            userMessage = prompt
-                        )
-                        if (fallbackReply != null) {
-                            conversationalEngine.recordTurn("assistant", fallbackReply, analysis.language)
-                            ActionExecutionResult(true, fallbackReply, VerificationStatus.VERIFIED)
+                        // Never pretend to be online when cloud AI API connectivity fails!
+                        val offlineNotice = if (res.code == 0) {
+                            "Offline / Network Error: Could not reach ${activeProvider.name} (${res.message}). Check Wi-Fi/Mobile Data or configure a fallback provider in Settings."
                         } else {
-                            ActionExecutionResult(
-                                false,
-                                "AI Provider error (${res.code}): ${res.message}",
-                                VerificationStatus.FAILED
-                            )
+                            "Online AI Provider Error (${activeProvider.name}, HTTP ${res.code}): ${res.message}"
                         }
+                        ActionExecutionResult(
+                            false,
+                            offlineNotice,
+                            VerificationStatus.FAILED
+                        )
                     }
                 }
             }
@@ -1224,11 +1555,11 @@ class ActionExecutor(
                     )
                 val direction = (action.target ?: action.parameters["direction"] ?: "up").trim().lowercase()
                 val durationMs = action.parameters["durationMs"]?.toLongOrNull() ?: 300L
-                val (sx, sy, ex, ey) = when (direction) {
-                    "up" -> listOf(540f, 1600f, 540f, 500f)
-                    "down" -> listOf(540f, 500f, 540f, 1600f)
-                    "left" -> listOf(900f, 1000f, 180f, 1000f)
-                    "right" -> listOf(180f, 1000f, 900f, 1000f)
+                val (ok, msg) = when (direction) {
+                    "up" -> service.dispatchDirectionalScroll("down", durationMs = durationMs)
+                    "down" -> service.dispatchDirectionalScroll("up", durationMs = durationMs)
+                    "left" -> service.dispatchDirectionalScroll("left", durationMs = durationMs)
+                    "right" -> service.dispatchDirectionalScroll("right", durationMs = durationMs)
                     else -> {
                         val x1 = action.parameters["startX"]?.toFloatOrNull()
                         val y1 = action.parameters["startY"]?.toFloatOrNull()
@@ -1241,16 +1572,20 @@ class ActionExecutor(
                                 VerificationStatus.FAILED
                             )
                         }
-                        listOf(x1, y1, x2, y2)
+                        service.dispatchSwipeGesture(x1, y1, x2, y2, durationMs)
                     }
                 }
-                val (ok, msg) = service.dispatchSwipeGesture(sx, sy, ex, ey, durationMs)
                 ActionExecutionResult(ok, msg, if (ok) VerificationStatus.VERIFIED else VerificationStatus.FAILED)
             }
 
             ActionType.ANALYZE_IMAGE_VISION -> {
                 val prompt = (action.parameters["prompt"] ?: action.target ?: "Describe what is visible on the screen.").trim()
                 val filename = action.parameters["filename"]?.trim()
+                if (filename.isNullOrBlank() &&
+                    (NayroAccessibilityService.isConnected() || com.example.core.screen.ScreenRecordingController.hasActiveProjection())
+                ) {
+                    return universalScreenOperator.describeOrAnswerScreen(prompt)
+                }
                 val cachedVisualObs = ScreenIntelligenceManager.lastVisualObservation
                 val contextText = if (!filename.isNullOrBlank()) {
                     when (val res = workspaceManager.readFileResult(filename)) {
@@ -1259,14 +1594,12 @@ class ActionExecutor(
                             return mapWorkspaceResult(res)
                         }
                     }
-                } else if (NayroAccessibilityService.isConnected()) {
-                    screenIntelligenceManager.describeScreenContent()
                 } else if (cachedVisualObs != null) {
                     "Visual Observation (${cachedVisualObs.detectedRegionsSummary}): ${cachedVisualObs.groundedTextElements.joinToString(", ")}"
                 } else {
                     return ActionExecutionResult(
                         false,
-                        "Cannot analyze screen/image: neither a workspace filename was provided nor is Accessibility Service connected.",
+                        "Cannot analyze screen/image: neither a workspace filename was provided nor is Accessibility Service or MediaProjection active.",
                         VerificationStatus.REQUIRES_PERMISSION
                     )
                 }
@@ -1628,6 +1961,88 @@ class ActionExecutor(
                         status = VerificationStatus.VERIFIED
                     )
                 }
+            }
+
+            ActionType.EXECUTE_SANDBOXED_CODE -> {
+                val code = action.parameters["code"] ?: action.target.orEmpty()
+                val language = action.parameters["language"] ?: "python"
+                val sandboxRes = com.example.core.agent.tools.SandboxedScriptRunner.execute(
+                    code = code,
+                    language = language
+                )
+                if (sandboxRes.isSuccess) {
+                    val out = buildString {
+                        append("Sandboxed $language execution succeeded (${sandboxRes.stepsExecuted} steps).")
+                        if (sandboxRes.stdout.isNotBlank()) {
+                            append("\nOutput:\n").append(sandboxRes.stdout)
+                        } else if (sandboxRes.variables.isNotEmpty()) {
+                            append("\nVariables: ").append(sandboxRes.variables.entries.joinToString(", ") { "${it.key}=${it.value}" })
+                        }
+                    }
+                    ActionExecutionResult(true, out, VerificationStatus.VERIFIED)
+                } else {
+                    ActionExecutionResult(
+                        false,
+                        sandboxRes.errorMessage ?: "Sandboxed script execution failed.",
+                        VerificationStatus.FAILED
+                    )
+                }
+            }
+
+            ActionType.SCAFFOLD_DEV_PROJECT -> {
+                val projectName = action.parameters["projectName"] ?: action.target ?: "nayro_project"
+                val template = action.parameters["template"] ?: "python"
+                val res = com.example.core.agent.tools.DevProjectToolkit.scaffoldProject(
+                    workspaceManager = workspaceManager,
+                    projectName = projectName,
+                    template = template
+                )
+                mapWorkspaceResult(res)
+            }
+
+            ActionType.ANALYZE_DATA_FILE -> {
+                val filename = action.parameters["filename"] ?: action.target
+                val inlineData = action.parameters["data"]
+                val filterExpr = action.parameters["filter"]
+                val saveReportAs = action.parameters["saveReportAs"]
+                val analysis = when {
+                    !inlineData.isNullOrBlank() -> com.example.core.agent.tools.StructuredDataToolkit.analyzeText(
+                        rawText = inlineData,
+                        formatHint = action.parameters["format"] ?: "auto",
+                        filterExpr = filterExpr
+                    )
+                    !filename.isNullOrBlank() -> com.example.core.agent.tools.StructuredDataToolkit.analyzeWorkspaceFile(
+                        workspaceManager = workspaceManager,
+                        relativePath = filename,
+                        filterExpr = filterExpr
+                    )
+                    else -> com.example.core.agent.tools.DataAnalysisResult(
+                        isSuccess = false,
+                        format = "unknown",
+                        rowCount = 0,
+                        columns = emptyList(),
+                        stats = emptyList(),
+                        reportMarkdown = "",
+                        errorMessage = "Provide either 'filename' (workspace CSV/JSON file) or inline 'data' to analyze."
+                    )
+                }
+                if (analysis.isSuccess) {
+                    if (!saveReportAs.isNullOrBlank()) {
+                        workspaceManager.writeFileResult(saveReportAs, analysis.reportMarkdown)
+                    }
+                    ActionExecutionResult(true, analysis.reportMarkdown, VerificationStatus.VERIFIED)
+                } else {
+                    ActionExecutionResult(
+                        false,
+                        analysis.errorMessage ?: "Structured data analysis failed.",
+                        VerificationStatus.FAILED
+                    )
+                }
+            }
+
+            ActionType.EXECUTE_DYNAMIC_PLUGIN -> {
+                val pluginId = action.parameters["pluginId"] ?: action.target.orEmpty()
+                ToolRegistryManager.executePlugin(pluginId, action.parameters)
             }
         }
     }

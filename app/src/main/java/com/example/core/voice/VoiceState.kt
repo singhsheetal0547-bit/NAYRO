@@ -40,6 +40,8 @@ data class VoiceConfiguration(
     val sensitivity: Float = 0.5f,
     val isTtsEnabled: Boolean = true,
     val speechRate: Float = 1.0f,
+    val voicePitch: Float = 1.0f,
+    val voiceGender: com.example.core.identity.VoiceGender = com.example.core.identity.VoiceGender.SYSTEM_DEFAULT,
     val languageTag: String = "en-IN",
     val isContinuousConversationEnabled: Boolean = true,
     val followUpTimeoutMs: Long = 8_000L,

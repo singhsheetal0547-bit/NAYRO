@@ -71,7 +71,8 @@ class AgentBrain(
     private val actionExecutor: ActionExecutor,
     private val workspaceManager: WorkspaceManager,
     private val skillManager: SkillManager,
-    private val subAgentManager: SubAgentManager
+    private val subAgentManager: SubAgentManager,
+    private val selfImprovementEngine: SelfImprovementEngine? = null
 ) {
 
     companion object {
@@ -248,18 +249,36 @@ class AgentBrain(
             return initialPlan
         }
 
+        providerManager.refreshActiveProvider()
         val activeProvider = try { providerManager.activeProvider.value } catch (_: Exception) { null }
-        if (activeProvider != null && activeProvider.hasKeySaved) {
+        val lower = userPrompt.lowercase()
+        val likelyNeedsToolDecomposition = listOf(
+            "open ", "launch ", "click ", "tap ", "scroll ", "swipe ", "screenshot", "record",
+            "call ", "dial ", "sms", "whatsapp", "message ", "email ", "mail ",
+            "settings", "wifi", "bluetooth", "volume", "flashlight", "torch", "battery", "storage",
+            "file", "folder", "pdf", "document", "calendar", "meeting", "alarm", "remind",
+            "notification", "youtube", "spotify", "play ", "pause", "next song", "kholo", "chalao", "bhejo", "badhao", "kam karo"
+        ).any { lower.contains(it) }
+
+        if (activeProvider != null && activeProvider.hasKeySaved && likelyNeedsToolDecomposition) {
             val activeName = com.example.core.identity.AssistantIdentityStore.sharedInstance?.getDisplayName()
                 ?: com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME
+            val learnedGuidance = selfImprovementEngine?.buildAdaptivePlanningGuidance(userPrompt).orEmpty()
             val systemPrompt = buildString {
                 append("You are the NAYRO Agent Planner ($activeName). ")
                 append("If the user is asking to perform device/app actions, decompose the goal into a JSON array of tool calls using ONLY the registered ActionTypes below. ")
                 append("If it is a general knowledge question, output a single QUERY_LLM action.\n")
+                if (learnedGuidance.isNotBlank()) {
+                    append(learnedGuidance).append("\n")
+                }
                 append("Output ONLY valid JSON array: [{\"actionType\": \"...\", \"target\": \"...\", \"parameters\": {...}}]\n")
                 append(ToolRegistryManager.generateLlmToolPromptSummary())
             }
-            val aiRes = providerManager.sendRequest(userPrompt = userPrompt, systemPrompt = systemPrompt)
+            val aiRes = providerManager.sendTaskAwareRequest(
+                userPrompt = userPrompt,
+                routingHint = com.example.core.provider.TaskRoutingHint.TOOL_PLANNING,
+                systemPrompt = systemPrompt
+            )
             if (aiRes is AIResult.Success) {
                 val raw = aiRes.response.content.trim()
                 val startBracket = raw.indexOf('[')

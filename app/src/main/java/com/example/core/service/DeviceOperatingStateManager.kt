@@ -97,6 +97,7 @@ class DeviceOperatingStateManager(private val context: Context?) {
             ActionType.GET_STORAGE_INFO,
             ActionType.CALCULATE_LOCAL,
             ActionType.TOGGLE_FLASHLIGHT,
+            ActionType.CONTROL_VOLUME,
             ActionType.SCHEDULE_ALARM,
             ActionType.CREATE_REMINDER,
             ActionType.QUERY_LLM

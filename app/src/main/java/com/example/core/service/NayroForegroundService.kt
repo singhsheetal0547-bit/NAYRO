@@ -39,6 +39,8 @@ class NayroForegroundService : Service() {
         const val ACTION_STOP = "com.example.nayro.action.STOP"
         const val ACTION_PAUSE = "com.example.nayro.action.PAUSE"
         const val ACTION_RESUME = "com.example.nayro.action.RESUME"
+        const val ACTION_START_VOICE_CAPTURE = "com.example.nayro.action.START_VOICE_CAPTURE"
+        const val ACTION_STOP_VOICE_CAPTURE = "com.example.nayro.action.STOP_VOICE_CAPTURE"
         const val ACTION_EXECUTE_BACKGROUND_TASK = "com.example.nayro.action.EXECUTE_BACKGROUND_TASK"
 
         const val EXTRA_PAUSE_DURATION_MINUTES = "com.example.nayro.extra.PAUSE_DURATION_MINUTES"
@@ -227,6 +229,37 @@ class NayroForegroundService : Service() {
             }
         }
 
+        fun startVoiceCapture(context: Context) {
+            val intent = Intent(context, NayroForegroundService::class.java).apply {
+                action = ACTION_START_VOICE_CAPTURE
+            }
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: SecurityException) {
+                ServiceStateRepository.updateForegroundStatus(
+                    ServiceLifecycleState.PERMISSION_DENIED,
+                    "Microphone permission required to start voice capture: ${e.localizedMessage ?: "denied"}"
+                )
+            } catch (e: Exception) {
+                ServiceStateRepository.appendActivityLog(
+                    "Voice capture trigger failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                )
+            }
+        }
+
+        fun stopVoiceCapture(context: Context) {
+            val intent = Intent(context, NayroForegroundService::class.java).apply {
+                action = ACTION_STOP_VOICE_CAPTURE
+            }
+            try {
+                context.startService(intent)
+            } catch (_: Exception) {}
+        }
+
         fun enqueueBackgroundTask(context: Context?, userInstruction: String) {
             val clean = userInstruction.trim()
             if (clean.isEmpty()) return
@@ -246,6 +279,66 @@ class NayroForegroundService : Service() {
                 ServiceStateRepository.appendActivityLog("Background task start failed: ${e.localizedMessage ?: e.javaClass.simpleName}")
             }
         }
+    }
+
+    inner class LocalBinder : android.os.Binder() {
+        fun getService(): NayroForegroundService = this@NayroForegroundService
+    }
+
+    private val localBinder = LocalBinder()
+
+    fun isServiceRunningInForeground(): Boolean = isRunningInForeground
+
+    fun pauseAgent(durationMinutes: Int? = null, reason: String = "Paused by user") {
+        handlePauseCommand(durationMinutes, reason)
+    }
+
+    fun resumeAgent() {
+        handleResumeCommand()
+    }
+
+    /**
+     * Triggers live Android Speech-to-Text capture inside the running agent service after
+     * verifying [android.Manifest.permission.RECORD_AUDIO]. Recognized speech flows directly
+     * into the attached UI or service [com.example.core.agent.AgentRuntime] listener.
+     */
+    fun triggerSpeechToTextCapture(): Boolean {
+        if (!hasRecordAudioPermission()) {
+            val msg = "Microphone permission (RECORD_AUDIO) is required before starting AI Speech-to-Text."
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.PERMISSION_DENIED, msg)
+            return false
+        }
+        return try {
+            val app = NayroApplication.instance
+            if (ServiceStateRepository.isBackgroundAgentPaused.value) {
+                ServiceStateRepository.resumeBackgroundAgent()
+            }
+            if (!app.voiceManager.hasActiveServiceListener()) {
+                attachBackgroundVoiceExecutionListener(app, resolveAssistantName())
+            }
+            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.LISTENING)
+            if (app.voiceManager.voiceState.value == com.example.core.voice.VoiceState.SPEAKING) {
+                app.voiceManager.interruptSpeakingAndListen()
+            } else {
+                app.voiceManager.startListening()
+            }
+            true
+        } catch (e: Exception) {
+            ServiceStateRepository.appendActivityLog(
+                "Service Speech-to-Text start failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
+            )
+            false
+        }
+    }
+
+    fun stopSpeechToTextCapture() {
+        try {
+            val app = NayroApplication.instance
+            app.voiceManager.stopListening()
+            if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
+            }
+        } catch (_: Exception) {}
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -385,6 +478,18 @@ class NayroForegroundService : Service() {
                 handleResumeCommand()
                 return START_STICKY
             }
+            ACTION_START_VOICE_CAPTURE -> {
+                if (isRunningInForeground) {
+                    triggerSpeechToTextCapture()
+                    return START_STICKY
+                }
+                // If service wasn't yet in foreground, fall through to startForeground safely first,
+                // then trigger Speech-to-Text once promoted.
+            }
+            ACTION_STOP_VOICE_CAPTURE -> {
+                stopSpeechToTextCapture()
+                return START_STICKY
+            }
             ACTION_EXECUTE_BACKGROUND_TASK -> {
                 val instruction = intent.getStringExtra(EXTRA_USER_INSTRUCTION)?.trim().orEmpty()
                 if (instruction.isNotEmpty() && !ServiceStateRepository.isBackgroundAgentPaused.value) {
@@ -472,6 +577,10 @@ class NayroForegroundService : Service() {
 
             // Independently verify microphone permission, wake templates, and AudioRecord capture (P0-3)
             setupBackgroundVoicePipeline()
+
+            if (intent?.action == ACTION_START_VOICE_CAPTURE) {
+                triggerSpeechToTextCapture()
+            }
 
         } catch (se: SecurityException) {
             isRunningInForeground = false
@@ -739,46 +848,7 @@ class NayroForegroundService : Service() {
                 handleRuntimePipelineDegradation(app, failureReason)
             }
 
-            app.voiceManager.attachServiceListener { rawText ->
-                val normalizedCommand = app.voiceManager.normalizeVoiceInvocationCommand(rawText)
-                if (normalizedCommand.isNotBlank() && !ServiceStateRepository.isBackgroundAgentPaused.value) {
-                    if (app.voiceManager.wakeWordEngine.isVoiceExitCommand(normalizedCommand, personaName) ||
-                        app.voiceManager.isConversationExitPhrase(normalizedCommand)
-                    ) {
-                        app.agentRuntime.cancelCurrentTask()
-                        app.voiceManager.endConversationSession(returnToStandby = true)
-                        return@attachServiceListener
-                    }
-                    serviceScope.launch {
-                        var response = ""
-                        try {
-                            app.agentRuntime.recordHeartbeat()
-                            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.PROCESSING)
-                            ServiceStateRepository.appendActivityLog("Background voice command: \"$normalizedCommand\"")
-                            app.repository.addConversationMessage(
-                                ConversationEntity(sender = "user", content = normalizedCommand)
-                            )
-                            response = app.agentRuntime.executeUserInstruction(normalizedCommand)
-                            app.repository.addConversationMessage(
-                                ConversationEntity(sender = "assistant", content = response)
-                            )
-                        } catch (e: Exception) {
-                            response = "Background execution failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
-                            ServiceStateRepository.appendActivityLog(response)
-                        } finally {
-                            if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
-                                ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
-                            }
-                            // Always complete the voice turn so microphone ownership returns to follow-up or wake standby
-                            app.voiceManager.completeCommandTurn(
-                                responseText = response,
-                                shouldSpeak = app.voiceManager.configuration.value.isTtsEnabled,
-                                expectFollowUp = app.voiceManager.configuration.value.isContinuousConversationEnabled
-                            )
-                        }
-                    }
-                }
-            }
+            attachBackgroundVoiceExecutionListener(app, personaName)
             startHealthWatchdog()
             app.healthManager.evaluateHealth()
             app.backgroundVoiceController.refreshState()
@@ -936,7 +1006,49 @@ class NayroForegroundService : Service() {
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    private fun attachBackgroundVoiceExecutionListener(app: NayroApplication, personaName: String) {
+        app.voiceManager.attachServiceListener { rawText ->
+            val normalizedCommand = app.voiceManager.normalizeVoiceInvocationCommand(rawText)
+            if (normalizedCommand.isNotBlank() && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                if (app.voiceManager.wakeWordEngine.isVoiceExitCommand(normalizedCommand, personaName) ||
+                    app.voiceManager.isConversationExitPhrase(normalizedCommand)
+                ) {
+                    app.agentRuntime.cancelCurrentTask()
+                    app.voiceManager.endConversationSession(returnToStandby = true)
+                    return@attachServiceListener
+                }
+                serviceScope.launch {
+                    var response = ""
+                    try {
+                        app.agentRuntime.recordHeartbeat()
+                        ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.PROCESSING)
+                        ServiceStateRepository.appendActivityLog("Background voice command: \"$normalizedCommand\"")
+                        app.repository.addConversationMessage(
+                            ConversationEntity(sender = "user", content = normalizedCommand)
+                        )
+                        response = app.agentRuntime.executeUserInstruction(normalizedCommand)
+                        app.repository.addConversationMessage(
+                            ConversationEntity(sender = "assistant", content = response)
+                        )
+                    } catch (e: Exception) {
+                        response = "Background execution failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
+                        ServiceStateRepository.appendActivityLog(response)
+                    } finally {
+                        if (isRunningInForeground && !ServiceStateRepository.isBackgroundAgentPaused.value) {
+                            ServiceStateRepository.updateForegroundStatus(ServiceLifecycleState.RUNNING)
+                        }
+                        app.voiceManager.completeCommandTurn(
+                            responseText = response,
+                            shouldSpeak = app.voiceManager.configuration.value.isTtsEnabled,
+                            expectFollowUp = app.voiceManager.configuration.value.isContinuousConversationEnabled
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder = localBinder
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -984,13 +1096,33 @@ class NayroForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val speakIntent = Intent(this, NayroForegroundService::class.java).apply {
+            action = ACTION_START_VOICE_CAPTURE
+        }
+        val speakPendingIntent = PendingIntent.getService(
+            this,
+            3,
+            speakIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(content)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+
+        if (!isPaused) {
+            builder.addAction(
+                android.R.drawable.ic_btn_speak_now,
+                "Speak",
+                speakPendingIntent
+            )
+        }
+
+        return builder
             .addAction(
                 if (isPaused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause,
                 if (isPaused) "Resume Agent" else "Pause Agent",

@@ -115,6 +115,84 @@ object ScreenRecordingController {
         }
     }
 
+    fun hasActiveProjection(): Boolean = activeProjection != null && _status.value.state == ScreenRecordingState.RECORDING
+
+    /**
+     * Captures a single live screen [android.graphics.Bitmap] frame using the active user-authorized
+     * [MediaProjection] via a temporary [android.media.ImageReader] + [android.hardware.display.VirtualDisplay].
+     * Always releases the VirtualDisplay and ImageReader immediately after grabbing a frame so battery
+     * overhead stays minimal. Returns null honestly if consent was not granted or capture failed.
+     */
+    suspend fun captureSingleFrameBitmap(
+        context: Context,
+        maxWaitMs: Long = 1800L
+    ): android.graphics.Bitmap? = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+        val projection = activeProjection ?: return@withContext null
+        val dm = context.resources.displayMetrics
+        val width = dm.widthPixels.coerceAtLeast(360)
+        val height = dm.heightPixels.coerceAtLeast(640)
+        val densityDpi = dm.densityDpi.coerceAtLeast(160)
+
+        var imageReader: android.media.ImageReader? = null
+        var virtualDisplay: android.hardware.display.VirtualDisplay? = null
+        try {
+            imageReader = android.media.ImageReader.newInstance(
+                width,
+                height,
+                android.graphics.PixelFormat.RGBA_8888,
+                2
+            )
+            virtualDisplay = projection.createVirtualDisplay(
+                "NayroScreenPerception",
+                width,
+                height,
+                densityDpi,
+                android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                imageReader.surface,
+                null,
+                null
+            )
+
+            val deadline = System.currentTimeMillis() + maxWaitMs
+            while (System.currentTimeMillis() < deadline) {
+                val image = imageReader.acquireLatestImage()
+                if (image != null) {
+                    try {
+                        val plane = image.planes[0]
+                        val buffer = plane.buffer
+                        val pixelStride = plane.pixelStride
+                        val rowStride = plane.rowStride
+                        val rowPadding = rowStride - pixelStride * width
+                        val paddedWidth = width + (rowPadding / pixelStride.coerceAtLeast(1))
+                        val paddedBitmap = android.graphics.Bitmap.createBitmap(
+                            paddedWidth,
+                            height,
+                            android.graphics.Bitmap.Config.ARGB_8888
+                        )
+                        paddedBitmap.copyPixelsFromBuffer(buffer)
+                        val cropped = if (paddedWidth != width) {
+                            val result = android.graphics.Bitmap.createBitmap(paddedBitmap, 0, 0, width, height)
+                            paddedBitmap.recycle()
+                            result
+                        } else {
+                            paddedBitmap
+                        }
+                        return@withContext cropped
+                    } finally {
+                        image.close()
+                    }
+                }
+                kotlinx.coroutines.delay(50L)
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        } finally {
+            try { virtualDisplay?.release() } catch (_: Throwable) {}
+            try { imageReader?.close() } catch (_: Throwable) {}
+        }
+    }
+
     fun stopRecording(reason: String = "Screen recording stopped by user."): Boolean {
         val wasRecording = _status.value.state == ScreenRecordingState.RECORDING || activeProjection != null
         try {

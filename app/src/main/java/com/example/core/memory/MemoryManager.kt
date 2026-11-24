@@ -1,15 +1,21 @@
 package com.example.core.memory
 
+import com.example.core.security.EncryptedStorageManager
 import com.example.data.local.entities.MemoryEntity
 import com.example.data.repository.NayroRepository
 import kotlinx.coroutines.flow.firstOrNull
 
 /**
  * Manages user memory lifecycle: candidate extraction, privacy filtering,
- * storage, and contextual retrieval for the Agent (Phase 6).
+ * encrypted semantic indexing, consolidation, conversation summarization,
+ * workflow memory, and contextual retrieval for the Agent.
  */
-class MemoryManager(private val repository: NayroRepository) {
+class MemoryManager(
+    private val repository: NayroRepository,
+    encryptedStorageManager: EncryptedStorageManager? = null
+) {
 
+    val semanticEngine = SemanticMemoryEngine(encryptedStorageManager)
     private val cachedMemories = java.util.Collections.synchronizedList(mutableListOf<MemoryEntity>())
 
     fun getCachedMemories(): List<MemoryEntity> {
@@ -52,6 +58,17 @@ class MemoryManager(private val repository: NayroRepository) {
             cachedMemories.removeAll { it.keyName == entity.keyName && it.keyName != "user_preference" }
             cachedMemories.add(0, entity)
         }
+        semanticEngine.upsertRecord(
+            tier = when (candidate.category) {
+                MemoryCategory.SHORT_TERM_MEMORY, MemoryCategory.TEMPORARY_SESSION -> SemanticMemoryTier.SHORT_TERM
+                else -> SemanticMemoryTier.LONG_TERM
+            },
+            category = candidate.category.name,
+            key = candidate.key,
+            content = sanitized,
+            tags = setOf(candidate.category.name.lowercase(), candidate.key.lowercase()),
+            importance = 1.25f
+        )
         try {
             repository.addMemory(entity)
         } catch (_: Exception) {}
@@ -61,16 +78,28 @@ class MemoryManager(private val repository: NayroRepository) {
     suspend fun saveDirectMemory(category: MemoryCategory, key: String, value: String): Boolean {
         if (!MemoryPrivacyGuard.isAllowedToPersist(value)) return false
 
+        val sanitized = MemoryPrivacyGuard.sanitizeContent(value)
         val entity = MemoryEntity(
             category = category.name,
             keyName = key,
-            memoryValue = MemoryPrivacyGuard.sanitizeContent(value),
+            memoryValue = sanitized,
             userConfirmed = true
         )
         synchronized(cachedMemories) {
             cachedMemories.removeAll { it.keyName == key && key != "user_preference" }
             cachedMemories.add(0, entity)
         }
+        semanticEngine.upsertRecord(
+            tier = when (category) {
+                MemoryCategory.SHORT_TERM_MEMORY, MemoryCategory.TEMPORARY_SESSION -> SemanticMemoryTier.SHORT_TERM
+                else -> SemanticMemoryTier.LONG_TERM
+            },
+            category = category.name,
+            key = key,
+            content = sanitized,
+            tags = setOf(category.name.lowercase(), key.lowercase()),
+            importance = 1.2f
+        )
         try {
             repository.addMemory(entity)
         } catch (_: Exception) {}
@@ -78,10 +107,43 @@ class MemoryManager(private val repository: NayroRepository) {
     }
 
     /**
-     * Builds a compact context snippet from existing memories that match query keywords.
+     * Records a completed or failed multi-step workflow into persistent semantic workflow memory.
+     */
+    fun recordWorkflowMemory(goal: String, actions: List<String>, succeeded: Boolean, details: String) {
+        semanticEngine.recordWorkflowOutcome(goal, actions, succeeded, details)
+    }
+
+    /**
+     * Summarizes multi-turn conversation history into persistent semantic summary memory.
+     */
+    fun summarizeConversation(turns: List<Pair<String, String>>, sessionLabel: String = "recent_session"): SemanticMemoryRecord? {
+        return semanticEngine.summarizeAndPersistConversation(turns, sessionLabel)
+    }
+
+    /**
+     * Consolidates short-term, long-term, and duplicate memories.
+     */
+    fun consolidateMemories(): ConsolidationReport = semanticEngine.consolidateMemory()
+
+    /**
+     * Builds a compact context snippet from semantic memory (long-term facts, summaries, workflows)
+     * plus Room memories using cross-lingual semantic retrieval.
      */
     fun buildRelevantContext(prompt: String, allMemories: List<MemoryEntity>): String {
         val pool = if (allMemories.isNotEmpty()) allMemories else getCachedMemories()
+        val semanticHits = semanticEngine.semanticSearch(
+            query = prompt,
+            additionalRoomMemories = pool,
+            limit = 6,
+            minScore = 0.08f
+        )
+
+        if (semanticHits.isNotEmpty()) {
+            return semanticHits.joinToString(separator = "\n", prefix = "Saved Context & Preferences:\n") { hit ->
+                "- [${hit.record.category}/${hit.record.key}] ${hit.record.content}"
+            }
+        }
+
         if (pool.isEmpty()) return ""
 
         val queryWords = prompt.lowercase().split("\\s+".toRegex()).filter { it.length > 3 }
@@ -98,7 +160,7 @@ class MemoryManager(private val repository: NayroRepository) {
     }
 
     /**
-     * Section 7 — Ranks non-expired memories by keyword relevance and recency.
+     * Section 7 — Ranks non-expired memories by semantic + keyword relevance and recency.
      */
     fun rankMemoriesForQuery(
         query: String,
@@ -107,11 +169,13 @@ class MemoryManager(private val repository: NayroRepository) {
     ): List<MemoryEntity> {
         val valid = filterNonExpiredMemories(allMemories, nowMs)
         val tokens = query.lowercase().split(Regex("\\s+")).filter { it.length >= 2 }
+        val queryVec = semanticEngine.buildFeatureVector(query)
         return valid.sortedByDescending { mem ->
             val hay = "${mem.keyName} ${mem.memoryValue} ${mem.category}".lowercase()
             val matchHits = tokens.count { tok -> hay.contains(tok) }
+            val semScore = (semanticEngine.cosineSimilarity(queryVec, semanticEngine.buildFeatureVector(hay)) * 100f).toLong()
             val tierBoost = if (mem.userConfirmed) 2 else 0
-            (matchHits * 100L) + (tierBoost * 10L) + (mem.createdAt / 1_000_000L)
+            (matchHits * 100L) + semScore + (tierBoost * 10L) + (mem.createdAt / 1_000_000L)
         }
     }
 
@@ -173,6 +237,13 @@ class MemoryManager(private val repository: NayroRepository) {
             cachedMemories.removeAll { it.keyName.equals(key.trim(), ignoreCase = true) }
             cachedMemories.add(0, updatedEntity)
         }
+        semanticEngine.upsertRecord(
+            tier = SemanticMemoryTier.LONG_TERM,
+            category = category.name,
+            key = key.trim(),
+            content = sanitized,
+            importance = 1.3f
+        )
         try {
             repository.addMemory(updatedEntity)
         } catch (_: Exception) {}
@@ -194,4 +265,5 @@ class MemoryManager(private val repository: NayroRepository) {
         return storedMemoryValue?.trim()?.takeIf { it.isNotEmpty() }
     }
 }
+
 

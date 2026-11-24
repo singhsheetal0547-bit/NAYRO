@@ -224,9 +224,22 @@ class ScreenIntelligenceManager(private val context: Context) {
                     "${node.displayLabel} @(${node.centerX},${node.centerY})"
                 }.orEmpty()
 
-            val themeLabel = if (isDark) "Dark UI" else "Light UI"
+            val isBlackProtected = meanLum < 2.5f && contrastStdDev < 2.0f
+            val salient = detectSalientVisualRegions(
+                luminances = luminances,
+                gridW = width,
+                gridH = height,
+                targetW = width,
+                targetH = height
+            )
+
+            val themeLabel = when {
+                isBlackProtected -> "Protected/Blank Frame"
+                isDark -> "Dark UI"
+                else -> "Light UI"
+            }
             val modalLabel = if (hasModalOverlay) ", Modal Dialog Detected" else ""
-            val summary = "${width}x${height}px ($themeLabel, Lum=${"%.1f".format(meanLum)}, Contrast=${"%.1f".format(contrastStdDev)}$modalLabel, Targets=${grounded.size}, dHash=0x${java.lang.Long.toHexString(dHash)})"
+            val summary = "${width}x${height}px ($themeLabel, Lum=${"%.1f".format(meanLum)}, Contrast=${"%.1f".format(contrastStdDev)}$modalLabel, Targets=${grounded.size}, VisualRegions=${salient.size}, dHash=0x${java.lang.Long.toHexString(dHash)})"
 
             val observation = VisualScreenObservation(
                 width = width,
@@ -237,10 +250,184 @@ class ScreenIntelligenceManager(private val context: Context) {
                 hasModalDimOverlay = hasModalOverlay,
                 visualPerceptualHash = dHash,
                 detectedRegionsSummary = summary,
-                groundedTextElements = grounded
+                groundedTextElements = grounded,
+                isLikelyProtectedBlackFrame = isBlackProtected,
+                salientRegions = salient
             )
             lastVisualObservation = observation
             return observation
+        }
+
+        /**
+         * Pure-Kotlin computer-vision salient control detector: partitions the sampled luminance grid
+         * into a spatial matrix and ranks high-gradient/high-contrast patches (buttons, game HUD icons,
+         * menus, tabs) mapped back to display coordinates.
+         */
+        fun detectSalientVisualRegions(
+            luminances: FloatArray,
+            gridW: Int,
+            gridH: Int,
+            targetW: Int,
+            targetH: Int,
+            maxRegions: Int = 8
+        ): List<VisualElementRegion> {
+            if (luminances.isEmpty() || gridW < 4 || gridH < 4) return emptyList()
+            val cols = 4.coerceAtMost(gridW / 2).coerceAtLeast(1)
+            val rows = 6.coerceAtMost(gridH / 2).coerceAtLeast(1)
+            val cellW = gridW / cols
+            val cellH = gridH / rows
+            val candidates = mutableListOf<VisualElementRegion>()
+
+            for (r in 0 until rows) {
+                for (c in 0 until cols) {
+                    val startX = c * cellW
+                    val endX = if (c == cols - 1) gridW else (c + 1) * cellW
+                    val startY = r * cellH
+                    val endY = if (r == rows - 1) gridH else (r + 1) * cellH
+
+                    var gradientSum = 0f
+                    var samples = 0
+                    for (y in startY until endY) {
+                        for (x in startX until endX) {
+                            val idx = y * gridW + x
+                            if (idx >= luminances.size) continue
+                            val cur = luminances[idx]
+                            val right = if (x + 1 < gridW && idx + 1 < luminances.size) luminances[idx + 1] else cur
+                            val down = if (y + 1 < gridH && idx + gridW < luminances.size) luminances[idx + gridW] else cur
+                            gradientSum += kotlin.math.abs(cur - right) + kotlin.math.abs(cur - down)
+                            samples++
+                        }
+                    }
+                    val avgEnergy = if (samples > 0) gradientSum / samples else 0f
+                    if (avgEnergy >= 14f) {
+                        val cx = (((startX + endX) / 2.0) / gridW * targetW).toInt().coerceIn(0, targetW)
+                        val cy = (((startY + endY) / 2.0) / gridH * targetH).toInt().coerceIn(0, targetH)
+                        val rw = (((endX - startX).toDouble() / gridW) * targetW).toInt().coerceAtLeast(1)
+                        val rh = (((endY - startY).toDouble() / gridH) * targetH).toInt().coerceAtLeast(1)
+                        val vZone = when {
+                            r == 0 -> "top"
+                            r >= rows - 1 -> "bottom"
+                            else -> "middle"
+                        }
+                        val hZone = when {
+                            c == 0 -> "left"
+                            c >= cols - 1 -> "right"
+                            else -> "center"
+                        }
+                        candidates.add(
+                            VisualElementRegion(
+                                regionId = "vr_${r}_${c}",
+                                centerX = cx,
+                                centerY = cy,
+                                width = rw,
+                                height = rh,
+                                edgeEnergy = avgEnergy,
+                                zoneLabel = "$vZone-$hZone"
+                            )
+                        )
+                    }
+                }
+            }
+            return candidates.sortedByDescending { it.edgeEnergy }.take(maxRegions)
+        }
+
+        /**
+         * Computes Hamming bit distance between two 64-bit perceptual dHashes (0 = identical, >= 4 = visual screen changed).
+         */
+        fun computePerceptualHashDistance(hashA: Long, hashB: Long): Int {
+            return java.lang.Long.bitCount(hashA xor hashB)
+        }
+
+        /**
+         * Classifies whether the currently observed interface restricts automation (FLAG_SECURE black frame,
+         * password/PIN/biometric entry, or financial/UPI/banking payment screens).
+         */
+        fun detectRestrictedScreen(
+            snapshot: ScreenSnapshot?,
+            visualObservation: VisualScreenObservation?
+        ): RestrictedScreenStatus {
+            val pkgLower = snapshot?.packageName?.lowercase().orEmpty()
+            val combinedText = buildString {
+                snapshot?.visibleTexts?.forEach { append(it).append(' ') }
+                snapshot?.interactiveElements?.forEach { append(it.displayLabel).append(' ') }
+            }.lowercase()
+
+            val isPaymentOrBankingPkg = listOf(
+                "phonepe", "paytm", "gpay", "paisa", "bhim", "upi", "bank", "sbi", "hdfc", "icici", "axis", "kotak", "cred"
+            ).any { pkgLower.contains(it) }
+            val hasFinancialPrompt = combinedText.contains("upi pin") ||
+                combinedText.contains("enter mpin") ||
+                combinedText.contains("confirm payment") ||
+                combinedText.contains("pay now") ||
+                combinedText.contains("transfer money") ||
+                combinedText.contains("cvv") ||
+                combinedText.contains("card number")
+            if (isPaymentOrBankingPkg && (hasFinancialPrompt || visualObservation?.isLikelyProtectedBlackFrame == true)) {
+                return RestrictedScreenStatus(
+                    isRestricted = true,
+                    type = RestrictedScreenType.BANKING_OR_PAYMENT,
+                    reason = "Banking or payment interface detected (${snapshot?.packageName ?: "protected app"}). Financial actions and PIN entry are restricted for your safety."
+                )
+            }
+
+            if (snapshot?.interactiveElements?.any { it.isPassword } == true ||
+                combinedText.contains("enter pin") ||
+                combinedText.contains("enter password") ||
+                combinedText.contains("biometric") ||
+                combinedText.contains("fingerprint") ||
+                combinedText.contains("verify it's you") ||
+                combinedText.contains("upi pin")
+            ) {
+                return RestrictedScreenStatus(
+                    isRestricted = true,
+                    type = RestrictedScreenType.AUTHENTICATION_OR_PASSWORD,
+                    reason = "Authentication or password screen detected. NAYRO does not read or auto-submit credentials."
+                )
+            }
+
+            if (visualObservation?.isLikelyProtectedBlackFrame == true &&
+                (snapshot == null || (snapshot.visibleTexts.isEmpty() && snapshot.interactiveElements.isEmpty()))
+            ) {
+                return RestrictedScreenStatus(
+                    isRestricted = true,
+                    type = RestrictedScreenType.FLAG_SECURE_PROTECTED,
+                    reason = "This screen is protected by Android FLAG_SECURE (blank capture and redacted Accessibility tree). Manual interaction is required."
+                )
+            }
+
+            return RestrictedScreenStatus(
+                isRestricted = false,
+                type = RestrictedScreenType.NONE,
+                reason = "Screen is accessible for perception and interaction."
+            )
+        }
+
+        /**
+         * Encodes a captured [android.graphics.Bitmap] into a downscaled Base64 JPEG string suitable for
+         * fast multimodal Vision AI requests (Gemini / OpenAI / OpenRouter / Grok).
+         */
+        fun encodeBitmapToBase64Jpeg(
+            bitmap: android.graphics.Bitmap,
+            maxDimension: Int = 1024,
+            quality: Int = 75
+        ): String {
+            return try {
+                val maxSide = maxOf(bitmap.width, bitmap.height).coerceAtLeast(1)
+                val scaled = if (maxSide > maxDimension) {
+                    val scale = maxDimension.toFloat() / maxSide.toFloat()
+                    val newW = (bitmap.width * scale).toInt().coerceAtLeast(1)
+                    val newH = (bitmap.height * scale).toInt().coerceAtLeast(1)
+                    android.graphics.Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+                } else {
+                    bitmap
+                }
+                val out = java.io.ByteArrayOutputStream()
+                scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality.coerceIn(40, 95), out)
+                if (scaled !== bitmap) scaled.recycle()
+                android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+            } catch (_: Throwable) {
+                ""
+            }
         }
 
         /**
@@ -261,11 +448,20 @@ class ScreenIntelligenceManager(private val context: Context) {
                 }
             }
             val gridObs = analyzePixelGrid(sampled, gridW, gridH, snapshot)
-            val fullResSummary = "${bitmap.width}x${bitmap.height}px (${if (gridObs.isDarkThemeDetected) "Dark UI" else "Light UI"}, Lum=${"%.1f".format(gridObs.meanLuminance)}, Contrast=${"%.1f".format(gridObs.contrastScore)}, GroundedTargets=${gridObs.groundedTextElements.size}, dHash=0x${java.lang.Long.toHexString(gridObs.visualPerceptualHash)})"
+            val scaledRegions = gridObs.salientRegions.map { region ->
+                region.copy(
+                    centerX = ((region.centerX.toDouble() / gridW) * bitmap.width).toInt(),
+                    centerY = ((region.centerY.toDouble() / gridH) * bitmap.height).toInt(),
+                    width = ((region.width.toDouble() / gridW) * bitmap.width).toInt().coerceAtLeast(1),
+                    height = ((region.height.toDouble() / gridH) * bitmap.height).toInt().coerceAtLeast(1)
+                )
+            }
+            val fullResSummary = "${bitmap.width}x${bitmap.height}px (${if (gridObs.isLikelyProtectedBlackFrame) "Protected/Blank Frame" else if (gridObs.isDarkThemeDetected) "Dark UI" else "Light UI"}, Lum=${"%.1f".format(gridObs.meanLuminance)}, Contrast=${"%.1f".format(gridObs.contrastScore)}, GroundedTargets=${gridObs.groundedTextElements.size}, VisualRegions=${scaledRegions.size}, dHash=0x${java.lang.Long.toHexString(gridObs.visualPerceptualHash)})"
             val finalObs = gridObs.copy(
                 width = bitmap.width,
                 height = bitmap.height,
-                detectedRegionsSummary = fullResSummary
+                detectedRegionsSummary = fullResSummary,
+                salientRegions = scaledRegions
             )
             lastVisualObservation = finalObs
             return finalObs

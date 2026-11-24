@@ -29,6 +29,7 @@ object TaskPlanner {
                     AgentAction(
                         taskId = taskId,
                         actionType = ActionType.READ_SCREEN,
+                        parameters = mapOf("prompt" to (intent.searchQueryOrContent ?: intent.rawPrompt)),
                         requiredCapability = CapabilityId.ACCESSIBILITY,
                         riskLevel = RiskLevel.R0_LOCAL_READONLY,
                         verificationStrategy = "VERIFY_SCREEN_READ",
@@ -323,6 +324,28 @@ object TaskPlanner {
                 )
             }
 
+            UserIntentType.VOLUME_CONTROL -> {
+                val operation = intent.section ?: "UP"
+                val stream = intent.targetAppOrEntity ?: "media"
+                val params = mutableMapOf(
+                    "operation" to operation,
+                    "stream" to stream
+                )
+                if (!intent.searchQueryOrContent.isNullOrBlank()) {
+                    params["levelPercent"] = intent.searchQueryOrContent
+                }
+                actions.add(
+                    AgentAction(
+                        taskId = taskId,
+                        actionType = ActionType.CONTROL_VOLUME,
+                        target = "$stream:$operation",
+                        parameters = params,
+                        riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                        idempotencyClassification = "IDEMPOTENT"
+                    )
+                )
+            }
+
             UserIntentType.NOTIFICATION_READ -> {
                 val actionType = if (intent.searchQueryOrContent == "summarize") {
                     ActionType.SUMMARIZE_NOTIFICATIONS
@@ -471,6 +494,162 @@ object TaskPlanner {
                 )
             }
 
+            UserIntentType.BROWSER_TASK -> {
+                when (intent.section) {
+                    "COMPARE_SOURCES" -> {
+                        val topic = intent.searchQueryOrContent ?: intent.rawPrompt
+                        actions.add(
+                            AgentAction(
+                                taskId = taskId,
+                                actionType = ActionType.BROWSER_COMPARE_SOURCES,
+                                target = topic,
+                                parameters = mapOf("topic" to topic),
+                                riskLevel = RiskLevel.R0_LOCAL_READONLY,
+                                idempotencyClassification = "IDEMPOTENT"
+                            )
+                        )
+                    }
+                    "DOWNLOAD_FILE" -> {
+                        val url = intent.targetAppOrEntity ?: ""
+                        actions.add(
+                            AgentAction(
+                                taskId = taskId,
+                                actionType = ActionType.BROWSER_DOWNLOAD_FILE,
+                                target = url,
+                                parameters = mapOf("url" to url),
+                                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                                idempotencyClassification = "IDEMPOTENT"
+                            )
+                        )
+                    }
+                    "FILL_FORM" -> {
+                        val field = intent.targetAppOrEntity ?: "search"
+                        val value = intent.searchQueryOrContent ?: ""
+                        actions.add(
+                            AgentAction(
+                                taskId = taskId,
+                                actionType = ActionType.BROWSER_FILL_FORM,
+                                target = field,
+                                parameters = mapOf("field" to field, "value" to value),
+                                requiredCapability = CapabilityId.ACCESSIBILITY,
+                                riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                                idempotencyClassification = "NON_IDEMPOTENT"
+                            )
+                        )
+                    }
+                    else -> {
+                        val url = intent.targetAppOrEntity ?: ""
+                        actions.add(
+                            AgentAction(
+                                taskId = taskId,
+                                actionType = ActionType.BROWSER_OPEN_URL,
+                                target = url,
+                                parameters = mapOf("url" to url),
+                                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                                idempotencyClassification = "IDEMPOTENT"
+                            )
+                        )
+                    }
+                }
+            }
+
+            UserIntentType.SCREEN_OPERATE -> {
+                val goal = intent.searchQueryOrContent ?: intent.rawPrompt
+                val lowerGoal = goal.trim().lowercase()
+                val ordIdx = com.example.core.screen.ScreenIntelligenceManager.parseOrdinalIndex(lowerGoal)
+                when {
+                    intent.section == "RECENTS" -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.NAVIGATE_RECENTS,
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "IDEMPOTENT"
+                        )
+                    )
+                    intent.section == "BACK" -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.NAVIGATE_BACK,
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                    intent.section == "HOME" -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.NAVIGATE_HOME,
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "IDEMPOTENT"
+                        )
+                    )
+                    lowerGoal == "scroll down" || lowerGoal.contains("neeche scroll") -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.SCROLL_FORWARD,
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                    lowerGoal == "scroll up" || lowerGoal.contains("upar scroll") -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.SCROLL_BACKWARD,
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                    lowerGoal.startsWith("scroll left") || lowerGoal.startsWith("swipe left") -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.SWIPE_SCREEN,
+                            target = "left",
+                            parameters = mapOf("direction" to "left"),
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                    lowerGoal.startsWith("scroll right") || lowerGoal.startsWith("swipe right") -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.SWIPE_SCREEN,
+                            target = "right",
+                            parameters = mapOf("direction" to "right"),
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                    ordIdx != null -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.CLICK_ELEMENT,
+                            target = "ordinal:$ordIdx",
+                            parameters = mapOf("ordinalIndex" to ordIdx.toString(), "goal" to goal),
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                    else -> actions.add(
+                        AgentAction(
+                            taskId = taskId,
+                            actionType = ActionType.UNIVERSAL_SCREEN_OPERATE,
+                            target = goal,
+                            parameters = mapOf("goal" to goal),
+                            requiredCapability = CapabilityId.ACCESSIBILITY,
+                            riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                            idempotencyClassification = "NON_IDEMPOTENT"
+                        )
+                    )
+                }
+            }
+
             UserIntentType.GENERAL_AI_QUERY -> {
                 actions.add(
                     AgentAction(
@@ -525,22 +704,32 @@ object TaskPlanner {
                     ActionType.MAKE_PHONE_CALL,
                     ActionType.SEND_SMS,
                     ActionType.MESSAGE_DRAFT_SEND -> RiskLevel.R3_EXTERNAL_COMMUNICATION
-                    ActionType.SET_TEXT -> RiskLevel.R2_APPLICATION_STATE
+                    ActionType.SET_TEXT,
+                    ActionType.BROWSER_FILL_FORM,
+                    ActionType.UNIVERSAL_SCREEN_OPERATE -> RiskLevel.R2_APPLICATION_STATE
                     ActionType.CLICK_ELEMENT,
                     ActionType.LAUNCH_APP,
                     ActionType.OPEN_SETTINGS_SECTION,
-                    ActionType.TOGGLE_FLASHLIGHT -> RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+                    ActionType.TOGGLE_FLASHLIGHT,
+                    ActionType.CONTROL_VOLUME,
+                    ActionType.NAVIGATE_RECENTS,
+                    ActionType.DRAG_SCREEN,
+                    ActionType.BROWSER_OPEN_URL,
+                    ActionType.BROWSER_DOWNLOAD_FILE -> RiskLevel.R1_LOW_IMPACT_REVERSIBLE
                     else -> RiskLevel.R0_LOCAL_READONLY
                 }
 
                 val reqCap = when (actionType) {
                     ActionType.READ_SCREEN, ActionType.CLICK_ELEMENT, ActionType.SET_TEXT,
-                    ActionType.SCROLL_FORWARD, ActionType.SCROLL_BACKWARD, ActionType.NAVIGATE_BACK -> CapabilityId.ACCESSIBILITY
+                    ActionType.SCROLL_FORWARD, ActionType.SCROLL_BACKWARD, ActionType.NAVIGATE_BACK,
+                    ActionType.NAVIGATE_RECENTS, ActionType.DRAG_SCREEN, ActionType.UNIVERSAL_SCREEN_OPERATE,
+                    ActionType.BROWSER_FILL_FORM -> CapabilityId.ACCESSIBILITY
                     else -> null
                 }
 
                 val idempotency = when (actionType) {
-                    ActionType.CLICK_ELEMENT, ActionType.SET_TEXT, ActionType.SAVE_NOTE, ActionType.ASK_USER_CONFIRMATION -> "NON_IDEMPOTENT"
+                    ActionType.CLICK_ELEMENT, ActionType.SET_TEXT, ActionType.SAVE_NOTE, ActionType.ASK_USER_CONFIRMATION,
+                    ActionType.UNIVERSAL_SCREEN_OPERATE, ActionType.DRAG_SCREEN -> "NON_IDEMPOTENT"
                     else -> "IDEMPOTENT"
                 }
 

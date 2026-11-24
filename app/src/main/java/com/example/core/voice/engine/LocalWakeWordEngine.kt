@@ -246,6 +246,22 @@ class LocalWakeWordEngine(private val context: Context?) {
     )
     val lastValidationResult: StateFlow<TemplateValidationResult> = _lastValidationResult.asStateFlow()
 
+    /**
+     * Independent Voice Activity Detector (VAD) cleanly separated from MFCC/DTW wake-word matching.
+     */
+    val voiceActivityDetector = VoiceActivityDetector(
+        VadConfig(
+            minSpeechRms = 400.0,
+            minSnrMarginRatio = MIN_SNR_MARGIN_RATIO,
+            minZcr = 0.02,
+            maxZcr = 0.46,
+            minVoicedFramesForSpeech = 2,
+            silenceHangoverFrames = SILENCE_HANGOVER_FRAMES,
+            initialNoiseFloorRms = 140.0
+        )
+    )
+    val vadState: StateFlow<VadState> = voiceActivityDetector.vadState
+
     private val activeWakePhrases = SUPPORTED_PHRASES.toMutableList()
     private val loadedTemplates = mutableMapOf<String, WakePhraseAcousticTemplate>()
 
@@ -2340,11 +2356,10 @@ class LocalWakeWordEngine(private val context: Context?) {
                             }
 
                             _standbyAudioLevel.value = ((rms - 100.0) / 3500.0).toFloat().coerceIn(0f, 1f)
-                            val isSpeechFrame = rms >= 400.0 &&
-                                rms > adaptiveNoiseFloorRms * MIN_SNR_MARGIN_RATIO &&
-                                zcr in 0.02..0.46
+                            val vadDecision = voiceActivityDetector.processFrame(frameBuf, read)
+                            adaptiveNoiseFloorRms = vadDecision.noiseFloorRms
 
-                            if (isSpeechFrame) {
+                            if (vadDecision.isSpeechFrame) {
                                 silenceHangoverCount = 0
                                 val toCopy = kotlin.math.min(read, segmentWindow.size - segmentWritePos)
                                 if (toCopy > 0) {
@@ -2361,12 +2376,12 @@ class LocalWakeWordEngine(private val context: Context?) {
                                     activeVoicedFrames = 0
                                 }
                             } else {
-                                if (rms < 400.0 && peak > 0f) {
-                                    adaptiveNoiseFloorRms = (0.92 * adaptiveNoiseFloorRms + 0.08 * rms).coerceIn(80.0, 650.0)
-                                }
                                 if (activeVoicedFrames > 0) {
                                     silenceHangoverCount++
-                                    if (silenceHangoverCount < SILENCE_HANGOVER_FRAMES && segmentWritePos + read <= segmentWindow.size) {
+                                    if (!vadDecision.utteranceEnded &&
+                                        silenceHangoverCount < SILENCE_HANGOVER_FRAMES &&
+                                        segmentWritePos + read <= segmentWindow.size
+                                    ) {
                                         System.arraycopy(frameBuf, 0, segmentWindow, segmentWritePos, read)
                                         segmentWritePos += read
                                     } else {

@@ -9,11 +9,17 @@ data class AIChatMessage(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+data class AIImageAttachment(
+    val base64Data: String,
+    val mimeType: String = "image/jpeg"
+)
+
 data class AIRequest(
     val messages: List<AIChatMessage>,
     val systemPrompt: String? = null,
     val temperature: Float = 0.7f,
-    val maxTokens: Int = 1024
+    val maxTokens: Int = 1024,
+    val images: List<AIImageAttachment> = emptyList()
 )
 
 data class AIResponse(

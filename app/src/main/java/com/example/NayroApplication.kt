@@ -3,11 +3,13 @@ package com.example
 import android.app.Application
 import com.example.core.agent.AgentBrain
 import com.example.core.agent.AgentRuntime
+import com.example.core.agent.SelfImprovementEngine
 import com.example.core.automation.AutomationEngine
 import com.example.core.capability.CapabilityManager
 import com.example.core.memory.ConversationContinuityManager
 import com.example.core.memory.MemoryManager
 import com.example.core.memory.NotebookManager
+import com.example.core.network.NetworkConnectivityMonitor
 import com.example.core.permission.PermissionManager
 import com.example.core.permission.PermissionSetupManager
 import com.example.core.proactive.ProactiveIntelligenceEngine
@@ -17,6 +19,7 @@ import com.example.core.security.AutonomyPolicyManager
 import com.example.core.security.EncryptedStorageManager
 import com.example.core.service.BackgroundAgentHealthManager
 import com.example.core.service.DeviceOperatingStateManager
+import com.example.core.service.VoiceAgentServiceWrapper
 import com.example.core.skills.SkillManager
 import com.example.core.subagent.SubAgentManager
 import com.example.core.telephony.CallIntelligenceManager
@@ -53,6 +56,8 @@ class NayroApplication : Application() {
         private set
     lateinit var encryptedStorageManager: EncryptedStorageManager
         private set
+    lateinit var networkConnectivityMonitor: NetworkConnectivityMonitor
+        private set
     lateinit var providerManager: AIProviderManager
         private set
     lateinit var memoryManager: MemoryManager
@@ -79,6 +84,8 @@ class NayroApplication : Application() {
         private set
     lateinit var operatingStateManager: DeviceOperatingStateManager
         private set
+    lateinit var selfImprovementEngine: SelfImprovementEngine
+        private set
     lateinit var agentRuntime: AgentRuntime
         private set
     lateinit var agentBrain: AgentBrain
@@ -88,6 +95,8 @@ class NayroApplication : Application() {
     lateinit var voiceManager: VoiceManager
         private set
     lateinit var backgroundVoiceController: com.example.core.voice.BackgroundVoiceController
+        private set
+    lateinit var voiceAgentServiceWrapper: VoiceAgentServiceWrapper
         private set
     lateinit var healthManager: BackgroundAgentHealthManager
         private set
@@ -104,11 +113,13 @@ class NayroApplication : Application() {
         permissionManager = PermissionManager(this)
         permissionSetupManager = PermissionSetupManager(this, permissionManager)
         encryptedStorageManager = EncryptedStorageManager(this)
-        providerManager = AIProviderManager(encryptedStorageManager)
+        networkConnectivityMonitor = NetworkConnectivityMonitor(this).also { it.startMonitoring() }
+        providerManager = AIProviderManager(encryptedStorageManager, networkConnectivityMonitor)
         capabilityManager = CapabilityManager(this, permissionManager, providerManager)
 
         val screenIntelligenceManager = ScreenIntelligenceManager(this)
-        memoryManager = MemoryManager(repository)
+        memoryManager = MemoryManager(repository, encryptedStorageManager)
+        selfImprovementEngine = SelfImprovementEngine(encryptedStorageManager)
         notebookManager = NotebookManager(repository)
         workspaceManager = WorkspaceManager(this)
         skillManager = SkillManager()
@@ -139,7 +150,8 @@ class NayroApplication : Application() {
             workflowEngine = workflowEngine,
             proactiveEngine = proactiveEngine,
             automationEngine = automationEngine,
-            operatingStateManager = operatingStateManager
+            operatingStateManager = operatingStateManager,
+            selfImprovementEngine = selfImprovementEngine
         )
 
         agentBrain = agentRuntime.agentBrain
@@ -152,6 +164,16 @@ class NayroApplication : Application() {
             identityStore = assistantIdentityStore,
             permissionManager = permissionManager,
             voiceManager = voiceManager
+        )
+        voiceAgentServiceWrapper = VoiceAgentServiceWrapper(
+            appContext = this,
+            permissionManager = permissionManager,
+            voiceManager = voiceManager,
+            backgroundVoiceController = backgroundVoiceController,
+            agentRuntime = agentRuntime,
+            repository = repository,
+            identityStore = assistantIdentityStore,
+            providerManager = providerManager
         )
         healthManager = BackgroundAgentHealthManager(this, permissionManager, capabilityManager, voiceManager)
 
@@ -174,8 +196,9 @@ class NayroApplication : Application() {
             }
         }
 
-        // Attempt Task Continuity recovery on application boot
+        // Hydrate persistent Room conversation/memory history and recover interrupted tasks on boot
         applicationScope.launch {
+            agentRuntime.hydrateMemoryAndConversationHistoryFromStorage()
             agentRuntime.recoverInterruptedTasksOnBoot()
         }
     }

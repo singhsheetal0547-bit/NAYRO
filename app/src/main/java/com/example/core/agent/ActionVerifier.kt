@@ -347,6 +347,7 @@ class ActionVerifier(
             ActionType.GET_STORAGE_INFO,
             ActionType.GET_CURRENT_LOCATION,
             ActionType.TOGGLE_FLASHLIGHT,
+            ActionType.CONTROL_VOLUME,
             ActionType.SEARCH_INSTALLED_APPS,
             ActionType.CALCULATE_LOCAL,
             ActionType.ASK_USER_CONFIRMATION,
@@ -362,10 +363,18 @@ class ActionVerifier(
             ActionType.WEB_SEARCH,
             ActionType.FETCH_WEB_PAGE,
             ActionType.SUMMARIZE_WEB_CONTENT,
+            ActionType.BROWSER_OPEN_URL,
+            ActionType.BROWSER_COMPARE_SOURCES,
+            ActionType.BROWSER_FILL_FORM,
+            ActionType.BROWSER_DOWNLOAD_FILE,
             ActionType.CODE_INSPECT_FILE,
             ActionType.CODE_EDIT_FILE,
             ActionType.CODE_DIAGNOSE_ERROR,
             ActionType.CODE_GENERATE_DOCS,
+            ActionType.EXECUTE_SANDBOXED_CODE,
+            ActionType.SCAFFOLD_DEV_PROJECT,
+            ActionType.ANALYZE_DATA_FILE,
+            ActionType.EXECUTE_DYNAMIC_PLUGIN,
             ActionType.LIST_SKILLS,
             ActionType.EXECUTE_PROCEDURAL_SKILL,
             ActionType.REGISTER_CUSTOM_SKILL,
@@ -398,7 +407,10 @@ class ActionVerifier(
             ActionType.DELETE_CALENDAR_EVENT,
             ActionType.WHATSAPP_READ_CONVERSATION,
             ActionType.MESSAGE_DRAFT_SEND,
-            ActionType.NAVIGATE_HOME -> {
+            ActionType.NAVIGATE_HOME,
+            ActionType.NAVIGATE_RECENTS,
+            ActionType.DRAG_SCREEN,
+            ActionType.UNIVERSAL_SCREEN_OPERATE -> {
                 if (executionResult.status == VerificationStatus.VERIFIED && executionResult.outputMessage.isNotBlank()) {
                     VerificationResult(
                         status = VerificationStatus.VERIFIED,

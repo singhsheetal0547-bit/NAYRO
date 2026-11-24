@@ -70,7 +70,8 @@ class AgentRuntime(
     val workflowEngine: CrossAppWorkflowEngine = CrossAppWorkflowEngine(),
     val proactiveEngine: ProactiveIntelligenceEngine = ProactiveIntelligenceEngine(),
     val automationEngine: AutomationEngine = AutomationEngine(context),
-    val operatingStateManager: DeviceOperatingStateManager = DeviceOperatingStateManager(context)
+    val operatingStateManager: DeviceOperatingStateManager = DeviceOperatingStateManager(context),
+    val selfImprovementEngine: SelfImprovementEngine = SelfImprovementEngine()
 ) {
 
     private val _currentState = MutableStateFlow<AgentState>(AgentState.Idle)
@@ -104,10 +105,29 @@ class AgentRuntime(
         actionExecutor = actionExecutor,
         workspaceManager = workspaceManager,
         skillManager = skillManager,
-        subAgentManager = subAgentManager
+        subAgentManager = subAgentManager,
+        selfImprovementEngine = selfImprovementEngine
     )
 
     private val actionVerifier = ActionVerifier(screenIntelligenceManager)
+    val errorRecoveryEngine = ErrorRecoveryEngine()
+
+    val personalIntelligenceHub: com.example.core.identity.PersonalIntelligenceHub by lazy {
+        val store = com.example.core.identity.AssistantIdentityStore.sharedInstance
+            ?: com.example.core.identity.AssistantIdentityStore(context)
+        com.example.core.identity.PersonalIntelligenceHub(
+            store = store,
+            memoryManager = memoryManager,
+            continuityManager = continuityManager,
+            conversationalEngine = conversationalEngine
+        )
+    }
+
+    /**
+     * Optional callback invoked whenever the user changes Personal AI Identity settings via natural language
+     * (e.g., assistant name, voice gender/speed/pitch, wake phrases, background voice, or floating icon).
+     */
+    var onPersonalPreferenceUpdated: ((com.example.core.identity.PreferenceCommandOutcome) -> Unit)? = null
 
     private val completedSideEffectSignatures = java.util.Collections.synchronizedSet(mutableSetOf<String>())
     private val uncertainExternalActionSignatures = java.util.Collections.synchronizedSet(mutableSetOf<String>())
@@ -624,12 +644,42 @@ class AgentRuntime(
             )
         }
 
-        // 0. Resolve pronouns ("him", "usko", "that file", "video about it", "open the second result") and check multi-turn continuation (Part 9)
+        // 0A. Check natural-language Personal AI Identity & Preference commands (e.g. "Call me Boss", "Change your name to QT", "Talk in Hinglish")
+        val prefOutcome = personalIntelligenceHub.preferenceCommandHandler.tryHandleCommand(trimmedPrompt)
+        if (prefOutcome.handled) {
+            assistantName = personalIntelligenceHub.identityManager.getAssistantName()
+            continuityManager.recordConversationTurn("user", trimmedPrompt)
+            continuityManager.recordConversationTurn("assistant", prefOutcome.confirmationMessage)
+            conversationalEngine.recordTurn("user", trimmedPrompt)
+            conversationalEngine.recordTurn("assistant", prefOutcome.confirmationMessage)
+            try {
+                onPersonalPreferenceUpdated?.invoke(prefOutcome)
+            } catch (_: Exception) {}
+            val prefTask = AgentTask(
+                userInstruction = userPrompt,
+                resolvedIntent = "PERSONAL_PREFERENCE_UPDATE",
+                actions = emptyList(),
+                state = TaskState.COMPLETED,
+                finalResult = prefOutcome.confirmationMessage
+            )
+            _currentTask.value = prefTask
+            _currentState.value = AgentState.Idle
+            return AgentExecutionSummary(
+                task = prefTask,
+                isSuccess = true,
+                message = prefOutcome.confirmationMessage,
+                verificationStatus = VerificationStatus.VERIFIED
+            )
+        }
+
+        // 0B. Resolve pronouns ("him", "usko", "that file", "video about it", "open the second result") and check multi-turn continuation (Part 9)
         val resolvedPrompt = continuityManager.resolveReferencesInPrompt(userPrompt)
         continuityManager.recordConversationTurn("user", resolvedPrompt)
-        try {
-            memoryManager.processPromptForMemory(resolvedPrompt)
-        } catch (_: Exception) {}
+        if (personalIntelligenceHub.userPreferenceMemory.isMemoryEnabled()) {
+            try {
+                memoryManager.processPromptForMemory(resolvedPrompt)
+            } catch (_: Exception) {}
+        }
         val hasPendingConf = confirmationManager.pendingConfirmation.value != null
         val contResolution = continuityManager.evaluateIncomingTurn(
             userTurn = resolvedPrompt,
@@ -925,6 +975,10 @@ class AgentRuntime(
                 if (openEndedSummary.isNotBlank()) {
                     enrichedParams.putIfAbsent("openEndedContext", openEndedSummary)
                 }
+                val adaptiveGuidance = selfImprovementEngine.buildAdaptivePlanningGuidance(task.userInstruction)
+                if (adaptiveGuidance.isNotBlank()) {
+                    enrichedParams.putIfAbsent("adaptiveGuidance", adaptiveGuidance)
+                }
             }
             val action = rawAction.copy(parameters = enrichedParams)
 
@@ -1074,14 +1128,39 @@ class AgentRuntime(
             } else null
 
             val isConfirmedFlag = activeConfirmation?.status == ConfirmationStatus.CONFIRMED
+            val stepStartMs = System.currentTimeMillis()
 
-            val execResult = withTimeoutOrNull(action.timeoutMs) {
+            var execResult = withTimeoutOrNull(action.timeoutMs) {
                 com.example.core.agent.tools.CommandDispatcher.dispatch(action, actionExecutor, isConfirmed = isConfirmedFlag)
             } ?: ActionExecutionResult(
                 isSuccess = false,
                 outputMessage = "Step ${index + 1} (${action.actionType.name}) timed out after ${action.timeoutMs}ms.",
                 status = VerificationStatus.TIMED_OUT
             )
+
+            // Bounded ErrorRecoveryEngine retry for safe idempotent transient failures
+            if (!execResult.isSuccess && action.idempotencyClassification == "IDEMPOTENT" &&
+                execResult.status in setOf(null, VerificationStatus.FAILED, VerificationStatus.TIMED_OUT)
+            ) {
+                val hasBackupProvider = providerManager.configuredProviders.value.count { it.isEnabled && it.hasKeySaved } > 1
+                val recoveryPlan = errorRecoveryEngine.planRecovery(
+                    action = action,
+                    result = execResult,
+                    attemptNumber = 0,
+                    hasSecondaryAiProvider = hasBackupProvider
+                )
+                if (recoveryPlan.canRetry &&
+                    recoveryPlan.strategy in setOf(RecoveryStrategy.RETRY_WITH_BACKOFF, RecoveryStrategy.FAILOVER_PROVIDER)
+                ) {
+                    stateManager.transition(task, TaskState.RETRYING, recoveryPlan.userExplanation)
+                    if (recoveryPlan.backoffDelayMs > 0L) {
+                        delay(recoveryPlan.backoffDelayMs.coerceAtMost(400L))
+                    }
+                    execResult = withTimeoutOrNull(action.timeoutMs) {
+                        com.example.core.agent.tools.CommandDispatcher.dispatch(action, actionExecutor, isConfirmed = isConfirmedFlag)
+                    } ?: execResult
+                }
+            }
 
             // Transition to OBSERVING & VERIFYING
             stateManager.transition(task, TaskState.OBSERVING)
@@ -1102,6 +1181,13 @@ class AgentRuntime(
                 executionResult = execResult,
                 preStateSummary = preState,
                 resolvedTargetPackage = resolvedPkg
+            )
+            val stepLatencyMs = (System.currentTimeMillis() - stepStartMs).coerceAtLeast(1L)
+            selfImprovementEngine.recordStepOutcome(
+                actionType = action.actionType,
+                verificationStatus = verification.status,
+                latencyMs = stepLatencyMs,
+                details = verification.details
             )
 
             if (verification.status == VerificationStatus.VERIFIED) {
@@ -1334,6 +1420,13 @@ class AgentRuntime(
                     }
                     task.finalResult = fullMsg
                     _currentState.value = AgentState.Error(fullMsg)
+                    selfImprovementEngine.recordTaskOutcome(task, finalVerStatus, fullMsg)
+                    memoryManager.recordWorkflowMemory(
+                        goal = task.userInstruction,
+                        actions = task.actions.map { it.actionType.name },
+                        succeeded = false,
+                        details = fullMsg
+                    )
                     logAndPersistTask(task, fullMsg, completedStepIds, stepContext)
                     return AgentExecutionSummary(
                         task = task,
@@ -1351,6 +1444,20 @@ class AgentRuntime(
         task.finalResult = finalResponse
         _currentState.value = AgentState.Completed(finalResponse)
         AgentEventBus.emit(AgentEvent.TaskFinished(task.taskId, true, finalResponse))
+        selfImprovementEngine.recordTaskOutcome(task, VerificationStatus.VERIFIED, finalResponse)
+        memoryManager.recordWorkflowMemory(
+            goal = task.userInstruction,
+            actions = task.actions.map { it.actionType.name },
+            succeeded = true,
+            details = finalResponse
+        )
+        val recentConv = conversationalEngine.getRecentHistory(limit = 10)
+        if (recentConv.size >= 6) {
+            memoryManager.summarizeConversation(
+                turns = recentConv.map { it.role to it.content },
+                sessionLabel = "session_${task.taskId.take(6)}"
+            )
+        }
         logAndPersistTask(task, finalResponse, completedStepIds, stepContext)
 
         return AgentExecutionSummary(
@@ -1485,6 +1592,8 @@ class AgentRuntime(
             "$stateTag ${act.actionType.name}${act.target?.let { " ($it)" } ?: ""}"
         }.orEmpty()
 
+        val compatReport = com.example.core.system.AndroidCompatibilityManager.evaluate()
+
         return AgentDiagnosticsReport(
             agentStatus = if (_currentState.value is AgentState.Error) "DEGRADED" else "ACTIVE",
             voiceStatus = voiceStateLabel,
@@ -1496,7 +1605,8 @@ class AgentRuntime(
             currentTaskTitle = activeTask?.userInstruction?.let { com.example.core.memory.MemoryPrivacyGuard.sanitizeContent(it) } ?: "Idle",
             currentTaskState = activeTask?.state?.name ?: "IDLE",
             stepChecklist = stepSummary,
-            heartbeatHealthy = isHeartbeatHealthy()
+            heartbeatHealthy = isHeartbeatHealthy(),
+            androidCompatibilitySummary = "${compatReport.androidVersionLabel} | OEM: ${compatReport.manufacturer}"
         )
     }
 
@@ -1517,6 +1627,41 @@ class AgentRuntime(
         }
         val plannedTask = agentBrain.planDynamicTaskWithModel(enrichedPrompt)
         return executePlannedTask(plannedTask, resolvedInstruction)
+    }
+
+    /**
+     * Restores persisted Room conversation turns, memories, and notes into the active
+     * [ConversationContinuityManager] and [ConversationalIntelligenceEngine] after app restarts
+     * so contextual follow-ups and daily plans remain intact across process death.
+     */
+    suspend fun hydrateMemoryAndConversationHistoryFromStorage(maxTurns: Int = 12): Int {
+        var restoredCount = 0
+        try {
+            val savedTurns = repository.conversations.firstOrNull().orEmpty()
+                .sortedBy { it.timestamp }
+                .takeLast(maxTurns)
+            if (savedTurns.isNotEmpty()) {
+                continuityManager.clearConversationTurns()
+                conversationalEngine.clearHistory()
+                for (turn in savedTurns) {
+                    val role = if (turn.sender.equals("user", ignoreCase = true)) "user" else "assistant"
+                    continuityManager.recordConversationTurn(role, turn.content)
+                    conversationalEngine.recordTurn(role, turn.content)
+                    restoredCount++
+                }
+            }
+            val savedNotes = repository.notes.firstOrNull().orEmpty()
+            val existingTitles = conversationalEngine.getDailyPlan().map { it.title.lowercase() }.toSet()
+            for (note in savedNotes.take(10)) {
+                val title = note.title.ifBlank { note.content }.trim()
+                if (title.isNotBlank() && title.lowercase() !in existingTitles) {
+                    conversationalEngine.addDailyPlanItem(title = title)
+                }
+            }
+        } catch (_: Exception) {
+            // Room hydration is best-effort; never crash app startup
+        }
+        return restoredCount
     }
 }
 
@@ -1548,7 +1693,8 @@ data class AgentDiagnosticsReport(
     val currentTaskTitle: String,
     val currentTaskState: String,
     val stepChecklist: List<String>,
-    val heartbeatHealthy: Boolean
+    val heartbeatHealthy: Boolean,
+    val androidCompatibilitySummary: String = ""
 ) {
     fun formatAsNayroStatusBlock(): String = buildString {
         appendLine("NAYRO AGENT STATUS")
@@ -1559,6 +1705,9 @@ data class AgentDiagnosticsReport(
         appendLine("Accessibility: $accessibilityStatus")
         appendLine("Service: $serviceStatus")
         appendLine("Gemini: $geminiStatus")
+        if (androidCompatibilitySummary.isNotBlank()) {
+            appendLine("Platform: $androidCompatibilitySummary")
+        }
         appendLine("Current Task: $currentTaskTitle ($currentTaskState)")
         if (stepChecklist.isNotEmpty()) {
             stepChecklist.forEach { appendLine(it) }

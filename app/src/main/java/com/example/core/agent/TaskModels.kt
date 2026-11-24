@@ -60,6 +60,7 @@ enum class ActionType {
     SEARCH_INSTALLED_APPS,
     GET_CURRENT_LOCATION,
     TOGGLE_FLASHLIGHT,
+    CONTROL_VOLUME,
 
     // Screen & Interaction Tools
     READ_SCREEN,
@@ -70,12 +71,15 @@ enum class ActionType {
     SCROLL_FORWARD,
     SCROLL_BACKWARD,
     SWIPE_SCREEN,
+    DRAG_SCREEN,
     NAVIGATE_BACK,
     NAVIGATE_HOME,
+    NAVIGATE_RECENTS,
     TAKE_SCREENSHOT,
     MANAGE_SCREEN_RECORDING,
     INTERACT_COORDINATES,
     ANALYZE_IMAGE_VISION,
+    UNIVERSAL_SCREEN_OPERATE,
     CONTROL_MEDIA,
 
     // Communication & Telephony Tools
@@ -107,16 +111,24 @@ enum class ActionType {
     DOC_SUMMARIZE,
     COMPARE_DOCUMENTS,
 
-    // Web & Research Agent Tools
+    // Web, Browser & Research Agent Tools
     WEB_SEARCH,
     FETCH_WEB_PAGE,
     SUMMARIZE_WEB_CONTENT,
+    BROWSER_OPEN_URL,
+    BROWSER_COMPARE_SOURCES,
+    BROWSER_FILL_FORM,
+    BROWSER_DOWNLOAD_FILE,
 
-    // Coding Agent Tools
+    // Coding Agent & Sandboxed Data/Dev Tools
     CODE_INSPECT_FILE,
     CODE_EDIT_FILE,
     CODE_DIAGNOSE_ERROR,
     CODE_GENERATE_DOCS,
+    EXECUTE_SANDBOXED_CODE,
+    SCAFFOLD_DEV_PROJECT,
+    ANALYZE_DATA_FILE,
+    EXECUTE_DYNAMIC_PLUGIN,
 
     // Skills, Workflows & Sub-Agent Orchestration Tools
     EXECUTE_PROCEDURAL_SKILL,
@@ -183,15 +195,7 @@ enum class VerificationStatus {
     }
 }
 
-fun TaskState.toActionExecutionState(): ActionExecutionState = when (this) {
-    TaskState.COMPLETED -> ActionExecutionState.SUCCESS
-    TaskState.AWAITING_PERMISSION, TaskState.WAITING_FOR_PERMISSION -> ActionExecutionState.WAITING_FOR_PERMISSION
-    TaskState.WAITING_FOR_DEVICE_UNLOCK -> ActionExecutionState.WAITING_FOR_UNLOCK
-    TaskState.AWAITING_CONFIRMATION, TaskState.WAITING_FOR_CONFIRMATION, TaskState.WAITING_FOR_USER_CONFIRMATION -> ActionExecutionState.WAITING_FOR_CONFIRMATION
-    TaskState.INCONCLUSIVE, TaskState.PARTIALLY_COMPLETED -> ActionExecutionState.INCONCLUSIVE
-    TaskState.FAILED, TaskState.NOT_SUPPORTED, TaskState.BLOCKED_BY_ANDROID, TaskState.TIMED_OUT, TaskState.CANCELLED -> ActionExecutionState.FAILED
-    else -> ActionExecutionState.IN_PROGRESS
-}
+// Note: TaskState.toActionExecutionState() is defined as a member method on TaskState above.
 
 data class VerificationEvidence(
     val preState: String? = null,
@@ -427,6 +431,7 @@ fun ActionType.toUserFriendlyDescription(
         ActionType.SEARCH_INSTALLED_APPS -> "Searching installed applications..."
         ActionType.GET_CURRENT_LOCATION -> "Reading current device location..."
         ActionType.TOGGLE_FLASHLIGHT -> "Toggling device flashlight..."
+        ActionType.CONTROL_VOLUME -> "Adjusting device volume (${parameters["operation"] ?: target ?: "media"})..."
         ActionType.READ_SCREEN -> "Reading current screen content..."
         ActionType.INSPECT_ACCESSIBILITY_TREE -> "Inspecting screen layout..."
         ActionType.CLICK_ELEMENT -> "Tapping ${target ?: "screen element"}..."
@@ -435,12 +440,15 @@ fun ActionType.toUserFriendlyDescription(
         ActionType.SCROLL_FORWARD -> "Scrolling down on screen..."
         ActionType.SCROLL_BACKWARD -> "Scrolling up on screen..."
         ActionType.SWIPE_SCREEN -> "Swiping on screen..."
+        ActionType.DRAG_SCREEN -> "Dragging on screen..."
         ActionType.NAVIGATE_BACK -> "Navigating back..."
         ActionType.NAVIGATE_HOME -> "Returning to Home screen..."
+        ActionType.NAVIGATE_RECENTS -> "Opening recent apps..."
         ActionType.TAKE_SCREENSHOT -> "Capturing screen snapshot..."
         ActionType.MANAGE_SCREEN_RECORDING -> "Managing screen recording (${parameters["operation"] ?: target ?: "status"})..."
         ActionType.INTERACT_COORDINATES -> "Interacting with screen coordinates..."
-        ActionType.ANALYZE_IMAGE_VISION -> "Analyzing screen image..."
+        ActionType.ANALYZE_IMAGE_VISION -> "Analyzing screen visually..."
+        ActionType.UNIVERSAL_SCREEN_OPERATE -> "Observing and operating screen${if (!target.isNullOrBlank()) " for '$target'" else ""}..."
         ActionType.CONTROL_MEDIA -> "Controlling media playback (${parameters["operation"] ?: target ?: "play"})..."
         ActionType.MESSAGE_DRAFT_SEND -> if (recipient != null) {
             "Preparing your WhatsApp message for $recipient..."
@@ -474,10 +482,18 @@ fun ActionType.toUserFriendlyDescription(
         ActionType.WEB_SEARCH -> "Searching the web${if (query != null) " for \"$query\"" else ""}..."
         ActionType.FETCH_WEB_PAGE -> "Fetching web page content..."
         ActionType.SUMMARIZE_WEB_CONTENT -> "Summarizing web article..."
+        ActionType.BROWSER_OPEN_URL -> "Opening ${target ?: "website"} in Chrome..."
+        ActionType.BROWSER_COMPARE_SOURCES -> "Comparing multiple web sources${if (query != null) " on \"$query\"" else ""}..."
+        ActionType.BROWSER_FILL_FORM -> "Filling browser form field..."
+        ActionType.BROWSER_DOWNLOAD_FILE -> "Downloading file via Android DownloadManager..."
         ActionType.CODE_INSPECT_FILE -> "Inspecting source file..."
         ActionType.CODE_EDIT_FILE -> "Updating code file..."
         ActionType.CODE_DIAGNOSE_ERROR -> "Diagnosing error log..."
         ActionType.CODE_GENERATE_DOCS -> "Generating documentation..."
+        ActionType.EXECUTE_SANDBOXED_CODE -> "Running script in on-device sandbox..."
+        ActionType.SCAFFOLD_DEV_PROJECT -> "Scaffolding development project in workspace..."
+        ActionType.ANALYZE_DATA_FILE -> "Analyzing structured data/spreadsheet..."
+        ActionType.EXECUTE_DYNAMIC_PLUGIN -> "Running custom plugin tool (${parameters["pluginId"] ?: target ?: "plugin"})..."
         ActionType.EXECUTE_PROCEDURAL_SKILL -> "Running saved skill workflow..."
         ActionType.REGISTER_CUSTOM_SKILL -> "Saving new custom skill..."
         ActionType.LIST_SKILLS -> "Listing available skills..."
@@ -543,6 +559,7 @@ fun String.toUserFriendlyIntentLabel(): String {
         "WHATSAPP_READ" -> "Reading WhatsApp Conversation"
         "PHONE_CALL" -> "Preparing Phone Call"
         "FLASHLIGHT_CONTROL" -> "Controlling Flashlight"
+        "VOLUME_CONTROL" -> "Controlling Device Volume"
         "NOTIFICATION_READ" -> "Reading Notifications"
         "FILE_FIND" -> "Searching Local Files"
         "REMINDER_CREATE" -> "Scheduling Reminder"

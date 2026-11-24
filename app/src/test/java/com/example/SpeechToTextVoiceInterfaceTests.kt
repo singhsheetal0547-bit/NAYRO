@@ -107,6 +107,78 @@ class SpeechToTextVoiceInterfaceTests {
 
         voiceManager.clearTranscriptAndError()
         assertEquals("", voiceManager.transcribedText.value)
+        assertEquals("", voiceManager.partialTranscript.value)
         assertNull(voiceManager.errorMessage.value)
     }
+
+    @Test
+    fun testClearTranscriptAndErrorClearsProviderPartialTranscriptAndResetsOnNewSession() {
+        val voiceManager = VoiceManager(context = null)
+        voiceManager.speechRecognitionProvider.simulateSpeechRecognitionLifecycleForTest(
+            partialHypotheses = listOf("Open", "Open WhatsApp"),
+            finalTranscript = "Open WhatsApp"
+        )
+        voiceManager.dispatchRecognizedSpeech("Open WhatsApp")
+
+        assertEquals("Open WhatsApp", voiceManager.transcribedText.value)
+        assertEquals("Open WhatsApp", voiceManager.partialTranscript.value)
+
+        // Starting a new capture session must immediately clear stale transcripts before recording starts
+        voiceManager.startListening()
+        assertEquals("", voiceManager.transcribedText.value)
+        assertEquals("", voiceManager.partialTranscript.value)
+
+        // Re-populate and verify explicit clearTranscriptAndError clears both flows and error state
+        voiceManager.speechRecognitionProvider.simulateSpeechRecognitionLifecycleForTest(
+            partialHypotheses = listOf("Check battery"),
+            finalTranscript = "Check battery"
+        )
+        voiceManager.dispatchRecognizedSpeech("Check battery")
+        voiceManager.clearTranscriptAndError()
+
+        assertEquals("", voiceManager.transcribedText.value)
+        assertEquals("", voiceManager.partialTranscript.value)
+        assertNull(voiceManager.errorMessage.value)
+    }
+
+    @Test
+    fun testSpeechRecognizerErrorMappingAndRmsNormalization() {
+        val voiceManager = VoiceManager(context = null)
+        val provider = voiceManager.speechRecognitionProvider
+
+        assertTrue(provider.mapSpeechRecognizerError(android.speech.SpeechRecognizer.ERROR_NO_MATCH).contains("try speaking", ignoreCase = true))
+        assertTrue(provider.mapSpeechRecognizerError(android.speech.SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS).contains("Microphone", ignoreCase = true))
+        assertTrue(provider.mapSpeechRecognizerError(android.speech.SpeechRecognizer.ERROR_NETWORK).contains("Network", ignoreCase = true))
+        assertTrue(provider.mapSpeechRecognizerError(12).contains("language", ignoreCase = true))
+        assertTrue(provider.mapSpeechRecognizerError(13).contains("language pack", ignoreCase = true))
+
+        assertEquals(0f, provider.normalizeRmsDb(Float.NaN), 0.001f)
+        assertEquals(0f, provider.normalizeRmsDb(-5f), 0.001f)
+        assertEquals(1f, provider.normalizeRmsDb(10f), 0.001f)
+        assertEquals(1f, provider.normalizeRmsDb(25f), 0.001f)
+        assertTrue(provider.normalizeRmsDb(4f) in 0.4f..0.6f)
+    }
+
+    @Test
+    fun testEndToEndSpeechRecognizerVoiceInputReachesAiAgentHandler() {
+        val voiceManager = VoiceManager(context = null)
+        val receivedAgentPrompts = mutableListOf<String>()
+
+        voiceManager.attachUiListener(
+            onRecognized = { prompt -> receivedAgentPrompts.add(prompt) }
+        )
+
+        val result = voiceManager.speechRecognitionProvider.simulateSpeechRecognitionLifecycleForTest(
+            partialHypotheses = listOf("आज मुझे", "आज मुझे Rahul को कॉल"),
+            finalTranscript = "आज मुझे Rahul को कॉल करना है",
+            languageTag = "hi-IN",
+            confidence = 0.93f
+        )
+
+        voiceManager.dispatchRecognizedSpeech(result.primaryText)
+
+        assertEquals(listOf("आज मुझे Rahul को कॉल करना है"), receivedAgentPrompts)
+        assertEquals("आज मुझे Rahul को कॉल करना है", voiceManager.transcribedText.value)
+    }
 }
+

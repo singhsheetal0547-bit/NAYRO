@@ -55,9 +55,33 @@ data class ScreenContext(
     val isAccessibilityAvailable: Boolean
 )
 
+data class VisualElementRegion(
+    val regionId: String,
+    val centerX: Int,
+    val centerY: Int,
+    val width: Int,
+    val height: Int,
+    val edgeEnergy: Float,
+    val zoneLabel: String
+)
+
+enum class RestrictedScreenType {
+    NONE,
+    FLAG_SECURE_PROTECTED,
+    AUTHENTICATION_OR_PASSWORD,
+    BANKING_OR_PAYMENT,
+    ACCESSIBILITY_UNAVAILABLE
+}
+
+data class RestrictedScreenStatus(
+    val isRestricted: Boolean,
+    val type: RestrictedScreenType,
+    val reason: String
+)
+
 /**
  * Section 6 — Real Computer-Use Visual Screen Observation produced by pixel-level
- * screenshot analysis fused with Accessibility node bounding boxes.
+ * screenshot analysis fused with Accessibility node bounding boxes and salient visual regions.
  */
 data class VisualScreenObservation(
     val width: Int,
@@ -69,6 +93,8 @@ data class VisualScreenObservation(
     val visualPerceptualHash: Long,
     val detectedRegionsSummary: String,
     val groundedTextElements: List<String>,
+    val isLikelyProtectedBlackFrame: Boolean = false,
+    val salientRegions: List<VisualElementRegion> = emptyList(),
     val timestampMs: Long = System.currentTimeMillis()
 )
 

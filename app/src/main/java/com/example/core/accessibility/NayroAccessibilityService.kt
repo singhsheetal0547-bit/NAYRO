@@ -369,4 +369,180 @@ class NayroAccessibilityService : AccessibilityService() {
 
         return outcome ?: (false to "Swipe gesture timed out.")
     }
+
+    /**
+     * Captures a live software [android.graphics.Bitmap] on Android 11+ (API 30+) for
+     * multimodal Vision AI OCR, game/HUD perception, and pixel-diff verification.
+     * Caller owns recycling the returned Bitmap.
+     */
+    suspend fun captureRealScreenshotBitmap(): android.graphics.Bitmap? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return withTimeoutOrNull(4000L) {
+            suspendCancellableCoroutine<android.graphics.Bitmap?> { cont ->
+                try {
+                    takeScreenshot(
+                        Display.DEFAULT_DISPLAY,
+                        mainExecutor,
+                        object : TakeScreenshotCallback {
+                            override fun onSuccess(screenshot: ScreenshotResult) {
+                                val buffer = screenshot.hardwareBuffer
+                                var swBitmap: android.graphics.Bitmap? = null
+                                try {
+                                    val hwBitmap = android.graphics.Bitmap.wrapHardwareBuffer(
+                                        buffer,
+                                        screenshot.colorSpace
+                                    )
+                                    swBitmap = hwBitmap?.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+                                    hwBitmap?.recycle()
+                                } catch (_: Throwable) {
+                                    swBitmap = null
+                                } finally {
+                                    buffer.close()
+                                }
+                                if (cont.isActive) cont.resume(swBitmap)
+                            }
+
+                            override fun onFailure(errorCode: Int) {
+                                if (cont.isActive) cont.resume(null)
+                            }
+                        }
+                    )
+                } catch (_: Throwable) {
+                    if (cont.isActive) cont.resume(null)
+                }
+            }
+        }
+    }
+
+    /**
+     * Dispatches a real long-press gesture at (x, y) for [durationMs] (default 650ms).
+     */
+    suspend fun dispatchLongPressGesture(x: Float, y: Float, durationMs: Long = 650L): Pair<Boolean, String> {
+        val displayMetrics = resources.displayMetrics
+        val maxW = displayMetrics.widthPixels.toFloat().coerceAtLeast(1080f)
+        val maxH = displayMetrics.heightPixels.toFloat().coerceAtLeast(2400f)
+
+        if (x < 0f || y < 0f || x > maxW || y > maxH) {
+            return false to "Invalid long-press coordinates ($x, $y): outside screen bounds (0..$maxW, 0..$maxH)."
+        }
+
+        val safeDuration = durationMs.coerceIn(450L, 2500L)
+        val outcome = withTimeoutOrNull(safeDuration + 2500L) {
+            suspendCancellableCoroutine<Pair<Boolean, String>> { cont ->
+                try {
+                    val path = Path().apply { moveTo(x, y) }
+                    val stroke = GestureDescription.StrokeDescription(path, 0L, safeDuration)
+                    val gesture = GestureDescription.Builder().addStroke(stroke).build()
+                    val dispatched = dispatchGesture(
+                        gesture,
+                        object : GestureResultCallback() {
+                            override fun onCompleted(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) cont.resume(true to "Dispatched long-press gesture at ($x, $y) for ${safeDuration}ms.")
+                            }
+
+                            override fun onCancelled(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) cont.resume(false to "Long-press gesture at ($x, $y) was cancelled by the system.")
+                            }
+                        },
+                        null
+                    )
+                    if (!dispatched && cont.isActive) {
+                        cont.resume(false to "System rejected long-press gesture at ($x, $y).")
+                    }
+                } catch (e: Exception) {
+                    if (cont.isActive) cont.resume(false to "Failed to dispatch long-press gesture: ${e.localizedMessage}")
+                }
+            }
+        }
+        return outcome ?: (false to "Long-press gesture at ($x, $y) timed out.")
+    }
+
+    /**
+     * Dispatches a real press-and-drag gesture (hold at start, then drag smoothly to end)
+     * for sliders, drag-and-drop interfaces, maps, and game controls.
+     */
+    suspend fun dispatchDragGesture(
+        startX: Float,
+        startY: Float,
+        endX: Float,
+        endY: Float,
+        holdMs: Long = 350L,
+        dragDurationMs: Long = 500L
+    ): Pair<Boolean, String> {
+        val displayMetrics = resources.displayMetrics
+        val maxW = displayMetrics.widthPixels.toFloat().coerceAtLeast(1080f)
+        val maxH = displayMetrics.heightPixels.toFloat().coerceAtLeast(2400f)
+
+        if (startX < 0f || startY < 0f || endX < 0f || endY < 0f ||
+            startX > maxW || endX > maxW || startY > maxH || endY > maxH
+        ) {
+            return false to "Invalid drag coordinates ($startX,$startY -> $endX,$endY): outside screen bounds."
+        }
+
+        val safeHold = holdMs.coerceIn(100L, 1200L)
+        val safeDrag = dragDurationMs.coerceIn(150L, 2000L)
+        val outcome = withTimeoutOrNull(safeHold + safeDrag + 2500L) {
+            suspendCancellableCoroutine<Pair<Boolean, String>> { cont ->
+                try {
+                    val holdPath = Path().apply { moveTo(startX, startY) }
+                    val dragPath = Path().apply {
+                        moveTo(startX, startY)
+                        lineTo(endX, endY)
+                    }
+                    val holdStroke = GestureDescription.StrokeDescription(holdPath, 0L, safeHold, true)
+                    val dragStroke = holdStroke.continueStroke(dragPath, 0L, safeDrag, false)
+                    val gesture = GestureDescription.Builder().addStroke(dragStroke).build()
+                    val dispatched = dispatchGesture(
+                        gesture,
+                        object : GestureResultCallback() {
+                            override fun onCompleted(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) {
+                                    cont.resume(true to "Dispatched drag gesture from ($startX, $startY) to ($endX, $endY).")
+                                }
+                            }
+
+                            override fun onCancelled(gestureDescription: GestureDescription?) {
+                                if (cont.isActive) cont.resume(false to "Drag gesture was cancelled by the system.")
+                            }
+                        },
+                        null
+                    )
+                    if (!dispatched && cont.isActive) {
+                        cont.resume(false to "System rejected drag gesture dispatch.")
+                    }
+                } catch (e: Exception) {
+                    if (cont.isActive) cont.resume(false to "Failed to dispatch drag gesture: ${e.localizedMessage}")
+                }
+            }
+        }
+        return outcome ?: (false to "Drag gesture timed out.")
+    }
+
+    /**
+     * Dispatches a screen-adaptive directional scroll/swipe gesture using live display dimensions.
+     * Note: "down" scrolls content downward (finger drags from bottom toward top);
+     * "up" scrolls content upward (finger drags from top toward bottom).
+     */
+    suspend fun dispatchDirectionalScroll(
+        direction: String,
+        distanceFraction: Float = 0.55f,
+        durationMs: Long = 320L
+    ): Pair<Boolean, String> {
+        val dm = resources.displayMetrics
+        val w = dm.widthPixels.toFloat().coerceAtLeast(720f)
+        val h = dm.heightPixels.toFloat().coerceAtLeast(1280f)
+        val frac = distanceFraction.coerceIn(0.2f, 0.75f)
+        val cx = w * 0.5f
+        val cy = h * 0.5f
+        val halfV = h * (frac / 2f)
+        val halfH = w * (frac / 2f)
+
+        return when (direction.trim().lowercase()) {
+            "down", "scroll_down", "forward" -> dispatchSwipeGesture(cx, cy + halfV, cx, cy - halfV, durationMs)
+            "up", "scroll_up", "backward" -> dispatchSwipeGesture(cx, cy - halfV, cx, cy + halfV, durationMs)
+            "left", "scroll_left" -> dispatchSwipeGesture(cx + halfH, cy, cx - halfH, cy, durationMs)
+            "right", "scroll_right" -> dispatchSwipeGesture(cx - halfH, cy, cx + halfH, cy, durationMs)
+            else -> false to "Unknown scroll direction '$direction'."
+        }
+    }
 }

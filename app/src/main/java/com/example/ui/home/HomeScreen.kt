@@ -62,6 +62,7 @@ import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
+import com.example.core.service.VoiceAgentServiceSnapshot
 import com.example.core.voice.VoiceState
 import com.example.data.local.entities.ConversationEntity
 import com.example.ui.components.AssistantOrb
@@ -110,7 +111,12 @@ fun HomeScreen(
     isFollowUpSessionActive: Boolean = false,
     backgroundListeningStatus: String = "",
     onToggleBackgroundListening: (Boolean) -> Unit = {},
-    onEndConversationSession: () -> Unit = {}
+    onEndConversationSession: () -> Unit = {},
+    voiceAgentServiceSnapshot: VoiceAgentServiceSnapshot? = null,
+    onStartAgentService: () -> Unit = { onToggleBackgroundListening(true) },
+    onPauseAgentService: () -> Unit = {},
+    onResumeAgentService: () -> Unit = {},
+    onStopAgentService: () -> Unit = { onToggleBackgroundListening(false) }
 ) {
     var textInput by remember { mutableStateOf("") }
     val scrollState = rememberScrollState()
@@ -474,7 +480,12 @@ fun HomeScreen(
             isBackgroundListeningEnabled = isBackgroundListeningEnabled,
             isFollowUpSessionActive = isFollowUpSessionActive,
             onToggleBackgroundListening = onToggleBackgroundListening,
-            onEndConversationSession = onEndConversationSession
+            onEndConversationSession = onEndConversationSession,
+            serviceSnapshot = voiceAgentServiceSnapshot,
+            onStartAgentService = onStartAgentService,
+            onPauseAgentService = onPauseAgentService,
+            onResumeAgentService = onResumeAgentService,
+            onStopAgentService = onStopAgentService
         )
 
         Spacer(modifier = Modifier.height(16.dp))

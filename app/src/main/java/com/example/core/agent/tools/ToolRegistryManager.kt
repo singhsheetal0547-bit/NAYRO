@@ -30,9 +30,25 @@ data class DynamicToolDefinition(
     val requiredPermission: String? = null
 )
 
+/**
+ * Runtime-extensible plugin tool definition allowing new tools to be registered and invoked
+ * dynamically without modifying the fixed [ActionType] enum or rebuilding the architecture.
+ */
+data class DynamicToolPlugin(
+    val pluginId: String,
+    val displayName: String,
+    val description: String,
+    val category: ToolCategory = ToolCategory.PRODUCTIVITY,
+    val parametersSchema: Map<String, String> = emptyMap(),
+    val requiredParams: Set<String> = emptySet(),
+    val riskLevel: RiskLevel = RiskLevel.R0_LOCAL_READONLY,
+    val handler: suspend (Map<String, String>) -> com.example.core.agent.ActionExecutionResult
+)
+
 object ToolRegistryManager : ToolRegistry, ToolCatalog {
 
     private val catalog = mutableMapOf<ActionType, DynamicToolDefinition>()
+    private val runtimePlugins = java.util.concurrent.ConcurrentHashMap<String, DynamicToolPlugin>()
 
     init {
         registerBuiltInTools()
@@ -40,7 +56,53 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
 
     fun resetToDefaults() {
         catalog.clear()
+        runtimePlugins.clear()
         registerBuiltInTools()
+    }
+
+    fun registerPlugin(plugin: DynamicToolPlugin) {
+        val cleanId = plugin.pluginId.trim().lowercase()
+        require(cleanId.isNotEmpty()) { "Plugin ID cannot be empty." }
+        runtimePlugins[cleanId] = plugin.copy(pluginId = cleanId)
+    }
+
+    fun unregisterPlugin(pluginId: String): Boolean =
+        runtimePlugins.remove(pluginId.trim().lowercase()) != null
+
+    fun getPlugin(pluginId: String): DynamicToolPlugin? =
+        runtimePlugins[pluginId.trim().lowercase()]
+
+    fun getAllPlugins(): List<DynamicToolPlugin> =
+        runtimePlugins.values.sortedBy { it.pluginId }
+
+    suspend fun executePlugin(
+        pluginId: String,
+        parameters: Map<String, String>
+    ): com.example.core.agent.ActionExecutionResult {
+        val plugin = getPlugin(pluginId)
+            ?: return com.example.core.agent.ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "Dynamic plugin '$pluginId' is not registered.",
+                status = com.example.core.agent.VerificationStatus.NOT_SUPPORTED
+            )
+        for (req in plugin.requiredParams) {
+            if (parameters[req].isNullOrBlank()) {
+                return com.example.core.agent.ActionExecutionResult(
+                    isSuccess = false,
+                    outputMessage = "Missing required parameter '$req' for plugin '${plugin.pluginId}'.",
+                    status = com.example.core.agent.VerificationStatus.FAILED
+                )
+            }
+        }
+        return try {
+            plugin.handler(parameters)
+        } catch (e: Exception) {
+            com.example.core.agent.ActionExecutionResult(
+                isSuccess = false,
+                outputMessage = "Plugin '${plugin.pluginId}' execution error: ${e.message ?: e::class.simpleName}",
+                status = com.example.core.agent.VerificationStatus.FAILED
+            )
+        }
     }
 
     private fun registerBuiltInTools() {
@@ -141,6 +203,21 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 description = "Turns the device camera flashlight (torch) ON or OFF using Android CameraManager.",
                 category = ToolCategory.DEVICE_SYSTEM,
                 parametersSchema = mapOf("enabled" to "Boolean ('true' or 'false') - Whether to turn torch on or off"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.CONTROL_VOLUME,
+                toolId = "android.control_volume",
+                displayName = "Control Device Volume",
+                description = "Adjusts Android media, ring, alarm, or notification volume (UP, DOWN, MUTE, UNMUTE, SET percentage, or STATUS) via AudioManager and verifies resulting level.",
+                category = ToolCategory.DEVICE_SYSTEM,
+                parametersSchema = mapOf(
+                    "operation" to "String - UP, DOWN, MUTE, UNMUTE, SET, or STATUS",
+                    "stream" to "String - media (default), ring, alarm, notification, or call",
+                    "levelPercent" to "Int - Optional percentage 0..100 when operation=SET"
+                ),
                 riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
@@ -440,6 +517,51 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                 category = ToolCategory.WEB_RESEARCH,
                 parametersSchema = mapOf("content" to "String - Web text or URL to summarize"),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.BROWSER_OPEN_URL,
+                toolId = "browser.open_url",
+                displayName = "Open Website in Chrome",
+                description = "Opens an SSRF-validated website URL in Google Chrome or the default Android browser.",
+                category = ToolCategory.WEB_RESEARCH,
+                parametersSchema = mapOf("url" to "String - Website URL or domain"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.BROWSER_COMPARE_SOURCES,
+                toolId = "browser.compare_sources",
+                displayName = "Compare Multiple Web Sources",
+                description = "Searches and extracts multiple web sources and compares key facts with citations.",
+                category = ToolCategory.WEB_RESEARCH,
+                parametersSchema = mapOf("topic" to "String - Topic to research and compare", "urls" to "Optional comma-separated URLs"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.BROWSER_FILL_FORM,
+                toolId = "browser.fill_form",
+                displayName = "Fill Browser Form Field",
+                description = "Uses authorized Accessibility service to enter text into a browser web form field.",
+                category = ToolCategory.WEB_RESEARCH,
+                parametersSchema = mapOf("field" to "String - Form field label", "value" to "String - Text to type", "submitButton" to "Optional submit button label"),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE,
+                requiredCapability = CapabilityId.ACCESSIBILITY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.BROWSER_DOWNLOAD_FILE,
+                toolId = "browser.download_file",
+                displayName = "Download Permitted Web File",
+                description = "Enqueues an SSRF-validated HTTPS file download via Android DownloadManager into Downloads.",
+                category = ToolCategory.WEB_RESEARCH,
+                parametersSchema = mapOf("url" to "String - HTTPS file URL", "fileName" to "Optional output file name"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
 
@@ -924,6 +1046,47 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
         )
         register(
             DynamicToolDefinition(
+                actionType = ActionType.NAVIGATE_RECENTS,
+                toolId = "screen.navigate_recents",
+                displayName = "Open Recent Apps",
+                description = "Opens the Android Recent Apps overview switcher via AccessibilityService.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = emptyMap(),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.DRAG_SCREEN,
+                toolId = "screen.drag_gesture",
+                displayName = "Drag Screen Gesture",
+                description = "Performs a real press-and-drag gesture between two screen coordinates for sliders, maps, and game controls.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = mapOf(
+                    "startX" to "Float - Start X coordinate in pixels",
+                    "startY" to "Float - Start Y coordinate in pixels",
+                    "endX" to "Float - End X coordinate in pixels",
+                    "endY" to "Float - End Y coordinate in pixels"
+                ),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.UNIVERSAL_SCREEN_OPERATE,
+                toolId = "screen.universal_operate",
+                displayName = "Universal AI Screen Operator",
+                description = "Observes the live Android screen (Accessibility + MediaProjection/Screenshot + On-Device CV + Multimodal Vision AI), decides the next visual or semantic action, executes it, and verifies screen transition across apps, games, browsers, and system settings.",
+                category = ToolCategory.SCREEN_CONTROL,
+                parametersSchema = mapOf(
+                    "goal" to "String - Natural-language on-screen goal or follow-up command",
+                    "maxSteps" to "Int - Optional max observe-act-verify steps (default 6)"
+                ),
+                riskLevel = RiskLevel.R2_APPLICATION_STATE
+            )
+        )
+        register(
+            DynamicToolDefinition(
                 actionType = ActionType.MANAGE_SCREEN_RECORDING,
                 toolId = "screen.manage_screen_recording",
                 displayName = "Screen Recording (MediaProjection)",
@@ -972,6 +1135,65 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
                     "body" to "String - Optional message content"
                 ),
                 riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.EXECUTE_SANDBOXED_CODE,
+                toolId = "coding.execute_sandboxed_code",
+                displayName = "Sandboxed Script Executor",
+                description = "Executes safe Python/JS computational scripts inside a Play-policy compliant pure-Kotlin sandbox with strict step/timeout caps and zero OS/shell access.",
+                category = ToolCategory.CODING_AGENT,
+                parametersSchema = mapOf(
+                    "code" to "String - Python or JavaScript code snippet to evaluate",
+                    "language" to "String - 'python' (default) or 'javascript'"
+                ),
+                requiredParams = setOf("code"),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.SCAFFOLD_DEV_PROJECT,
+                toolId = "coding.scaffold_dev_project",
+                displayName = "Scaffold Dev Project",
+                description = "Creates starter Python, JavaScript, React, or React Native project files inside NAYRO's confined workspace.",
+                category = ToolCategory.CODING_AGENT,
+                parametersSchema = mapOf(
+                    "projectName" to "String - Project folder name inside workspace",
+                    "template" to "String - python, javascript, react, or react-native"
+                ),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.ANALYZE_DATA_FILE,
+                toolId = "workspace.analyze_data_file",
+                displayName = "Analyze CSV/JSON Data",
+                description = "Parses CSV/TSV/JSON workspace files or inline tabular data, computes column statistics (sum/avg/min/max), filters rows, and generates Markdown reports.",
+                category = ToolCategory.WORKSPACE_FILES,
+                parametersSchema = mapOf(
+                    "filename" to "String - Optional workspace CSV/TSV/JSON file path",
+                    "data" to "String - Optional inline CSV/JSON text",
+                    "filter" to "String - Optional column=value row filter",
+                    "saveReportAs" to "String - Optional workspace path to save Markdown report"
+                ),
+                riskLevel = RiskLevel.R0_LOCAL_READONLY
+            )
+        )
+        register(
+            DynamicToolDefinition(
+                actionType = ActionType.EXECUTE_DYNAMIC_PLUGIN,
+                toolId = "plugins.execute_dynamic_plugin",
+                displayName = "Execute Registered Dynamic Plugin",
+                description = "Invokes any dynamically registered runtime plugin tool by pluginId without rebuilding the agent architecture.",
+                category = ToolCategory.SKILLS_SUBAGENTS,
+                parametersSchema = mapOf(
+                    "pluginId" to "String - Registered dynamic plugin identifier"
+                ),
+                requiredParams = setOf("pluginId"),
+                riskLevel = RiskLevel.R1_LOW_IMPACT_REVERSIBLE
             )
         )
     }
@@ -1063,9 +1285,15 @@ object ToolRegistryManager : ToolRegistry, ToolCatalog {
         com.example.core.agent.ExecutionDomain.entries.associateWith { domain -> getToolsByDomain(domain).size }
 
     override fun generateLlmToolPromptSummary(): String {
-        return catalog.values.joinToString("\n") { tool ->
+        val baseTools = catalog.values.joinToString("\n") { tool ->
             "- ${tool.actionType.name} (${tool.displayName}): ${tool.description} Params: ${tool.parametersSchema.keys}"
         }
+        val plugins = getAllPlugins()
+        if (plugins.isEmpty()) return baseTools
+        val pluginLines = plugins.joinToString("\n") { p ->
+            "- EXECUTE_DYNAMIC_PLUGIN[pluginId=${p.pluginId}] (${p.displayName}): ${p.description} Params: ${p.parametersSchema.keys}"
+        }
+        return "$baseTools\nRegistered Runtime Plugins:\n$pluginLines"
     }
 }
 

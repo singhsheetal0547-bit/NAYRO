@@ -411,6 +411,8 @@ class VoiceManager(
     fun clearTranscriptAndError() {
         _transcribedText.value = ""
         _errorMessage.value = null
+        speechRecognitionProvider.clearTranscript()
+        voiceProviderRouter.deepgramSttProvider.clearTranscript()
     }
 
     /**
@@ -491,9 +493,20 @@ class VoiceManager(
             wakePhrases = profile.wakePhrases,
             languageTag = profile.languageTag,
             speechRate = profile.speechRate,
+            voicePitch = profile.voicePitch,
+            voiceGender = profile.voiceGender,
             isTtsEnabled = profile.isTtsEnabled,
             isWakeWordEnabled = profile.isWakeWordEnabled,
             isContinuousConversationEnabled = profile.isContinuousConversationEnabled
+        )
+        speechSynthesisProvider.configure(
+            TtsSynthesisConfig(
+                languageTag = profile.languageTag,
+                speechRate = profile.speechRate,
+                pitch = profile.voicePitch,
+                voiceGender = profile.voiceGender,
+                autoDetectUtteranceLanguage = profile.conversationLanguageMode == com.example.core.identity.ConversationLanguageMode.AUTO
+            )
         )
     }
 
@@ -723,6 +736,8 @@ class VoiceManager(
     fun startManualListening(isFollowUpTurn: Boolean = false, onResult: (String) -> Unit) {
         onResultCallback = onResult
         _errorMessage.value = null
+        _transcribedText.value = ""
+        speechRecognitionProvider.clearTranscript()
         cancelFollowUpTimeout()
 
         if (!isMicrophonePermissionGranted()) {
@@ -977,6 +992,18 @@ class VoiceManager(
         try {
             tts?.language = resolvedLocale
             tts?.setSpeechRate(_configuration.value.speechRate.coerceIn(0.5f, 2.0f))
+            val effectivePitch = AndroidSpeechSynthesisProvider.resolveEffectivePitch(
+                _configuration.value.voicePitch,
+                _configuration.value.voiceGender
+            )
+            tts?.setPitch(effectivePitch)
+            tts?.let { engine ->
+                AndroidSpeechSynthesisProvider.selectVoiceForGender(
+                    engine = engine,
+                    locale = resolvedLocale,
+                    gender = _configuration.value.voiceGender
+                )
+            }
         } catch (_: Throwable) {}
 
         microphoneOwnership.enterResponsePlayback("Speaking response via TTS (${resolvedLocale.toLanguageTag()})")
@@ -1138,6 +1165,19 @@ class VoiceManager(
             speechSynthesisProvider.stop()
         } catch (_: Throwable) {}
         interruptSpeakingAndListen(onResult)
+    }
+
+    /**
+     * Signals Android SpeechRecognizer that the user finished speaking so it can finalize
+     * and deliver onResults() to the AI agent without cancelling the captured audio.
+     */
+    fun finishListeningAndSubmit() {
+        cancelFollowUpTimeout()
+        speechRecognitionProvider.stopListening()
+        voiceProviderRouter.deepgramSttProvider.stopListening()
+        if (_voiceState.value == VoiceState.LISTENING || _voiceState.value == VoiceState.FOLLOW_UP_LISTENING) {
+            _voiceState.value = VoiceState.TRANSCRIBING
+        }
     }
 
     fun stopListening() {

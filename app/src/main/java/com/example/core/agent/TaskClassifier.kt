@@ -11,6 +11,7 @@ enum class UserIntentType {
     OPEN_DIALER,
     PHONE_CALL,
     FLASHLIGHT_CONTROL,
+    VOLUME_CONTROL,
     NOTIFICATION_READ,
     FILE_FIND,
     REMINDER_CREATE,
@@ -23,6 +24,8 @@ enum class UserIntentType {
     LOCAL_TIME,
     LOCAL_CALCULATOR,
     MEDIA_CONTROL,
+    BROWSER_TASK,
+    SCREEN_OPERATE,
     GENERAL_AI_QUERY
 }
 
@@ -162,6 +165,41 @@ object TaskClassifier {
             )
         }
 
+        // 2c-b. Device Volume Control Intent (English, Hinglish, Hindi)
+        val mentionsVolume = lower.contains("volume") || lower.contains("awaz") || lower.contains("awaaz") ||
+            trimmed.contains("वॉल्यूम") || trimmed.contains("आवाज़") || trimmed.contains("आवाज") ||
+            lower == "mute" || lower == "unmute" || lower == "mute phone" || lower == "unmute phone"
+        if (mentionsVolume && !lower.contains("setting")) {
+            val stream = when {
+                lower.contains("ring") || lower.contains("ringer") -> "ring"
+                lower.contains("alarm") -> "alarm"
+                lower.contains("notification") -> "notification"
+                lower.contains("call") -> "call"
+                else -> "media"
+            }
+            val pctMatch = Regex("(\\d{1,3})\\s*%?").find(lower)
+            val pctValue = pctMatch?.groupValues?.getOrNull(1)?.toIntOrNull()?.coerceIn(0, 100)
+            val operation = when {
+                lower.contains("unmute") || lower.contains("अनम्यूट") -> "UNMUTE"
+                lower.contains("mute") || lower.contains("silent") || lower.contains("chup") || trimmed.contains("म्यूट") -> "MUTE"
+                pctValue != null && (lower.contains("set") || lower.contains("karo") || lower.contains("to ") || lower.contains("%") || lower.contains("par")) -> "SET"
+                lower.contains("down") || lower.contains("decrease") || lower.contains("lower") || lower.contains("reduce") ||
+                    lower.contains("kam") || lower.contains("dheema") || lower.contains("dhima") || trimmed.contains("कम") -> "DOWN"
+                lower.contains("up") || lower.contains("increase") || lower.contains("raise") || lower.contains("high") ||
+                    lower.contains("max") || lower.contains("full") || lower.contains("badha") || lower.contains("tez") ||
+                    trimmed.contains("बढ़ा") || trimmed.contains("तेज") || trimmed.contains("ज़्यादा") -> "UP"
+                lower.contains("kitna") || lower.contains("status") || lower.contains("check") || lower.contains("what") -> "STATUS"
+                else -> "UP"
+            }
+            return ResolvedIntent(
+                type = UserIntentType.VOLUME_CONTROL,
+                targetAppOrEntity = stream,
+                section = operation,
+                searchQueryOrContent = pctValue?.toString() ?: "",
+                rawPrompt = prompt
+            )
+        }
+
         // 2d. Notification Read / Summarize Intent
         if ((lower.contains("notification") || trimmed.contains("नोटिफिकेशन")) &&
             (lower.contains("read") || lower.contains("check") || lower.contains("summarize") || lower.contains("padho") || lower.contains("dikhao") || lower.contains("batao") ||
@@ -195,21 +233,35 @@ object TaskClassifier {
             )
         }
 
-        // 3. Screen Read / Dialog Explanation Intent
+        // 3. Screen Read / Visual Explanation Intent ("What is on my screen?", "Read this page", "Explain this screen")
         if (lower.contains("screen par kya") ||
+            lower.contains("screen pe kya") ||
             lower.contains("page par kya likha") ||
             lower.contains("dialog ko samjhao") ||
             lower.contains("explain this dialog") ||
+            lower.contains("explain this screen") ||
+            lower.contains("explain the screen") ||
+            lower.contains("describe this screen") ||
+            lower.contains("describe the screen") ||
+            lower.contains("read this page") ||
+            lower.contains("read the page") ||
+            lower.contains("yeh page padho") ||
+            lower.contains("is screen ko samjhao") ||
             lower.contains("screen padho") ||
             lower.contains("what is on screen") ||
+            lower.contains("what is on my screen") ||
             lower.contains("what's on screen") ||
+            lower.contains("what's on my screen") ||
+            lower.contains("whats on my screen") ||
             lower.contains("read screen") ||
             trimmed.contains("स्क्रीन पढ़ो") ||
             trimmed.contains("स्क्रीन पर क्या") ||
+            trimmed.contains("यह पेज पढ़ो") ||
             (lower.contains("read") && lower.contains("screen") && !lower.contains("save"))
         ) {
             return ResolvedIntent(
                 type = UserIntentType.SCREEN_READ,
+                searchQueryOrContent = trimmed,
                 rawPrompt = prompt
             )
         }
@@ -512,26 +564,64 @@ object TaskClassifier {
                 )
             }
         }
-        if ((lower.contains("song") || lower.contains("songs") || lower.contains("gaana") || lower.contains("gaane") || lower.contains("music")) &&
-            (lower.contains("chalao") || lower.contains("play") || lower.contains("lagao") || lower.contains("sunao"))
-        ) {
+        val hasMusicNoun = lower.contains("song") || lower.contains("songs") || lower.contains("gaana") ||
+            lower.contains("gaane") || lower.contains("music") || trimmed.contains("गाना") || trimmed.contains("गाने") || trimmed.contains("म्यूजिक")
+        val hasPlayVerb = lower.contains("chalao") || lower.contains("chala do") || lower.contains("chala de") ||
+            lower.contains("play") || lower.contains("lagao") || lower.contains("laga do") ||
+            lower.contains("sunao") || lower.contains("suna do") || lower.contains("bajao") || lower.contains("baja do") ||
+            trimmed.contains("चलाओ") || trimmed.contains("चला दो") || trimmed.contains("लगाओ") || trimmed.contains("सुनाओ")
+        if (hasMusicNoun && hasPlayVerb) {
             val targetApp = when {
                 lower.contains("spotify") -> "com.spotify.music"
                 lower.contains("youtube music") -> "com.google.android.apps.youtube.music"
                 else -> "com.google.android.youtube"
             }
-            val cleanedQuery = trimmed
+            val detectedMood = when {
+                lower.contains("mood off") || lower.contains("mood kharab") || lower.contains("udaas") ||
+                    lower.contains("dukhi") || lower.contains("upset") || lower.contains("stressed") ||
+                    lower.contains("low feel") || lower.contains("mood thik") -> "mood_uplift"
+                lower.contains("sad") -> "sad"
+                lower.contains("romantic") || lower.contains("pyaar") -> "romantic"
+                lower.contains("party") || lower.contains("dance") -> "party"
+                lower.contains("lofi") || lower.contains("relax") || lower.contains("chill") || lower.contains("tired") -> "lofi"
+                lower.contains("bhajan") || lower.contains("devotional") -> "bhajan"
+                lower.contains("happy") || lower.contains("khush") -> "happy"
+                else -> null
+            }
+
+            val strippedForQuery = trimmed
                 .removeSuffix(".")
-                .replaceFirst(Regex("^(?i)(hey babu|hi babu|babu|nayro)\\s*,?\\s*"), "")
+                .removeSuffix("।")
+                .replaceFirst(Regex("^(?i)(hey babu|hi babu|babu|hey nayro|hi nayro|nayro)\\s*,?\\s*"), "")
+                .replace(Regex("(?i)(aaj\\s+)?(mera\\s+)?mood\\s+(off|kharab|low|sad)\\s*(hai|ho raha hai)?[.,!\\s]*"), "")
+                .replace(Regex("(?i)(mere\\s+liye|for\\s+me|please|plz|zara)\\s+"), "")
+                .replace(Regex("(?i)(youtube\\s+music|youtube|spotify)\\s+(par|pe|mein|me|kholo\\s+aur|open\\s+karo\\s+aur)?\\s*"), "")
                 .replaceFirst(Regex("^(?i)(open\\s+youtube\\s+and\\s+|youtube\\s+kholo\\s+aur\\s+|spotify\\s+kholo\\s+aur\\s+|ab\\s+|now\\s+)"), "")
-                .replaceFirst(Regex("^(?i)(play|chalao|lagao|sunao)\\s+"), "")
-                .replaceFirst(Regex("(?i)\\s+(ke\\s+songs\\s+chalao|ke\\s+gaane\\s+chalao|songs\\s+chalao|song\\s+chalao|chalao|lagao|on\\s+youtube|on\\s+spotify)\\s*$"), "")
+                .replaceFirst(Regex("^(?i)(play|chalao|chala do|chala de|lagao|laga do|sunao|suna do|bajao|baja do)\\s+"), "")
+                .replaceFirst(Regex("(?i)\\s+(ke\\s+songs\\s+chalao|ke\\s+gaane\\s+chalao|songs\\s+chalao|song\\s+chalao|gaana\\s+chala\\s+do|gaana\\s+chalao|chala\\s+do|chala\\s+de|chalao|lagao|laga\\s+do|sunao|suna\\s+do|on\\s+youtube|on\\s+spotify)\\s*$"), "")
                 .trim()
                 .removeSuffix(".")
-                .ifBlank { "Hindi songs" }
+
+            val isGenericRequest = strippedForQuery.isBlank() ||
+                strippedForQuery.lowercase() in setOf(
+                    "koi achha gaana", "koi acha gaana", "achha gaana", "acha gaana",
+                    "koi gaana", "good song", "a good song", "nice song", "some music", "music", "song", "gaana"
+                )
+
+            val finalQuery = when {
+                !isGenericRequest -> strippedForQuery
+                detectedMood == "mood_uplift" -> "feel good uplifting Hindi songs"
+                detectedMood == "sad" -> "soothing Hindi sad songs"
+                detectedMood == "romantic" -> "best Hindi romantic songs"
+                detectedMood == "party" -> "Bollywood party hit songs"
+                detectedMood == "lofi" -> "relaxing Hindi lofi chill songs"
+                detectedMood == "bhajan" -> "peaceful morning bhajan"
+                detectedMood == "happy" -> "upbeat happy Hindi songs"
+                else -> "best Hindi songs"
+            }
 
             val op = when {
-                lower.contains("sad") || lower.contains("romantic") || lower.contains("party") || lower.contains("lofi") || lower.contains("bhajan") -> "PLAY_BY_GENRE_OR_MOOD"
+                detectedMood != null -> "PLAY_BY_GENRE_OR_MOOD"
                 lower.contains("ke songs") || lower.contains("ke gaane") -> "PLAY_BY_ARTIST"
                 else -> "PLAY_QUERY"
             }
@@ -539,7 +629,7 @@ object TaskClassifier {
                 type = UserIntentType.MEDIA_CONTROL,
                 targetAppOrEntity = targetApp,
                 section = op,
-                searchQueryOrContent = cleanedQuery,
+                searchQueryOrContent = finalQuery,
                 rawPrompt = prompt
             )
         }
@@ -593,6 +683,75 @@ object TaskClassifier {
                 type = UserIntentType.SETTINGS_NAVIGATE,
                 targetAppOrEntity = "com.android.settings",
                 section = section,
+                rawPrompt = prompt
+            )
+        }
+
+        // 7B. Browser & Internet Agent Intents (Open URL in Chrome, Compare Web Sources, Download File, Fill Web Form)
+        val urlMatch = Regex("(https?://\\S+|\\b[a-z0-9-]+\\.(?:com|org|net|in|io|gov|edu|dev|ai)(?:/\\S*)?)", RegexOption.IGNORE_CASE).find(trimmed)
+        if (lower.contains("compare") && (lower.contains("source") || lower.contains("website") || lower.contains("web") || lower.contains("online") || lower.contains("article"))) {
+            val topic = trimmed.replaceFirst(Regex("(?i).*compare\\s+(?:multiple\\s+)?(?:web\\s+|online\\s+)?(?:sources|websites|articles)?\\s*(?:on|about|for)?\\s*"), "").trim().ifBlank { trimmed }
+            return ResolvedIntent(
+                type = UserIntentType.BROWSER_TASK,
+                section = "COMPARE_SOURCES",
+                searchQueryOrContent = topic,
+                rawPrompt = prompt
+            )
+        }
+        if ((lower.contains("download") || lower.contains("डाउनलोड")) && urlMatch != null) {
+            return ResolvedIntent(
+                type = UserIntentType.BROWSER_TASK,
+                section = "DOWNLOAD_FILE",
+                targetAppOrEntity = urlMatch.groupValues[1].trimEnd('.', ',', ')'),
+                rawPrompt = prompt
+            )
+        }
+        if ((lower.contains("fill") || lower.contains("type")) && lower.contains("form")) {
+            val fieldMatch = Regex("(?i)(?:field|box|input)\\s+([A-Za-z0-9 _-]+?)\\s+(?:with|to)\\s+(.+)").find(trimmed)
+            return ResolvedIntent(
+                type = UserIntentType.BROWSER_TASK,
+                section = "FILL_FORM",
+                targetAppOrEntity = fieldMatch?.groupValues?.getOrNull(1)?.trim() ?: "search",
+                searchQueryOrContent = fieldMatch?.groupValues?.getOrNull(2)?.trim() ?: trimmed,
+                rawPrompt = prompt
+            )
+        }
+        if (urlMatch != null && (lower.contains("open") || lower.contains("visit") || lower.contains("go to") || lower.contains("chrome") || lower.contains("browse") || lower.contains("kholo") || trimmed.contains("खोलो"))) {
+            return ResolvedIntent(
+                type = UserIntentType.BROWSER_TASK,
+                section = "OPEN_URL",
+                targetAppOrEntity = urlMatch.groupValues[1].trimEnd('.', ',', ')'),
+                rawPrompt = prompt
+            )
+        }
+
+        // 7C. Universal Screen Operator Intents (works across ANY app, game, website, or settings screen)
+        val isRecentAppsCmd = lower.contains("recent app") || lower == "recents" || lower == "open recents" || trimmed.contains("रीसेंट ऐप")
+        val isNavBackCmd = lower == "go back" || lower == "back" || lower == "wapas jao" || lower == "peeche jao" || trimmed == "वापस जाओ" || trimmed == "पीछे जाओ"
+        val isNavHomeCmd = lower == "go home" || lower == "home screen" || lower == "go to home" || lower == "home jao"
+        val isScrollOrSwipeCmd = lower.startsWith("scroll ") || lower.startsWith("swipe ") || lower.startsWith("drag ") ||
+            lower.contains("neeche scroll") || lower.contains("upar scroll") || trimmed.contains("स्क्रॉल")
+        val isOrdinalOpenCmd = (lower.contains("open") || lower.contains("click") || lower.contains("tap") || lower.contains("select") || lower.contains("press")) &&
+            com.example.core.screen.ScreenIntelligenceManager.parseOrdinalIndex(lower) != null
+        val isDirectUiControlCmd = Regex("^(?i)(click|tap|press|long press|select)\\s+").containsMatchIn(lower) ||
+            lower.contains("open its settings") || lower.contains("open game settings") ||
+            lower.contains("settings icon") ||
+            ((lower.startsWith("turn on ") || lower.startsWith("turn off ") || lower.startsWith("enable ") || lower.startsWith("disable ")) &&
+                !lower.contains("flashlight") && !lower.contains("torch") && !lower.contains("memory") && !lower.contains("background") && !lower.contains("floating")) ||
+            (lower.startsWith("find ") && (lower.contains("feature") || lower.contains("option") || lower.contains("button") || lower.contains("setting") || lower.contains("on screen") || lower.contains("menu")))
+
+        if (isRecentAppsCmd || isNavBackCmd || isNavHomeCmd || isScrollOrSwipeCmd || isOrdinalOpenCmd || isDirectUiControlCmd) {
+            val opSubType = when {
+                isRecentAppsCmd -> "RECENTS"
+                isNavBackCmd -> "BACK"
+                isNavHomeCmd -> "HOME"
+                isScrollOrSwipeCmd -> "GESTURE"
+                else -> "OPERATE_GOAL"
+            }
+            return ResolvedIntent(
+                type = UserIntentType.SCREEN_OPERATE,
+                section = opSubType,
+                searchQueryOrContent = trimmed,
                 rawPrompt = prompt
             )
         }

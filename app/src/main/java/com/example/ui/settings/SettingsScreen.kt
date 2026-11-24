@@ -31,11 +31,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,6 +50,11 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.core.identity.AssistantIdentityProfile
+import com.example.core.identity.ConversationLanguageMode
+import com.example.core.identity.PersonalityMode
+import com.example.core.identity.ResponseLengthMode
+import com.example.core.identity.VoiceGender
 import com.example.core.provider.ProviderConfig
 import com.example.core.voice.SpeechRecognitionEngineType
 import com.example.core.voice.VoiceProviderStatus
@@ -88,16 +96,37 @@ fun SettingsScreen(
     onSaveDeepgramKey: (String) -> Unit = {},
     onDeleteDeepgramKey: () -> Unit = {},
     onTestDeepgramConnection: (suspend () -> Pair<Boolean, String>)? = null,
-    providerTestStatusMessage: String = ""
+    providerTestStatusMessage: String = "",
+    identityProfile: AssistantIdentityProfile = AssistantIdentityProfile(assistantDisplayName = assistantName),
+    isFloatingIconRunning: Boolean = false,
+    conversationCount: Int = 0,
+    onUpdatePersonalPreferences: (
+        userAddress: String?,
+        languageMode: ConversationLanguageMode?,
+        personalityMode: PersonalityMode?,
+        customPersonalityNote: String?,
+        responseLength: ResponseLengthMode?,
+        voiceGender: VoiceGender?,
+        speechRate: Float?,
+        voicePitch: Float?,
+        isMemoryEnabled: Boolean?
+    ) -> Unit = { _, _, _, _, _, _, _, _, _ -> },
+    onToggleFloatingIcon: (Boolean) -> Unit = {},
+    onClearConversationHistory: () -> Unit = {}
 ) {
     val scrollState = rememberScrollState()
     val scope = rememberCoroutineScope()
 
     var assistantNameDraft by remember(assistantName) { mutableStateOf(assistantName) }
+    var userAddressDraft by remember(identityProfile.userAddress) { mutableStateOf(identityProfile.userAddress) }
+    var customPersonalityDraft by remember(identityProfile.customPersonalityNote) { mutableStateOf(identityProfile.customPersonalityNote) }
+    var voiceSpeedDraft by remember(identityProfile.speechRate) { mutableFloatStateOf(identityProfile.speechRate) }
+    var voicePitchDraft by remember(identityProfile.voicePitch) { mutableFloatStateOf(identityProfile.voicePitch) }
     var customWakePhraseDraft by remember { mutableStateOf("") }
     var geminiKeyInput by remember { mutableStateOf("") }
     var openaiKeyInput by remember { mutableStateOf("") }
     var grokKeyInput by remember { mutableStateOf("") }
+    var openrouterKeyInput by remember { mutableStateOf("") }
     var deepseekKeyInput by remember { mutableStateOf("") }
     var deepgramKeyInput by remember { mutableStateOf("") }
     var deepgramStatusNote by remember { mutableStateOf("") }
@@ -108,6 +137,7 @@ fun SettingsScreen(
     var enrolledSamplesStatus by remember { mutableStateOf("") }
     var isRecordingWakeSample by remember { mutableStateOf(false) }
     var enrollmentRefreshTick by remember { mutableIntStateOf(0) }
+    var personalIdentityNotice by remember { mutableStateOf("") }
 
     val dynamicWakePhrases = remember(assistantName, configuredWakePhrases, enrollmentRefreshTick) {
         if (configuredWakePhrases.isNotEmpty()) {
@@ -131,16 +161,16 @@ fun SettingsScreen(
             color = MaterialTheme.colorScheme.onBackground
         )
         Text(
-            text = "Multi-provider AI routing, voice intelligence & hardware KeyStore security",
+            text = "Personal AI identity, multi-provider AI routing, voice runtime & hardware KeyStore security",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
 
         Spacer(modifier = Modifier.height(20.dp))
 
-        // A. Assistant Identity Section (Section 2: Custom Assistant Identity System)
+        // A. PERSONAL AI IDENTITY Section
         SettingsGroup(
-            title = "A. Assistant Identity",
+            title = "A. PERSONAL AI IDENTITY",
             icon = Icons.Default.SmartToy
         ) {
             Column(modifier = Modifier.padding(16.dp)) {
@@ -150,11 +180,13 @@ fun SettingsScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "NAYRO is the permanent product identity. Customize your personal assistant's name below (e.g., Babu, Jarvis, Friday, Alex).",
+                    text = "Customize your personal agent identity, addressing, voice persona, language, personality, and persistent memory. Changes apply immediately and survive app restarts.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(10.dp))
+
+                // 1. Assistant Name
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
@@ -171,10 +203,10 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            val clean = assistantNameDraft.trim().ifEmpty { "Babu" }
+                            val clean = assistantNameDraft.trim().ifEmpty { "NAYRO" }
                             assistantNameDraft = clean
                             onSaveAssistantName(clean)
-                            enrolledSamplesStatus = "Assistant identity updated to '$clean'. Dynamic wake phrases: 'Hi $clean', 'Hey $clean'."
+                            personalIdentityNotice = "Assistant name saved as '$clean'. Wake phrases synced."
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
                         modifier = Modifier.testTag("settings_save_assistant_name_button")
@@ -184,12 +216,12 @@ fun SettingsScreen(
                 }
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Babu", "Jarvis", "Friday", "Alex").forEach { preset ->
+                    AssistantIdentityProfile.ASSISTANT_NAME_PRESETS.forEach { preset ->
                         OutlinedButton(
                             onClick = {
                                 assistantNameDraft = preset
                                 onSaveAssistantName(preset)
-                                enrolledSamplesStatus = "Switched assistant name to '$preset'."
+                                personalIdentityNotice = "Switched assistant name to '$preset'."
                             },
                             modifier = Modifier.testTag("preset_assistant_${preset.lowercase()}")
                         ) {
@@ -197,17 +229,348 @@ fun SettingsScreen(
                         }
                     }
                 }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 2. User Addressing
+                Text(
+                    text = "User Address: ${identityProfile.userAddress}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = userAddressDraft,
+                        onValueChange = { userAddressDraft = it },
+                        label = { Text("How should $assistantName call you?") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("settings_user_address_input")
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            val cleanAddr = userAddressDraft.trim().ifEmpty { "Sir" }
+                            userAddressDraft = cleanAddr
+                            onUpdatePersonalPreferences(cleanAddr, null, null, null, null, null, null, null, null)
+                            personalIdentityNotice = "User addressing updated to '$cleanAddr'."
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
+                        modifier = Modifier.testTag("settings_save_user_address_button")
+                    ) {
+                        Text("Save")
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    AssistantIdentityProfile.USER_ADDRESS_PRESETS.forEach { preset ->
+                        val selected = identityProfile.userAddress.equals(preset, ignoreCase = true)
+                        Button(
+                            onClick = {
+                                userAddressDraft = preset
+                                onUpdatePersonalPreferences(preset, null, null, null, null, null, null, null, null)
+                                personalIdentityNotice = "User addressing set to '$preset'."
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selected) ForestGreen else SoftSage,
+                                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else ForestGreen
+                            ),
+                            modifier = Modifier.testTag("preset_address_${preset.lowercase()}")
+                        ) {
+                            Text(preset, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 3. Assistant Voice Gender, Speed & Pitch
+                Text(
+                    text = "Assistant Voice: ${identityProfile.voiceGender.displayName}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(VoiceGender.FEMALE, VoiceGender.MALE, VoiceGender.SYSTEM_DEFAULT).forEach { gender ->
+                        val selected = identityProfile.voiceGender == gender
+                        Button(
+                            onClick = {
+                                onUpdatePersonalPreferences(null, null, null, null, null, gender, null, null, null)
+                                personalIdentityNotice = "Assistant voice set to ${gender.displayName}."
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selected) ForestGreen else SoftSage,
+                                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else ForestGreen
+                            ),
+                            modifier = Modifier.testTag("voice_gender_${gender.name.lowercase()}")
+                        ) {
+                            Text(gender.displayName, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = "Voice Speed: ${"%.2f".format(voiceSpeedDraft)}x",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Slider(
+                    value = voiceSpeedDraft,
+                    onValueChange = { voiceSpeedDraft = it },
+                    onValueChangeFinished = {
+                        onUpdatePersonalPreferences(null, null, null, null, null, null, voiceSpeedDraft, null, null)
+                    },
+                    valueRange = 0.6f..1.8f,
+                    colors = SliderDefaults.colors(thumbColor = Coral, activeTrackColor = ForestGreen),
+                    modifier = Modifier.testTag("voice_speed_slider")
+                )
+
+                Text(
+                    text = "Voice Pitch: ${"%.2f".format(voicePitchDraft)}x",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                Slider(
+                    value = voicePitchDraft,
+                    onValueChange = { voicePitchDraft = it },
+                    onValueChangeFinished = {
+                        onUpdatePersonalPreferences(null, null, null, null, null, null, null, voicePitchDraft, null)
+                    },
+                    valueRange = 0.6f..1.6f,
+                    colors = SliderDefaults.colors(thumbColor = Coral, activeTrackColor = ForestGreen),
+                    modifier = Modifier.testTag("voice_pitch_slider")
+                )
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // 4. Conversation Language
+                Text(
+                    text = "Conversation Language: ${identityProfile.conversationLanguageMode.displayName}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ConversationLanguageMode.entries.forEach { langMode ->
+                        val selected = identityProfile.conversationLanguageMode == langMode
+                        Button(
+                            onClick = {
+                                onUpdatePersonalPreferences(null, langMode, null, null, null, null, null, null, null)
+                                personalIdentityNotice = "Conversation language set to ${langMode.displayName}."
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selected) ForestGreen else SoftSage,
+                                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else ForestGreen
+                            ),
+                            modifier = Modifier.testTag("conv_lang_${langMode.name.lowercase()}")
+                        ) {
+                            Text(langMode.displayName, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // 5. Personality Mode
+                Text(
+                    text = "Personality: ${identityProfile.personalityMode.displayName}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(PersonalityMode.PROFESSIONAL, PersonalityMode.FRIENDLY, PersonalityMode.CASUAL).forEach { mode ->
+                        val selected = identityProfile.personalityMode == mode
+                        Button(
+                            onClick = {
+                                onUpdatePersonalPreferences(null, null, mode, null, null, null, null, null, null)
+                                personalIdentityNotice = "Personality set to ${mode.displayName}."
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selected) ForestGreen else SoftSage,
+                                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else ForestGreen
+                            ),
+                            modifier = Modifier.testTag("personality_${mode.name.lowercase()}")
+                        ) {
+                            Text(mode.displayName, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf(PersonalityMode.FUNNY, PersonalityMode.CUSTOM).forEach { mode ->
+                        val selected = identityProfile.personalityMode == mode
+                        Button(
+                            onClick = {
+                                onUpdatePersonalPreferences(null, null, mode, customPersonalityDraft, null, null, null, null, null)
+                                personalIdentityNotice = "Personality set to ${mode.displayName}."
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selected) ForestGreen else SoftSage,
+                                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else ForestGreen
+                            ),
+                            modifier = Modifier.testTag("personality_${mode.name.lowercase()}")
+                        ) {
+                            Text(mode.displayName, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                }
+                if (identityProfile.personalityMode == PersonalityMode.CUSTOM) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedTextField(
+                            value = customPersonalityDraft,
+                            onValueChange = { customPersonalityDraft = it },
+                            label = { Text("Custom Personality Style") },
+                            singleLine = true,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("custom_personality_input")
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                onUpdatePersonalPreferences(null, null, PersonalityMode.CUSTOM, customPersonalityDraft, null, null, null, null, null)
+                                personalIdentityNotice = "Custom personality saved."
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = ForestGreen)
+                        ) {
+                            Text("Save")
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // 6. Response Length
+                Text(
+                    text = "Response Length: ${identityProfile.responseLength.displayName}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    ResponseLengthMode.entries.forEach { len ->
+                        val selected = identityProfile.responseLength == len
+                        Button(
+                            onClick = {
+                                onUpdatePersonalPreferences(null, null, null, null, len, null, null, null, null)
+                                personalIdentityNotice = "Response length set to ${len.displayName}."
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (selected) ForestGreen else SoftSage,
+                                contentColor = if (selected) MaterialTheme.colorScheme.onPrimary else ForestGreen
+                            ),
+                            modifier = Modifier.testTag("response_len_${len.name.lowercase()}")
+                        ) {
+                            Text(len.displayName, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 7. Personal Memory ON/OFF
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Personal Memory: ${if (identityProfile.isMemoryEnabled) "ON" else "OFF"}",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Remember user preferences, facts, and context across app restarts.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = identityProfile.isMemoryEnabled,
+                        onCheckedChange = { enabled ->
+                            onUpdatePersonalPreferences(null, null, null, null, null, null, null, null, enabled)
+                            personalIdentityNotice = "Personal memory turned ${if (enabled) "ON" else "OFF"}."
+                        },
+                        colors = SwitchDefaults.colors(checkedThumbColor = Coral, checkedTrackColor = ForestGreen),
+                        modifier = Modifier.testTag("toggle_memory_switch")
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // 8. Floating Icon ON/OFF (Independent of Background Voice Mode)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Floating Icon: ${if (isFloatingIconRunning) "ON" else "OFF"}",
+                            style = MaterialTheme.typography.bodyLarge,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Controlled independently of Background Voice Mode.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = isFloatingIconRunning,
+                        onCheckedChange = { enabled ->
+                            onToggleFloatingIcon(enabled)
+                            personalIdentityNotice = "Floating icon turned ${if (enabled) "ON" else "OFF"}."
+                        },
+                        colors = SwitchDefaults.colors(checkedThumbColor = Coral, checkedTrackColor = ForestGreen),
+                        modifier = Modifier.testTag("toggle_floating_icon_switch")
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // 9. Persistent Conversation History Management
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Conversation History ($conversationCount saved turns)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Persisted locally in Room SQLite and hydrated on startup.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            onClearConversationHistory()
+                            personalIdentityNotice = "Cleared saved conversation history."
+                        },
+                        modifier = Modifier.testTag("clear_conversation_history_button")
+                    ) {
+                        Text("Clear", color = ErrorRed)
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = "Configured Wake Phrases: ${dynamicWakePhrases.joinToString { "'$it'" }}",
                     style = MaterialTheme.typography.bodyMedium
                 )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Languages Supported: Hindi, English, Hinglish",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Coral
-                )
+                if (personalIdentityNotice.isNotBlank()) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = personalIdentityNotice,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = SuccessGreen
+                    )
+                }
             }
         }
 
@@ -652,7 +1015,32 @@ fun SettingsScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Provider 4: DeepSeek
+                // Provider 4: OpenRouter
+                val openrouterConfig = providers.firstOrNull { it.id == "openrouter_custom" }
+                val isOpenrouterActive = activeProviderId == "openrouter_custom"
+                ProviderEntryCard(
+                    title = "OpenRouter API",
+                    modelInfo = "Model: ${openrouterConfig?.modelId ?: "meta-llama/llama-3.1-8b-instruct"}",
+                    hasKey = openrouterConfig?.hasKeySaved == true,
+                    isActive = isOpenrouterActive,
+                    inputValue = openrouterKeyInput,
+                    onInputChange = { openrouterKeyInput = it },
+                    label = "OpenRouter API Key",
+                    onSave = {
+                        if (openrouterKeyInput.isNotBlank()) {
+                            onSaveApiKey("openrouter_custom", openrouterKeyInput)
+                            openrouterKeyInput = ""
+                        }
+                    },
+                    onDelete = { onDeleteApiKey("openrouter_custom") },
+                    onSelectPrimary = { onSelectPrimaryProvider("openrouter_custom") },
+                    onTest = { onTestProvider("openrouter_custom") },
+                    testTag = "openrouter"
+                )
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                // Provider 5: DeepSeek
                 val deepseekConfig = providers.firstOrNull { it.id == "deepseek_custom" }
                 val isDeepseekActive = activeProviderId == "deepseek_custom"
                 ProviderEntryCard(

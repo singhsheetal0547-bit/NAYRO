@@ -6,9 +6,37 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
+enum class VoiceGender(val displayName: String) {
+    FEMALE("Female"),
+    MALE("Male"),
+    SYSTEM_DEFAULT("System Default")
+}
+
+enum class ConversationLanguageMode(val displayName: String, val defaultLocaleTag: String) {
+    AUTO("Auto", "en-IN"),
+    ENGLISH("English", "en-IN"),
+    HINDI("Hindi", "hi-IN"),
+    HINGLISH("Hinglish", "hi-IN")
+}
+
+enum class PersonalityMode(val displayName: String) {
+    PROFESSIONAL("Professional"),
+    FRIENDLY("Friendly"),
+    CASUAL("Casual"),
+    FUNNY("Funny"),
+    CUSTOM("Custom")
+}
+
+enum class ResponseLengthMode(val displayName: String, val suggestedMaxTokens: Int) {
+    SHORT("Short", 384),
+    BALANCED("Balanced", 1024),
+    DETAILED("Detailed", 2048)
+}
+
 /**
- * Single authoritative persistent configuration source for NAYRO's assistant identity,
- * configurable wake phrases, voice/TTS preferences, and language settings.
+ * Single authoritative persistent configuration source for NAYRO's Personal AI Identity,
+ * configurable wake phrases, voice persona (gender/speed/pitch), user addressing,
+ * conversation language/personality/length, memory toggle, and independent background/floating toggles.
  *
  * - Never hardcodes a permanent assistant name in business logic.
  * - Reads existing user preference from `nayro_permission_setup_prefs` ("assistant_persona_name")
@@ -21,8 +49,17 @@ data class AssistantIdentityProfile(
     val languageTag: String = "en-IN",
     val responseTone: String = "Balanced",
     val speechRate: Float = 1.0f,
+    val voicePitch: Float = 1.0f,
+    val voiceGender: VoiceGender = VoiceGender.SYSTEM_DEFAULT,
+    val userAddress: String = "Sir",
+    val conversationLanguageMode: ConversationLanguageMode = ConversationLanguageMode.AUTO,
+    val personalityMode: PersonalityMode = PersonalityMode.FRIENDLY,
+    val customPersonalityNote: String = "",
+    val responseLength: ResponseLengthMode = ResponseLengthMode.BALANCED,
     val isTtsEnabled: Boolean = true,
     val isWakeWordEnabled: Boolean = false,
+    val isFloatingIconEnabled: Boolean = false,
+    val isMemoryEnabled: Boolean = true,
     val isContinuousConversationEnabled: Boolean = true,
     val activationResponse: String = "Haan, boliye"
 ) {
@@ -36,6 +73,8 @@ data class AssistantIdentityProfile(
             "Hi Babu",
             "Hi Qki"
         )
+        val USER_ADDRESS_PRESETS = listOf("Sir", "Madam", "Boss", "Babu", "Sona")
+        val ASSISTANT_NAME_PRESETS = listOf("NAYRO", "QT", "Babu", "Wavy")
     }
 }
 
@@ -51,8 +90,17 @@ class AssistantIdentityStore(private val context: Context?) {
         private const val KEY_LANGUAGE_TAG = "identity_language_tag"
         private const val KEY_RESPONSE_TONE = "identity_response_tone"
         private const val KEY_SPEECH_RATE = "identity_speech_rate"
+        private const val KEY_VOICE_PITCH = "identity_voice_pitch"
+        private const val KEY_VOICE_GENDER = "identity_voice_gender"
+        private const val KEY_USER_ADDRESS = "identity_user_address"
+        private const val KEY_CONVERSATION_LANGUAGE = "identity_conversation_language"
+        private const val KEY_PERSONALITY_MODE = "identity_personality_mode"
+        private const val KEY_CUSTOM_PERSONALITY_NOTE = "identity_custom_personality_note"
+        private const val KEY_RESPONSE_LENGTH = "identity_response_length"
         private const val KEY_TTS_ENABLED = "identity_tts_enabled"
         private const val KEY_WAKE_ENABLED = "identity_wake_word_enabled"
+        private const val KEY_FLOATING_ICON_ENABLED = "identity_floating_icon_enabled"
+        private const val KEY_MEMORY_ENABLED = "identity_memory_enabled"
         private const val KEY_CONTINUOUS_CONVERSATION = "identity_continuous_conversation"
         private const val KEY_ACTIVATION_RESPONSE = "identity_activation_response"
 
@@ -100,7 +148,6 @@ class AssistantIdentityStore(private val context: Context?) {
                 .distinctBy { it.lowercase() }
                 .ifEmpty { buildDefaultWakePhrasesForName(resolvedName) }
         } else {
-            // Preserve user's existing custom name in wake phrases if migrated from legacy prefs
             if (legacyName != null) {
                 buildDefaultWakePhrasesForName(legacyName)
             } else {
@@ -111,8 +158,25 @@ class AssistantIdentityStore(private val context: Context?) {
         val lang = prefs?.getString(KEY_LANGUAGE_TAG, "en-IN")?.takeIf { it.isNotBlank() } ?: "en-IN"
         val tone = prefs?.getString(KEY_RESPONSE_TONE, "Balanced")?.takeIf { it.isNotBlank() } ?: "Balanced"
         val speechRate = prefs?.getFloat(KEY_SPEECH_RATE, 1.0f)?.coerceIn(0.6f, 1.8f) ?: 1.0f
+        val voicePitch = prefs?.getFloat(KEY_VOICE_PITCH, 1.0f)?.coerceIn(0.6f, 1.6f) ?: 1.0f
+        val voiceGender = prefs?.getString(KEY_VOICE_GENDER, null)?.let { raw ->
+            VoiceGender.entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+        } ?: VoiceGender.SYSTEM_DEFAULT
+        val userAddress = prefs?.getString(KEY_USER_ADDRESS, "Sir")?.takeIf { it.isNotBlank() } ?: "Sir"
+        val convLang = prefs?.getString(KEY_CONVERSATION_LANGUAGE, null)?.let { raw ->
+            ConversationLanguageMode.entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+        } ?: ConversationLanguageMode.AUTO
+        val personality = prefs?.getString(KEY_PERSONALITY_MODE, null)?.let { raw ->
+            PersonalityMode.entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+        } ?: PersonalityMode.FRIENDLY
+        val customPersonality = prefs?.getString(KEY_CUSTOM_PERSONALITY_NOTE, "")?.orEmpty() ?: ""
+        val responseLen = prefs?.getString(KEY_RESPONSE_LENGTH, null)?.let { raw ->
+            ResponseLengthMode.entries.firstOrNull { it.name.equals(raw, ignoreCase = true) }
+        } ?: ResponseLengthMode.BALANCED
         val ttsEnabled = prefs?.getBoolean(KEY_TTS_ENABLED, true) ?: true
         val wakeEnabled = prefs?.getBoolean(KEY_WAKE_ENABLED, false) ?: false
+        val floatingEnabled = prefs?.getBoolean(KEY_FLOATING_ICON_ENABLED, false) ?: false
+        val memoryEnabled = prefs?.getBoolean(KEY_MEMORY_ENABLED, true) ?: true
         val continuousEnabled = prefs?.getBoolean(KEY_CONTINUOUS_CONVERSATION, true) ?: true
         val activationResp = prefs?.getString(KEY_ACTIVATION_RESPONSE, null)?.takeIf { it.isNotBlank() }
             ?: defaultActivationResponseFor(lang)
@@ -123,8 +187,17 @@ class AssistantIdentityStore(private val context: Context?) {
             languageTag = lang,
             responseTone = tone,
             speechRate = speechRate,
+            voicePitch = voicePitch,
+            voiceGender = voiceGender,
+            userAddress = userAddress,
+            conversationLanguageMode = convLang,
+            personalityMode = personality,
+            customPersonalityNote = customPersonality,
+            responseLength = responseLen,
             isTtsEnabled = ttsEnabled,
             isWakeWordEnabled = wakeEnabled,
+            isFloatingIconEnabled = floatingEnabled,
+            isMemoryEnabled = memoryEnabled,
             isContinuousConversationEnabled = continuousEnabled,
             activationResponse = activationResp
         )
@@ -193,8 +266,12 @@ class AssistantIdentityStore(private val context: Context?) {
         languageTag: String? = null,
         responseTone: String? = null,
         speechRate: Float? = null,
+        voicePitch: Float? = null,
+        voiceGender: VoiceGender? = null,
         isTtsEnabled: Boolean? = null,
         isWakeWordEnabled: Boolean? = null,
+        isFloatingIconEnabled: Boolean? = null,
+        isMemoryEnabled: Boolean? = null,
         isContinuousConversationEnabled: Boolean? = null,
         activationResponse: String? = null
     ): AssistantIdentityProfile {
@@ -204,8 +281,12 @@ class AssistantIdentityStore(private val context: Context?) {
             languageTag = nextLang,
             responseTone = responseTone?.trim()?.takeIf { it.isNotBlank() } ?: cur.responseTone,
             speechRate = speechRate?.coerceIn(0.6f, 1.8f) ?: cur.speechRate,
+            voicePitch = voicePitch?.coerceIn(0.6f, 1.6f) ?: cur.voicePitch,
+            voiceGender = voiceGender ?: cur.voiceGender,
             isTtsEnabled = isTtsEnabled ?: cur.isTtsEnabled,
             isWakeWordEnabled = isWakeWordEnabled ?: cur.isWakeWordEnabled,
+            isFloatingIconEnabled = isFloatingIconEnabled ?: cur.isFloatingIconEnabled,
+            isMemoryEnabled = isMemoryEnabled ?: cur.isMemoryEnabled,
             isContinuousConversationEnabled = isContinuousConversationEnabled ?: cur.isContinuousConversationEnabled,
             activationResponse = activationResponse?.trim()?.takeIf { it.isNotBlank() }
                 ?: if (languageTag != null && cur.activationResponse == defaultActivationResponseFor(cur.languageTag)) {
@@ -213,6 +294,44 @@ class AssistantIdentityStore(private val context: Context?) {
                 } else {
                     cur.activationResponse
                 }
+        )
+        persistProfile(updated)
+        return updated
+    }
+
+    fun updatePersonalPreferences(
+        userAddress: String? = null,
+        conversationLanguageMode: ConversationLanguageMode? = null,
+        personalityMode: PersonalityMode? = null,
+        customPersonalityNote: String? = null,
+        responseLength: ResponseLengthMode? = null,
+        voiceGender: VoiceGender? = null,
+        speechRate: Float? = null,
+        voicePitch: Float? = null,
+        isMemoryEnabled: Boolean? = null,
+        isWakeWordEnabled: Boolean? = null,
+        isFloatingIconEnabled: Boolean? = null
+    ): AssistantIdentityProfile {
+        val cur = _profile.value
+        val nextLangMode = conversationLanguageMode ?: cur.conversationLanguageMode
+        val nextLangTag = when (conversationLanguageMode) {
+            null -> cur.languageTag
+            else -> conversationLanguageMode.defaultLocaleTag
+        }
+        val updated = cur.copy(
+            userAddress = userAddress?.trim()?.take(24)?.takeIf { it.isNotBlank() } ?: cur.userAddress,
+            conversationLanguageMode = nextLangMode,
+            languageTag = nextLangTag,
+            personalityMode = personalityMode ?: cur.personalityMode,
+            customPersonalityNote = customPersonalityNote?.trim()?.take(120) ?: cur.customPersonalityNote,
+            responseLength = responseLength ?: cur.responseLength,
+            responseTone = (personalityMode ?: cur.personalityMode).displayName,
+            voiceGender = voiceGender ?: cur.voiceGender,
+            speechRate = speechRate?.coerceIn(0.6f, 1.8f) ?: cur.speechRate,
+            voicePitch = voicePitch?.coerceIn(0.6f, 1.6f) ?: cur.voicePitch,
+            isMemoryEnabled = isMemoryEnabled ?: cur.isMemoryEnabled,
+            isWakeWordEnabled = isWakeWordEnabled ?: cur.isWakeWordEnabled,
+            isFloatingIconEnabled = isFloatingIconEnabled ?: cur.isFloatingIconEnabled
         )
         persistProfile(updated)
         return updated
@@ -303,8 +422,17 @@ class AssistantIdentityStore(private val context: Context?) {
                 ?.putString(KEY_LANGUAGE_TAG, updated.languageTag)
                 ?.putString(KEY_RESPONSE_TONE, updated.responseTone)
                 ?.putFloat(KEY_SPEECH_RATE, updated.speechRate)
+                ?.putFloat(KEY_VOICE_PITCH, updated.voicePitch)
+                ?.putString(KEY_VOICE_GENDER, updated.voiceGender.name)
+                ?.putString(KEY_USER_ADDRESS, updated.userAddress)
+                ?.putString(KEY_CONVERSATION_LANGUAGE, updated.conversationLanguageMode.name)
+                ?.putString(KEY_PERSONALITY_MODE, updated.personalityMode.name)
+                ?.putString(KEY_CUSTOM_PERSONALITY_NOTE, updated.customPersonalityNote)
+                ?.putString(KEY_RESPONSE_LENGTH, updated.responseLength.name)
                 ?.putBoolean(KEY_TTS_ENABLED, updated.isTtsEnabled)
                 ?.putBoolean(KEY_WAKE_ENABLED, updated.isWakeWordEnabled)
+                ?.putBoolean(KEY_FLOATING_ICON_ENABLED, updated.isFloatingIconEnabled)
+                ?.putBoolean(KEY_MEMORY_ENABLED, updated.isMemoryEnabled)
                 ?.putBoolean(KEY_CONTINUOUS_CONVERSATION, updated.isContinuousConversationEnabled)
                 ?.putString(KEY_ACTIVATION_RESPONSE, updated.activationResponse)
                 ?.apply()

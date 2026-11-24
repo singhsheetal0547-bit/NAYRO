@@ -36,6 +36,8 @@ import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -72,6 +74,8 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.R
 import com.example.core.agent.AgentState
+import com.example.core.service.ServiceLifecycleState
+import com.example.core.service.VoiceAgentServiceSnapshot
 import com.example.core.voice.VoiceState
 import com.example.ui.theme.Coral
 import com.example.ui.theme.ErrorRed
@@ -125,11 +129,17 @@ fun SpeechToTextVoicePanel(
     isBackgroundListeningEnabled: Boolean = false,
     isFollowUpSessionActive: Boolean = false,
     onToggleBackgroundListening: (Boolean) -> Unit = {},
-    onEndConversationSession: () -> Unit = {}
+    onEndConversationSession: () -> Unit = {},
+    serviceSnapshot: VoiceAgentServiceSnapshot? = null,
+    onStartAgentService: () -> Unit = { onToggleBackgroundListening(true) },
+    onPauseAgentService: () -> Unit = {},
+    onResumeAgentService: () -> Unit = {},
+    onStopAgentService: () -> Unit = { onToggleBackgroundListening(false) }
 ) {
     val context = LocalContext.current
     var permissionDeniedOnce by remember { mutableStateOf(false) }
     var startListeningAfterGrant by remember { mutableStateOf(false) }
+    var startServiceAfterGrant by remember { mutableStateOf(false) }
 
     val hasMicPermission = isMicrophoneGranted || try {
         ContextCompat.checkSelfPermission(
@@ -146,12 +156,17 @@ fun SpeechToTextVoicePanel(
         onMicrophonePermissionResult(granted)
         if (granted) {
             permissionDeniedOnce = false
+            if (startServiceAfterGrant) {
+                startServiceAfterGrant = false
+                onStartAgentService()
+            }
             if (startListeningAfterGrant) {
                 startListeningAfterGrant = false
                 onStartListening()
             }
         } else {
             startListeningAfterGrant = false
+            startServiceAfterGrant = false
             permissionDeniedOnce = true
         }
     }
@@ -523,48 +538,194 @@ fun SpeechToTextVoicePanel(
                         }
                     }
 
-                    // Inline Continuous Session & Background Listening quick controls
+                    // AI Voice Agent Running Service Wrapper Controls
                     Spacer(modifier = Modifier.height(10.dp))
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    val serviceState = serviceSnapshot?.serviceLifecycleState ?: ServiceLifecycleState.STOPPED
+                    val isServiceRunning = serviceSnapshot?.isServiceRunning ?: isBackgroundListeningEnabled
+                    val isServicePaused = serviceSnapshot?.isPaused ?: (serviceState == ServiceLifecycleState.PAUSED)
+                    val serviceStatusLabel = when {
+                        !hasMicPermission -> stringResource(R.string.voice_agent_service_mic_required)
+                        isActiveCapture -> stringResource(R.string.voice_agent_service_listening)
+                        isServicePaused -> stringResource(R.string.voice_agent_service_paused)
+                        isServiceRunning -> stringResource(R.string.voice_agent_service_running)
+                        else -> stringResource(R.string.voice_agent_service_stopped)
+                    }
+                    Surface(
+                        color = MaterialTheme.colorScheme.surface,
+                        border = BorderStroke(
+                            1.dp,
+                            when {
+                                isServiceRunning && !isServicePaused -> SuccessGreen.copy(alpha = 0.5f)
+                                isServicePaused -> WarningAmber.copy(alpha = 0.5f)
+                                else -> MaterialTheme.colorScheme.outline.copy(alpha = 0.7f)
+                            }
+                        ),
+                        shape = RoundedCornerShape(14.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("stt_agent_service_wrapper_card")
                     ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.weight(1f)
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp)
                         ) {
-                            Text(
-                                text = if (isBackgroundListeningEnabled) {
-                                    "Background Listening: ON"
-                                } else {
-                                    "Background Listening: OFF"
-                                },
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.SemiBold,
-                                color = if (isBackgroundListeningEnabled) SuccessGreen else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            if (isFollowUpSessionActive) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = stringResource(R.string.voice_agent_service_title),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                    Text(
+                                        text = serviceSnapshot?.statusSummary?.takeIf { it.isNotBlank() }
+                                            ?: if (isBackgroundListeningEnabled) {
+                                                "Background Listening: ON"
+                                            } else {
+                                                "Background Listening: OFF"
+                                            },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.testTag("stt_agent_service_status_text")
+                                    )
+                                }
                                 Spacer(modifier = Modifier.width(8.dp))
-                                TextButton(
-                                    onClick = onEndConversationSession,
-                                    modifier = Modifier
-                                        .minimumInteractiveComponentSize()
-                                        .testTag("stt_end_session_button")
+                                Surface(
+                                    color = when {
+                                        !hasMicPermission -> Coral.copy(alpha = 0.14f)
+                                        isServicePaused -> WarningAmber.copy(alpha = 0.16f)
+                                        isServiceRunning -> SoftSage
+                                        else -> MaterialTheme.colorScheme.surfaceVariant
+                                    },
+                                    shape = RoundedCornerShape(999.dp),
+                                    modifier = Modifier.testTag("stt_agent_service_state_pill")
                                 ) {
-                                    Text("End Session", color = Coral, style = MaterialTheme.typography.labelSmall)
+                                    Text(
+                                        text = serviceStatusLabel,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = when {
+                                            !hasMicPermission -> Coral
+                                            isServicePaused -> WarningAmber
+                                            isServiceRunning -> ForestGreen
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                    )
                                 }
                             }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    if (!isServiceRunning) {
+                                        Button(
+                                            onClick = {
+                                                if (hasMicPermission) {
+                                                    onStartAgentService()
+                                                } else {
+                                                    startServiceAfterGrant = true
+                                                    microphonePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                                }
+                                            },
+                                            colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
+                                            modifier = Modifier
+                                                .minimumInteractiveComponentSize()
+                                                .testTag("stt_start_agent_service_button")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.PlayArrow,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(stringResource(R.string.voice_agent_service_start))
+                                        }
+                                    } else {
+                                        OutlinedButton(
+                                            onClick = {
+                                                if (isServicePaused) onResumeAgentService() else onPauseAgentService()
+                                            },
+                                            modifier = Modifier
+                                                .minimumInteractiveComponentSize()
+                                                .testTag("stt_pause_resume_agent_service_button")
+                                        ) {
+                                            Icon(
+                                                imageVector = if (isServicePaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                                                contentDescription = null,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(
+                                                stringResource(
+                                                    if (isServicePaused) R.string.voice_agent_service_resume
+                                                    else R.string.voice_agent_service_pause
+                                                )
+                                            )
+                                        }
+                                        OutlinedButton(
+                                            onClick = onStopAgentService,
+                                            modifier = Modifier
+                                                .minimumInteractiveComponentSize()
+                                                .testTag("stt_stop_agent_service_button")
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.Stop,
+                                                contentDescription = null,
+                                                tint = ErrorRed,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text(
+                                                stringResource(R.string.voice_agent_service_stop),
+                                                color = ErrorRed
+                                            )
+                                        }
+                                    }
+
+                                    if (isFollowUpSessionActive) {
+                                        TextButton(
+                                            onClick = onEndConversationSession,
+                                            modifier = Modifier
+                                                .minimumInteractiveComponentSize()
+                                                .testTag("stt_end_session_button")
+                                        ) {
+                                            Text("End Session", color = Coral, style = MaterialTheme.typography.labelSmall)
+                                        }
+                                    }
+                                }
+
+                                Switch(
+                                    checked = isBackgroundListeningEnabled,
+                                    onCheckedChange = { enable ->
+                                        if (enable && !hasMicPermission) {
+                                            startServiceAfterGrant = true
+                                            microphonePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                        } else {
+                                            onToggleBackgroundListening(enable)
+                                        }
+                                    },
+                                    colors = SwitchDefaults.colors(
+                                        checkedThumbColor = Coral,
+                                        checkedTrackColor = ForestGreen
+                                    ),
+                                    modifier = Modifier.testTag("stt_bg_listening_toggle")
+                                )
+                            }
                         }
-                        Switch(
-                            checked = isBackgroundListeningEnabled,
-                            onCheckedChange = onToggleBackgroundListening,
-                            colors = SwitchDefaults.colors(
-                                checkedThumbColor = Coral,
-                                checkedTrackColor = ForestGreen
-                            ),
-                            modifier = Modifier.testTag("stt_bg_listening_toggle")
-                        )
                     }
 
                     // Live / Final Recognized Speech Transcript Box

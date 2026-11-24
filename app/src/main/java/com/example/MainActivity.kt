@@ -37,6 +37,7 @@ import com.example.core.security.EncryptedStorageManager
 import com.example.core.service.NayroForegroundService
 import com.example.core.service.ServiceLifecycleState
 import com.example.core.service.ServiceStateRepository
+import com.example.core.service.VoiceAgentServiceWrapper
 import com.example.core.voice.VoiceManager
 import com.example.core.voice.VoiceState
 import com.example.data.local.NayroDatabase
@@ -73,6 +74,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var voiceManager: VoiceManager
     private lateinit var providerManager: AIProviderManager
     private lateinit var backgroundVoiceController: com.example.core.voice.BackgroundVoiceController
+    private lateinit var voiceAgentServiceWrapper: VoiceAgentServiceWrapper
     private lateinit var assistantIdentityStore: com.example.core.identity.AssistantIdentityStore
 
     // Holds pending prompt delivered from floating assistant
@@ -110,6 +112,9 @@ class MainActivity : ComponentActivity() {
             permissionManager.evaluateSinglePermissionTargeted(permStr, this)
         }
         if (permStr == android.Manifest.permission.RECORD_AUDIO) {
+            if (::voiceAgentServiceWrapper.isInitialized) {
+                voiceAgentServiceWrapper.onMicrophonePermissionResult(isGranted, this)
+            }
             if (isGranted) {
                 if (pendingEnableBackgroundAfterMicGrant && ::backgroundVoiceController.isInitialized) {
                     pendingEnableBackgroundAfterMicGrant = false
@@ -135,6 +140,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Authorized MediaProjection Screen Capture consent launcher for Universal Visual Screen Perception
+    private val requestMediaProjectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val granted = com.example.core.screen.ScreenRecordingController.onConsentResult(
+            context = this,
+            resultCode = result.resultCode,
+            data = result.data
+        )
+        if (::permissionManager.isInitialized) {
+            permissionManager.evaluateSinglePermissionTargeted(PermissionType.SCREEN_CAPTURE.name, this)
+        }
+        if (::agentRuntime.isInitialized) {
+            agentRuntime.persistPendingPermissionDecision(PermissionType.SCREEN_CAPTURE.name, granted)
+            lifecycleScope.launch {
+                agentRuntime.onPermissionDecision(PermissionType.SCREEN_CAPTURE.name, granted)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -154,6 +179,7 @@ class MainActivity : ComponentActivity() {
         agentRuntime = app.agentRuntime
         voiceManager = app.voiceManager
         backgroundVoiceController = app.backgroundVoiceController
+        voiceAgentServiceWrapper = app.voiceAgentServiceWrapper
         assistantIdentityStore = app.assistantIdentityStore
         val notebookManager = app.notebookManager
 
@@ -161,6 +187,28 @@ class MainActivity : ComponentActivity() {
         agentRuntime.setAssistantIdentity(savedName)
         voiceManager.bindIdentityStore(assistantIdentityStore)
         backgroundVoiceController.refreshState()
+        voiceAgentServiceWrapper.refreshSnapshot()
+        agentRuntime.onPersonalPreferenceUpdated = { outcome ->
+            if (outcome.requiresVoiceSync) {
+                voiceManager.bindIdentityStore(assistantIdentityStore)
+            }
+            outcome.backgroundVoiceToggle?.let { enableBg ->
+                if (enableBg) {
+                    if (permissionManager.isPermissionGranted(android.Manifest.permission.RECORD_AUDIO)) {
+                        backgroundVoiceController.enableBackgroundListening(this)
+                    }
+                } else {
+                    backgroundVoiceController.disableBackgroundListening(this)
+                }
+            }
+            outcome.floatingIconToggle?.let { enableFloat ->
+                if (enableFloat) {
+                    NayroFloatingService.startService(this)
+                } else {
+                    NayroFloatingService.stopService(this)
+                }
+            }
+        }
 
         try {
             registerReceiver(userPresentReceiver, IntentFilter(Intent.ACTION_USER_PRESENT))
@@ -184,6 +232,7 @@ class MainActivity : ComponentActivity() {
                     providerManager = providerManager,
                     notebookManager = notebookManager,
                     backgroundVoiceController = backgroundVoiceController,
+                    voiceAgentServiceWrapper = voiceAgentServiceWrapper,
                     assistantIdentityStore = assistantIdentityStore,
                     initialPendingPrompt = pendingFloatingPrompt,
                     onClearPendingPrompt = { pendingFloatingPrompt = null },
@@ -205,48 +254,53 @@ class MainActivity : ComponentActivity() {
                     },
                     onRequestMicAndListen = {
                         val micPerm = android.Manifest.permission.RECORD_AUDIO
-                        if (permissionManager.isPermissionGranted(micPerm)) {
-                            voiceManager.startListening()
-                        } else {
-                            pendingStartListeningAfterMicGrant = true
-                            lastRequestedPermissionString = micPerm
-                            permissionManager.markRuntimePermissionRequested(micPerm)
-                            requestSinglePermissionLauncher.launch(micPerm)
-                        }
+                        voiceAgentServiceWrapper.requestVoiceCapture(
+                            context = this,
+                            ensureAgentServiceRunning = false,
+                            onRequestMicrophonePermission = {
+                                lastRequestedPermissionString = micPerm
+                                permissionManager.markRuntimePermissionRequested(micPerm)
+                                requestSinglePermissionLauncher.launch(micPerm)
+                            }
+                        )
                     },
                     onMicrophonePermissionResult = { granted ->
                         val micPerm = android.Manifest.permission.RECORD_AUDIO
                         permissionManager.evaluateSinglePermissionTargeted(micPerm, this)
-                        if (!granted) {
-                            backgroundVoiceController.onMicrophonePermissionRevoked(this)
-                        } else {
-                            backgroundVoiceController.refreshState()
-                        }
+                        voiceAgentServiceWrapper.onMicrophonePermissionResult(granted, this)
                         agentRuntime.persistPendingPermissionDecision(micPerm, granted)
                         lifecycleScope.launch {
                             agentRuntime.onPermissionDecision(micPerm, granted)
                         }
                     },
                     onToggleBackgroundListening = { enabled ->
+                        val micPerm = android.Manifest.permission.RECORD_AUDIO
                         if (enabled) {
-                            val micPerm = android.Manifest.permission.RECORD_AUDIO
-                            if (permissionManager.isPermissionGranted(micPerm)) {
-                                backgroundVoiceController.enableBackgroundListening(this)
-                            } else {
-                                pendingEnableBackgroundAfterMicGrant = true
-                                lastRequestedPermissionString = micPerm
-                                permissionManager.markRuntimePermissionRequested(micPerm)
-                                requestSinglePermissionLauncher.launch(micPerm)
-                            }
+                            voiceAgentServiceWrapper.requestStartAgentService(
+                                context = this,
+                                autoCaptureSpeech = false,
+                                onRequestMicrophonePermission = {
+                                    lastRequestedPermissionString = micPerm
+                                    permissionManager.markRuntimePermissionRequested(micPerm)
+                                    requestSinglePermissionLauncher.launch(micPerm)
+                                }
+                            )
                         } else {
                             pendingEnableBackgroundAfterMicGrant = false
-                            backgroundVoiceController.disableBackgroundListening(this)
+                            voiceAgentServiceWrapper.stopAgentService(this)
                         }
                         capabilityManager.evaluateAll()
                     },
                     onOpenPermissionSettings = { type ->
-                        pendingSpecialAccessPermissionType = type
-                        permissionSetupManager.triggerSpecialAccessSettings(type, this)
+                        if (type == PermissionType.SCREEN_CAPTURE) {
+                            val consentIntent = com.example.core.screen.ScreenRecordingController.createUserConsentIntent(this)
+                            if (consentIntent != null) {
+                                requestMediaProjectionLauncher.launch(consentIntent)
+                            }
+                        } else {
+                            pendingSpecialAccessPermissionType = type
+                            permissionSetupManager.triggerSpecialAccessSettings(type, this)
+                        }
                     },
                     onRefreshPermissions = {
                         permissionManager.refreshAllPermissions(this)
@@ -255,10 +309,19 @@ class MainActivity : ComponentActivity() {
                         backgroundVoiceController.refreshState()
                     },
                     onStartForegroundService = {
-                        backgroundVoiceController.enableBackgroundListening(this)
+                        val micPerm = android.Manifest.permission.RECORD_AUDIO
+                        voiceAgentServiceWrapper.requestStartAgentService(
+                            context = this,
+                            autoCaptureSpeech = false,
+                            onRequestMicrophonePermission = {
+                                lastRequestedPermissionString = micPerm
+                                permissionManager.markRuntimePermissionRequested(micPerm)
+                                requestSinglePermissionLauncher.launch(micPerm)
+                            }
+                        )
                     },
                     onStopForegroundService = {
-                        backgroundVoiceController.disableBackgroundListening(this)
+                        voiceAgentServiceWrapper.stopAgentService(this)
                     },
                     onStartFloatingService = {
                         NayroFloatingService.startService(this)
@@ -308,6 +371,9 @@ class MainActivity : ComponentActivity() {
             } catch (_: Exception) {}
             isUnlockReceiverRegistered = false
         }
+        if (::voiceAgentServiceWrapper.isInitialized) {
+            voiceAgentServiceWrapper.unbindFromService(this)
+        }
         super.onDestroy()
         voiceManager.onActivityDestroyed()
     }
@@ -325,6 +391,7 @@ fun NayroAppContent(
     providerManager: AIProviderManager,
     notebookManager: com.example.core.memory.NotebookManager,
     backgroundVoiceController: com.example.core.voice.BackgroundVoiceController,
+    voiceAgentServiceWrapper: VoiceAgentServiceWrapper,
     assistantIdentityStore: com.example.core.identity.AssistantIdentityStore,
     initialPendingPrompt: String?,
     onClearPendingPrompt: () -> Unit,
@@ -369,11 +436,12 @@ fun NayroAppContent(
     val standbyAudioLevel by voiceManager.standbyAudioLevel.collectAsState()
     val isFollowUpSessionActive by voiceManager.isFollowUpSessionActive.collectAsState()
     val bgListeningState by backgroundVoiceController.state.collectAsState()
+    val voiceAgentSnapshot by voiceAgentServiceWrapper.snapshot.collectAsState()
     val isSpeechRecognitionAvailable = remember(voiceManager) {
         voiceManager.speechRecognitionProvider.isRecognitionAvailable()
     }
-    var micPermissionGranted by remember(evaluations) {
-        mutableStateOf(permissionManager.isMicrophoneGranted())
+    var micPermissionGranted by remember(evaluations, voiceAgentSnapshot.hasMicrophonePermission) {
+        mutableStateOf(voiceAgentSnapshot.hasMicrophonePermission || permissionManager.isMicrophoneGranted())
     }
 
     val foregroundStatus by ServiceStateRepository.foregroundServiceStatus.collectAsState()
@@ -421,15 +489,18 @@ fun NayroAppContent(
     }
 
     fun handleVoiceToggle() {
-        if (voiceState == VoiceState.LISTENING || voiceState == VoiceState.FOLLOW_UP_LISTENING) {
-            voiceManager.stopListening()
+        if (voiceState == VoiceState.LISTENING ||
+            voiceState == VoiceState.FOLLOW_UP_LISTENING ||
+            voiceState == VoiceState.TRANSCRIBING
+        ) {
+            voiceAgentServiceWrapper.stopVoiceCapture(context)
         } else if (voiceState == VoiceState.SPEAKING) {
             voiceManager.interruptSpeakingAndListen()
         } else {
-            if (!permissionManager.isMicrophoneGranted()) {
+            if (!voiceAgentServiceWrapper.hasMicrophonePermission(context)) {
                 onRequestMicAndListen()
             } else {
-                voiceManager.startListening()
+                voiceAgentServiceWrapper.requestVoiceCapture(context = context)
             }
         }
     }
@@ -466,20 +537,25 @@ fun NayroAppContent(
                 androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
                     attachUi()
                     backgroundVoiceController.refreshState()
+                    voiceAgentServiceWrapper.bindToService(context)
+                    voiceAgentServiceWrapper.refreshSnapshot()
                 }
                 androidx.lifecycle.Lifecycle.Event.ON_STOP -> {
                     voiceManager.detachUiListener()
+                    voiceAgentServiceWrapper.unbindFromService(context)
                 }
                 else -> {}
             }
         }
         if (lifecycleOwner.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.STARTED)) {
             attachUi()
+            voiceAgentServiceWrapper.bindToService(context)
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
             voiceManager.detachUiListener()
+            voiceAgentServiceWrapper.unbindFromService(context)
         }
     }
 
@@ -562,23 +638,23 @@ fun NayroAppContent(
                             handleVoiceToggle()
                         },
                         onStartListening = {
-                            voiceManager.startListening()
+                            onRequestMicAndListen()
                         },
                         onStopListening = {
-                            voiceManager.stopListening()
+                            voiceAgentServiceWrapper.stopVoiceCapture(context)
                         },
                         onStopSpeaking = {
-                            voiceManager.stopSpeaking()
+                            voiceAgentServiceWrapper.stopSpeaking()
                         },
                         onMicrophonePermissionResult = { granted ->
                             micPermissionGranted = granted
                             onMicrophonePermissionResult(granted)
                         },
                         onLanguageSelected = { langTag ->
-                            voiceManager.setRecognitionLanguage(langTag)
+                            voiceAgentServiceWrapper.setRecognitionLanguage(langTag)
                         },
                         onClearTranscript = {
-                            voiceManager.clearTranscriptAndError()
+                            voiceAgentServiceWrapper.clearTranscriptAndError()
                         },
                         onSendText = { text ->
                             processUserPrompt(text)
@@ -607,12 +683,26 @@ fun NayroAppContent(
                         standbyAudioLevel = standbyAudioLevel,
                         isBackgroundListeningEnabled = bgListeningState.isEnabled,
                         isFollowUpSessionActive = isFollowUpSessionActive,
-                        backgroundListeningStatus = bgListeningState.statusSummary,
+                        backgroundListeningStatus = voiceAgentSnapshot.statusSummary,
                         onToggleBackgroundListening = onToggleBackgroundListening,
                         onEndConversationSession = {
                             voiceManager.endConversationSession(returnToStandby = bgListeningState.isEnabled)
                             agentRuntime.setState(AgentState.Idle)
-                        }
+                        },
+                        voiceAgentServiceSnapshot = voiceAgentSnapshot,
+                        onStartAgentService = onStartForegroundService,
+                        onPauseAgentService = {
+                            voiceAgentServiceWrapper.pauseAgentService(context)
+                        },
+                        onResumeAgentService = {
+                            voiceAgentServiceWrapper.resumeAgentService(
+                                context = context,
+                                onRequestMicrophonePermission = {
+                                    onRequestRuntimePermission(PermissionType.MICROPHONE)
+                                }
+                            )
+                        },
+                        onStopAgentService = onStopForegroundService
                     )
 
                     Screen.BackgroundControl -> BackgroundControlScreen(
@@ -689,9 +779,22 @@ fun NayroAppContent(
                         conversations = conversations,
                         voiceState = voiceState,
                         liveTranscript = transcribedText,
+                        partialTranscript = partialTranscript,
                         audioLevel = audioLevel,
+                        voiceError = voiceError,
+                        selectedLanguageTag = voiceConfig.languageTag,
+                        isSpeechRecognitionAvailable = isSpeechRecognitionAvailable,
                         onVoiceTap = {
                             handleVoiceToggle()
+                        },
+                        onStopSpeaking = {
+                            voiceManager.stopSpeaking()
+                        },
+                        onLanguageSelected = { langTag ->
+                            voiceManager.setRecognitionLanguage(langTag)
+                        },
+                        onClearVoiceError = {
+                            voiceManager.clearTranscriptAndError()
                         },
                         onSendMessage = { text ->
                             processUserPrompt(text)
@@ -876,7 +979,39 @@ fun NayroAppContent(
                             onTestDeepgramConnection = {
                                 voiceManager.voiceProviderRouter.testDeepgramConnection()
                             },
-                            providerTestStatusMessage = providerTestStatus
+                            providerTestStatusMessage = providerTestStatus,
+                            identityProfile = identityProfile,
+                            isFloatingIconRunning = floatingStatus.state == ServiceLifecycleState.RUNNING,
+                            conversationCount = conversations.size,
+                            onUpdatePersonalPreferences = { userAddress, langMode, personality, customNote, respLen, gender, speed, pitch, memEnabled ->
+                                assistantIdentityStore.updatePersonalPreferences(
+                                    userAddress = userAddress,
+                                    conversationLanguageMode = langMode,
+                                    personalityMode = personality,
+                                    customPersonalityNote = customNote,
+                                    responseLength = respLen,
+                                    voiceGender = gender,
+                                    speechRate = speed,
+                                    voicePitch = pitch,
+                                    isMemoryEnabled = memEnabled
+                                )
+                                voiceManager.bindIdentityStore(assistantIdentityStore)
+                            },
+                            onToggleFloatingIcon = { enabled ->
+                                assistantIdentityStore.updatePersonalPreferences(isFloatingIconEnabled = enabled)
+                                if (enabled) {
+                                    onStartFloatingService()
+                                } else {
+                                    onStopFloatingService()
+                                }
+                            },
+                            onClearConversationHistory = {
+                                coroutineScope.launch {
+                                    repository.clearHistory()
+                                    agentRuntime.continuityManager.clearConversationTurns()
+                                    agentRuntime.conversationalEngine.clearHistory()
+                                }
+                            }
                         )
                     }
 

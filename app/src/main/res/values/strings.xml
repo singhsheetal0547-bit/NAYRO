@@ -34,4 +34,14 @@
     <string name="stt_retry_listening">Try Again</string>
     <string name="stt_clear_transcript">Clear</string>
     <string name="stt_service_unavailable">Android Speech Recognition service is not available on this device.</string>
+    <string name="voice_agent_service_title">AI Voice Agent Running Service</string>
+    <string name="voice_agent_service_running">Agent Running</string>
+    <string name="voice_agent_service_listening">Listening (STT)</string>
+    <string name="voice_agent_service_paused">Agent Paused</string>
+    <string name="voice_agent_service_stopped">Agent Stopped</string>
+    <string name="voice_agent_service_mic_required">Mic Required</string>
+    <string name="voice_agent_service_start">Start Agent</string>
+    <string name="voice_agent_service_pause">Pause</string>
+    <string name="voice_agent_service_resume">Resume</string>
+    <string name="voice_agent_service_stop">Stop</string>
 </resources>

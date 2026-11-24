@@ -60,6 +60,7 @@ interface SpeechRecognitionProvider {
 
     fun stopListening()
     fun cancel()
+    fun clearTranscript() {}
     fun release()
 }
 
@@ -98,6 +99,10 @@ class AndroidSpeechRecognitionProvider(
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var activeLanguageTag: String = "en-IN"
+    private var usingOnDeviceRecognizer: Boolean = false
+    private var hasAttemptedFallback: Boolean = false
+    @Volatile
+    private var recognitionSessionId: Long = 0L
 
     private val mainHandler: Handler? = try {
         val looper = Looper.getMainLooper()
@@ -154,6 +159,9 @@ class AndroidSpeechRecognitionProvider(
     ): Intent {
         val cleanLang = languageTag.ifBlank { Locale.getDefault().toLanguageTag().ifBlank { "en-IN" } }
         return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            context?.packageName?.takeIf { it.isNotBlank() }?.let { pkg ->
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, pkg)
+            }
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, cleanLang)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, cleanLang)
@@ -193,7 +201,9 @@ class AndroidSpeechRecognitionProvider(
         onFinalResult: (SpeechRecognitionResult) -> Unit,
         onError: ((Int, String) -> Unit)?
     ) {
+        val sessionId = ++recognitionSessionId
         activeLanguageTag = languageTag.ifBlank { "en-IN" }
+        hasAttemptedFallback = false
         onReadyCallback = onReady
         onBeginningCallback = onBeginningOfSpeech
         onPartialCallback = onPartialText
@@ -223,24 +233,27 @@ class AndroidSpeechRecognitionProvider(
         }
 
         postToMain {
+            if (sessionId != recognitionSessionId) return@postToMain
             try {
                 speechRecognizer?.destroy()
-                speechRecognizer = if (preferOffline &&
+                val useOnDevice = preferOffline &&
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                     SpeechRecognizer.isOnDeviceRecognitionAvailable(ctx)
-                ) {
+                usingOnDeviceRecognizer = useOnDevice
+                speechRecognizer = if (useOnDevice) {
                     SpeechRecognizer.createOnDeviceSpeechRecognizer(ctx)
                 } else {
                     SpeechRecognizer.createSpeechRecognizer(ctx)
                 }
 
-                speechRecognizer?.setRecognitionListener(createRecognitionListener())
+                speechRecognizer?.setRecognitionListener(createRecognitionListener(sessionId))
                 val recognizerIntent = buildRecognizerIntent(
                     languageTag = activeLanguageTag,
-                    preferOffline = preferOffline && isOfflineRecognitionAvailable()
+                    preferOffline = useOnDevice
                 )
                 speechRecognizer?.startListening(recognizerIntent)
             } catch (e: Throwable) {
+                if (sessionId != recognitionSessionId) return@postToMain
                 _isListening.value = false
                 _rmsDb.value = 0f
                 _normalizedAudioLevel.value = 0f
@@ -251,20 +264,23 @@ class AndroidSpeechRecognitionProvider(
         }
     }
 
-    private fun createRecognitionListener(): RecognitionListener {
+    private fun createRecognitionListener(sessionId: Long): RecognitionListener {
         return object : RecognitionListener {
             override fun onReadyForSpeech(params: Bundle?) {
+                if (sessionId != recognitionSessionId) return
                 _isListening.value = true
                 _lastError.value = null
                 onReadyCallback?.invoke()
             }
 
             override fun onBeginningOfSpeech() {
+                if (sessionId != recognitionSessionId) return
                 _isListening.value = true
                 onBeginningCallback?.invoke()
             }
 
             override fun onRmsChanged(rmsdB: Float) {
+                if (sessionId != recognitionSessionId) return
                 _rmsDb.value = rmsdB
                 _normalizedAudioLevel.value = normalizeRmsDb(rmsdB)
             }
@@ -272,6 +288,7 @@ class AndroidSpeechRecognitionProvider(
             override fun onBufferReceived(buffer: ByteArray?) {}
 
             override fun onEndOfSpeech() {
+                if (sessionId != recognitionSessionId) return
                 _isListening.value = false
                 _rmsDb.value = 0f
                 _normalizedAudioLevel.value = 0f
@@ -279,15 +296,32 @@ class AndroidSpeechRecognitionProvider(
             }
 
             override fun onError(error: Int) {
+                if (sessionId != recognitionSessionId) return
                 _isListening.value = false
                 _rmsDb.value = 0f
                 _normalizedAudioLevel.value = 0f
-                // Automatic one-time multilingual fallback if requested locale pack is unavailable (Android 13+ codes 12/13)
-                if ((error == 12 || error == 13) && !activeLanguageTag.equals("en-IN", ignoreCase = true)) {
-                    activeLanguageTag = "en-IN"
+                // Automatic one-time fallback when offline/locale pack is unavailable (Android 12+ codes 12/13)
+                val isLocaleOrOfflineError = (error == 12 || error == 13)
+                val canFallbackFromOnDevice = isLocaleOrOfflineError && usingOnDeviceRecognizer && context != null
+                val canFallbackLocale = isLocaleOrOfflineError && !activeLanguageTag.equals("en-IN", ignoreCase = true)
+                if (!hasAttemptedFallback && (canFallbackFromOnDevice || canFallbackLocale)) {
+                    hasAttemptedFallback = true
+                    if (!canFallbackFromOnDevice) {
+                        activeLanguageTag = "en-IN"
+                    }
                     postToMain {
+                        if (sessionId != recognitionSessionId) return@postToMain
                         try {
-                            val fallbackIntent = buildRecognizerIntent(languageTag = "en-IN", preferOffline = false)
+                            if (canFallbackFromOnDevice && context != null) {
+                                speechRecognizer?.destroy()
+                                usingOnDeviceRecognizer = false
+                                speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
+                                speechRecognizer?.setRecognitionListener(createRecognitionListener(sessionId))
+                            }
+                            val fallbackIntent = buildRecognizerIntent(
+                                languageTag = activeLanguageTag,
+                                preferOffline = false
+                            )
                             speechRecognizer?.startListening(fallbackIntent)
                         } catch (_: Throwable) {
                             val message = mapSpeechRecognizerError(error)
@@ -303,6 +337,7 @@ class AndroidSpeechRecognitionProvider(
             }
 
             override fun onResults(results: Bundle?) {
+                if (sessionId != recognitionSessionId) return
                 _isListening.value = false
                 _rmsDb.value = 0f
                 _normalizedAudioLevel.value = 0f
@@ -337,6 +372,7 @@ class AndroidSpeechRecognitionProvider(
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
+                if (sessionId != recognitionSessionId) return
                 val partial = partialResults
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull()
@@ -364,6 +400,7 @@ class AndroidSpeechRecognitionProvider(
     }
 
     override fun cancel() {
+        recognitionSessionId++
         _isListening.value = false
         _rmsDb.value = 0f
         _normalizedAudioLevel.value = 0f
@@ -374,7 +411,13 @@ class AndroidSpeechRecognitionProvider(
         }
     }
 
+    override fun clearTranscript() {
+        _partialTranscript.value = ""
+        _lastError.value = null
+    }
+
     override fun release() {
+        recognitionSessionId++
         _isListening.value = false
         _rmsDb.value = 0f
         _normalizedAudioLevel.value = 0f
@@ -389,6 +432,7 @@ class AndroidSpeechRecognitionProvider(
                 speechRecognizer?.destroy()
             } catch (_: Throwable) {}
             speechRecognizer = null
+            usingOnDeviceRecognizer = false
         }
     }
 
