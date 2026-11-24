@@ -21,6 +21,7 @@ import androidx.core.content.ContextCompat
 import com.example.core.accessibility.AccessibilityActionController
 import com.example.core.accessibility.AppNavigationManager
 import com.example.core.accessibility.NayroAccessibilityService
+import com.example.core.agent.tools.RemoteDevelopmentExecutionGateway
 import com.example.core.agent.tools.ToolRegistryManager
 import com.example.core.memory.MemoryCategory
 import com.example.core.memory.MemoryManager
@@ -105,7 +106,8 @@ class ActionExecutor(
         providerManager = providerManager,
         perceptionProvider = com.example.core.screen.AndroidMultiMethodPerceptionProvider(context, screenIntelligenceManager),
         gestureDispatcher = com.example.core.screen.AndroidScreenGestureDispatcher()
-    )
+    ),
+    private val remoteDevelopmentGateway: RemoteDevelopmentExecutionGateway? = null
 ) {
 
     companion object {
@@ -1966,26 +1968,47 @@ class ActionExecutor(
             ActionType.EXECUTE_SANDBOXED_CODE -> {
                 val code = action.parameters["code"] ?: action.target.orEmpty()
                 val language = action.parameters["language"] ?: "python"
-                val sandboxRes = com.example.core.agent.tools.SandboxedScriptRunner.execute(
-                    code = code,
-                    language = language
-                )
-                if (sandboxRes.isSuccess) {
-                    val out = buildString {
-                        append("Sandboxed $language execution succeeded (${sandboxRes.stepsExecuted} steps).")
-                        if (sandboxRes.stdout.isNotBlank()) {
-                            append("\nOutput:\n").append(sandboxRes.stdout)
-                        } else if (sandboxRes.variables.isNotEmpty()) {
-                            append("\nVariables: ").append(sandboxRes.variables.entries.joinToString(", ") { "${it.key}=${it.value}" })
+                val remoteGateway = remoteDevelopmentGateway
+                if (remoteGateway?.isConfigured() == true) {
+                    val remoteResult = remoteGateway.execute(code = code, language = language)
+                    if (remoteResult.isSuccess) {
+                        val out = buildString {
+                            append("Remote $language sandbox execution completed with exit code 0.")
+                            if (remoteResult.stdout.isNotBlank()) append("\nOutput:\n").append(remoteResult.stdout)
+                            if (remoteResult.stderr.isNotBlank()) append("\nDiagnostics:\n").append(remoteResult.stderr)
+                            remoteResult.durationMs?.let { append("\nDuration: ").append(it).append(" ms") }
                         }
+                        ActionExecutionResult(true, out, VerificationStatus.VERIFIED)
+                    } else {
+                        ActionExecutionResult(
+                            false,
+                            remoteResult.errorMessage ?: remoteResult.stderr.ifBlank { "Remote code execution failed." },
+                            VerificationStatus.FAILED
+                        )
                     }
-                    ActionExecutionResult(true, out, VerificationStatus.VERIFIED)
                 } else {
-                    ActionExecutionResult(
-                        false,
-                        sandboxRes.errorMessage ?: "Sandboxed script execution failed.",
-                        VerificationStatus.FAILED
+                    // Preserve the existing pure-Kotlin evaluator but never mislabel it as CPython/Node.
+                    val sandboxRes = com.example.core.agent.tools.SandboxedScriptRunner.execute(
+                        code = code,
+                        language = language
                     )
+                    if (sandboxRes.isSuccess) {
+                        val out = buildString {
+                            append("Restricted local Kotlin evaluator completed (${sandboxRes.stepsExecuted} steps). This is a limited Python/JavaScript-like subset, not CPython or Node.js; packages, pip/npm and native builds are unavailable until a remote development gateway is configured.")
+                            if (sandboxRes.stdout.isNotBlank()) {
+                                append("\nOutput:\n").append(sandboxRes.stdout)
+                            } else if (sandboxRes.variables.isNotEmpty()) {
+                                append("\nVariables: ").append(sandboxRes.variables.entries.joinToString(", ") { "${it.key}=${it.value}" })
+                            }
+                        }
+                        ActionExecutionResult(true, out, VerificationStatus.VERIFIED)
+                    } else {
+                        ActionExecutionResult(
+                            false,
+                            sandboxRes.errorMessage ?: "Restricted local script execution failed.",
+                            VerificationStatus.FAILED
+                        )
+                    }
                 }
             }
 
