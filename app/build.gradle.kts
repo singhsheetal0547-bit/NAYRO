@@ -1,4 +1,6 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.io.File
+import java.net.URL
 import java.security.MessageDigest
 
 plugins {
@@ -19,8 +21,8 @@ val ensureSherpaOnnxAar by tasks.registering {
     target.parentFile.mkdirs()
 
     if (!target.exists()) {
-      val temporary = java.io.File(target.parentFile, "${target.name}.download")
-      val connection = java.net.URL(
+      val temporary = File(target.parentFile, "${target.name}.download")
+      val connection = URL(
         "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-2.0.3.aar"
       ).openConnection().apply {
         connectTimeout = 20_000
@@ -35,11 +37,10 @@ val ensureSherpaOnnxAar by tasks.registering {
       check(digest == "4c766e2e74c9d33d595338c21fe3b305c73ba45d47e96a235675c33142a2ec50") {
         "Sherpa-ONNX AAR checksum mismatch. Refusing to use an unverified native runtime."
       }
-      java.nio.file.Files.move(
-        temporary.toPath(),
-        target.toPath(),
-        java.nio.file.StandardCopyOption.REPLACE_EXISTING
-      )
+      temporary.copyTo(target, overwrite = true)
+      check(temporary.delete()) {
+        "Unable to remove temporary Sherpa-ONNX AAR download."
+      }
     } else {
       val digest = MessageDigest.getInstance("SHA-256")
         .digest(target.readBytes())
