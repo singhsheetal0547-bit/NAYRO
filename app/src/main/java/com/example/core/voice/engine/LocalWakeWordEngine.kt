@@ -7,6 +7,7 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import androidx.core.content.ContextCompat
+import com.advanceagent.core.wakeword.SherpaWakeWordEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -42,6 +43,7 @@ enum class WakeEngineState {
  * validated JSON MFCC/DTW acoustic templates, invalid/corrupt payloads, or missing assets.
  */
 enum class WakeAssetFormat {
+    SHERPA_ONNX,
     TFLITE_FLATBUFFER,
     JSON_ACOUSTIC_TEMPLATES,
     INVALID,
@@ -176,12 +178,11 @@ data class WakeCalibrationTestResult(
 )
 
 /**
- * Section 5 — Local Wake-Word Engine for NAYRO (MFCC + DTW Acoustic Template Matcher).
+ * Section 5 — Local Wake-Word Engine for NAYRO.
  *
- * Implements:
- * - Honest asset loading and format inspection of `app/src/main/assets/nayro_kws_templates.json`
- *   via [inspectBundledAssetFormat]: explicitly identifies itself as a local MFCC + DTW JSON
- *   acoustic template engine (`JSON_ACOUSTIC_TEMPLATES`, non-TFLite).
+ * Production Android devices use the native Sherpa-ONNX Zipformer2/GigaSpeech keyword spotter.
+ * The older MFCC + DTW implementation remains available only for headless JVM tests and migration
+ * diagnostics. Native initialization failures are reported honestly; speech cadence is never a match.
  * - Configurable wake phrases (e.g. "Hi Nayro", "Hi Nero", "Hi Babu", "Hi Qki", or any user-defined
  *   wake phrase via [AssistantIdentityStore] and on-device voice enrollment).
  * - Audio input pipeline via Android `AudioRecord` (16kHz, mono, 16-bit PCM) with adaptive noise floor,
@@ -194,6 +195,9 @@ data class WakeCalibrationTestResult(
  * - Voice exit command detection (`isVoiceExitCommand`) for hands-free task/voice termination.
  */
 class LocalWakeWordEngine(private val context: Context?) {
+
+    private val sherpaWakeWordEngine: SherpaWakeWordEngine? =
+        context?.applicationContext?.let(::SherpaWakeWordEngine)
 
     companion object {
         val SUPPORTED_PHRASES = listOf(
@@ -213,7 +217,7 @@ class LocalWakeWordEngine(private val context: Context?) {
         const val BUNDLED_KWS_TEMPLATES_ASSET = "nayro_kws_templates.json"
         /** Backward-compatible alias pointing to the honestly named JSON MFCC+DTW template asset. */
         const val BUNDLED_KWS_MODEL_ASSET = BUNDLED_KWS_TEMPLATES_ASSET
-        const val ENGINE_IMPLEMENTATION_DESCRIPTION = "Local MFCC + DTW Acoustic Template Matcher (JSON templates, non-TFLite)"
+        const val ENGINE_IMPLEMENTATION_DESCRIPTION = "Native Sherpa-ONNX 2.0.3 Zipformer2/GigaSpeech KWS; MFCC/DTW retained only for headless JVM tests"
         const val DEFAULT_SAMPLE_RATE_HZ = 16000
         const val NUM_MFCC = 13
         const val MIN_SNR_MARGIN_RATIO = 1.6
@@ -336,6 +340,8 @@ class LocalWakeWordEngine(private val context: Context?) {
     }
 
     fun hasUsableAcousticTemplates(): Boolean {
+        // On Android, usable means the official Sherpa JNI runtime and its ONNX model initialized.
+        if (context != null) return sherpaWakeWordEngine?.isInitialized == true
         if (loadedTemplates.isEmpty()) return false
         val phrases = getConfiguredWakePhrases()
         return phrases.any { phrase ->
@@ -473,6 +479,29 @@ class LocalWakeWordEngine(private val context: Context?) {
      * - On missing or invalid templates, clears loaded templates and reports `MODEL_UNAVAILABLE` / `ERROR`.
      */
     fun loadAcousticModel(allowEmbeddedFallbackInTests: Boolean = true): Boolean {
+        if (context != null) {
+            val engine = sherpaWakeWordEngine
+            val loaded = engine?.initialize(getConfiguredWakePhrases()) == true
+            detectedAssetFormat = if (loaded) WakeAssetFormat.SHERPA_ONNX else WakeAssetFormat.MISSING
+            val message = if (loaded) {
+                "Native Sherpa-ONNX Zipformer2/GigaSpeech wake-word model loaded."
+            } else {
+                engine?.lastErrorMessage
+                    ?: "Sherpa-ONNX runtime or one of the required ONNX model assets is missing."
+            }
+            _lastValidationResult.value = TemplateValidationResult(
+                isValid = loaded,
+                loadedCount = if (loaded) engine?.keywordCount ?: 0 else 0,
+                sampleRateHz = DEFAULT_SAMPLE_RATE_HZ,
+                numMfccCoefficients = 0,
+                errors = if (loaded) emptyList() else listOf(message)
+            )
+            _lastFailureReason.value = if (loaded) null else message
+            _engineState.value = if (loaded) WakeEngineState.STOPPED else WakeEngineState.MODEL_UNAVAILABLE
+            _statusMessage.value = message
+            return loaded
+        }
+
         loadedTemplates.clear()
         val rawJson = readModelAssetString(allowEmbeddedFallbackInTests)
         if (rawJson.isNullOrBlank()) {
@@ -1499,6 +1528,7 @@ class LocalWakeWordEngine(private val context: Context?) {
      * (or has been explicitly loaded via [loadAcousticModel] in headless test mode).
      */
     fun isOfflineKwsModelAvailable(): Boolean {
+        if (context != null) return sherpaWakeWordEngine?.areAssetsAvailable() == true
         if (isEmbeddedModelEnabledForTesting && loadedTemplates.isNotEmpty()) {
             return true
         }
@@ -1518,7 +1548,8 @@ class LocalWakeWordEngine(private val context: Context?) {
         }
     }
 
-    fun getLoadedTemplateCount(): Int = loadedTemplates.size
+    fun getLoadedTemplateCount(): Int =
+        if (context != null) sherpaWakeWordEngine?.keywordCount ?: 0 else loadedTemplates.size
 
     fun getLoadedTemplate(phrase: String): WakePhraseAcousticTemplate? =
         loadedTemplates[phrase.trim().lowercase()]
@@ -1540,6 +1571,12 @@ class LocalWakeWordEngine(private val context: Context?) {
     fun getWakePhraseSupportStatus(phrase: String): WakePhraseSupportStatus {
         val clean = phrase.trim()
         if (clean.length < 3) return WakePhraseSupportStatus.INVALID_PHRASE
+        if (context != null) {
+            val supported = clean.all { it.code in 32..126 } &&
+                sherpaWakeWordEngine?.areAssetsAvailable() == true
+            return if (supported) WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
+            else WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT
+        }
         val template = loadedTemplates[clean.lowercase()]
         if (template != null && template.enrolledSamples.isNotEmpty()) {
             return WakePhraseSupportStatus.READY_USER_ENROLLED_DTW
@@ -1570,36 +1607,48 @@ class LocalWakeWordEngine(private val context: Context?) {
      * Configures dynamic wake phrases for any user-defined assistant name (e.g. "Nero", "Babu", "Qki", "Alex")
      * and returns the honest [WakePhraseSupportStatus] for each configured phrase.
      */
-    fun configureWakePhrasesForAssistantName(assistantName: String): Map<String, WakePhraseSupportStatus> = synchronized(activeWakePhrases) {
-        val cleanName = assistantName.trim().ifEmpty { com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME }
-        configuredAssistantName = cleanName
-        val primaryPhrases = listOf(
-            "Hi $cleanName",
-            "Hey $cleanName",
-            "Hi Nayro",
-            "Hey Nayro"
-        ).distinctBy { it.lowercase() }
+    fun configureWakePhrasesForAssistantName(assistantName: String): Map<String, WakePhraseSupportStatus> {
+        val status = synchronized(activeWakePhrases) {
+            val cleanName = assistantName.trim().ifEmpty { com.example.core.identity.AssistantIdentityProfile.DEFAULT_DISPLAY_NAME }
+            configuredAssistantName = cleanName
+            val primaryPhrases = listOf(
+                "Hi $cleanName",
+                "Hey $cleanName",
+                "Hi Nayro",
+                "Hey Nayro"
+            ).distinctBy { it.lowercase() }
 
-        for (p in primaryPhrases) {
-            if (activeWakePhrases.none { it.equals(p, ignoreCase = true) }) {
-                activeWakePhrases.add(0, p)
+            for (p in primaryPhrases) {
+                if (activeWakePhrases.none { it.equals(p, ignoreCase = true) }) {
+                    activeWakePhrases.add(0, p)
+                }
             }
+            primaryPhrases.associateWith { getWakePhraseSupportStatus(it) }
         }
-        primaryPhrases.associateWith { getWakePhraseSupportStatus(it) }
+        if (sherpaWakeWordEngine?.isInitialized == true) {
+            sherpaWakeWordEngine.reloadWakeWords(getConfiguredWakePhrases())
+        }
+        return status
     }
 
     /**
      * Replaces the active wake-phrase list with the exact user-configured list (e.g. from [AssistantIdentityStore]).
      */
-    fun setConfiguredWakePhrases(phrases: List<String>): Map<String, WakePhraseSupportStatus> = synchronized(activeWakePhrases) {
+    fun setConfiguredWakePhrases(phrases: List<String>): Map<String, WakePhraseSupportStatus> {
         val cleaned = phrases.map { it.trim() }
             .filter { it.length >= 3 }
             .distinctBy { it.lowercase() }
-        if (cleaned.isNotEmpty()) {
-            activeWakePhrases.clear()
-            activeWakePhrases.addAll(cleaned)
+        val status = synchronized(activeWakePhrases) {
+            if (cleaned.isNotEmpty()) {
+                activeWakePhrases.clear()
+                activeWakePhrases.addAll(cleaned)
+            }
+            activeWakePhrases.associateWith { getWakePhraseSupportStatus(it) }
         }
-        activeWakePhrases.associateWith { getWakePhraseSupportStatus(it) }
+        if (sherpaWakeWordEngine?.isInitialized == true) {
+            sherpaWakeWordEngine.reloadWakeWords(getConfiguredWakePhrases())
+        }
+        return status
     }
 
     fun syncFromIdentityStore(store: com.example.core.identity.AssistantIdentityStore) {
@@ -2140,6 +2189,18 @@ class LocalWakeWordEngine(private val context: Context?) {
             return true
         }
 
+        // Production Android path: initialize the real Sherpa JNI runtime and open verified
+        // AudioRecord capture. Never start the old MFCC/cadence-only fallback on a real device.
+        if (context != null) {
+            if (sherpaWakeWordEngine?.isInitialized != true && !loadAcousticModel(false)) {
+                _isMicrophoneInitialized.value = false
+                _isAudioCaptureActive.value = false
+                _engineState.value = WakeEngineState.MODEL_UNAVAILABLE
+                return false
+            }
+            return startVerifiedAudioCapture()
+        }
+
         if (!hasUsableAcousticTemplates() && !isOfflineKwsModelAvailable()) {
             _isMicrophoneInitialized.value = false
             _isAudioCaptureActive.value = false
@@ -2362,10 +2423,23 @@ class LocalWakeWordEngine(private val context: Context?) {
                             }
 
                             _standbyAudioLevel.value = ((rms - 100.0) / 3500.0).toFloat().coerceIn(0f, 1f)
+
+                            // Decode captured 16 kHz PCM through the native Sherpa KWS inference loop.
+                            if (context != null) {
+                                val matchedPhrase = sherpaWakeWordEngine?.processPcm16(frameBuf, read)
+                                if (!matchedPhrase.isNullOrBlank()) {
+                                    lastDetectionLatencyMs = sherpaWakeWordEngine?.lastDetectionLatencyMs ?: 0L
+                                    lastConfidenceScore = 0.90f
+                                    _engineState.value = WakeEngineState.WAKE_DETECTED
+                                    _statusMessage.value = "Wake phrase detected by native Sherpa-ONNX: $matchedPhrase"
+                                    onWakeWordDetected?.invoke(matchedPhrase)
+                                }
+                            }
+
                             val vadDecision = voiceActivityDetector.processFrame(frameBuf, read)
                             adaptiveNoiseFloorRms = vadDecision.noiseFloorRms
 
-                            if (vadDecision.isSpeechFrame) {
+                            if (context == null && vadDecision.isSpeechFrame) {
                                 silenceHangoverCount = 0
                                 val toCopy = kotlin.math.min(read, segmentWindow.size - segmentWritePos)
                                 if (toCopy > 0) {
@@ -2459,6 +2533,8 @@ class LocalWakeWordEngine(private val context: Context?) {
     }
 
     private fun triggerLiveHardwareBundledWakeFallback(pcmBuffer: ShortArray, length: Int) {
+        // This cadence heuristic is not speech recognition; it must never activate the Android agent.
+        if (context != null) return
         val hasAnyEnrolled = loadedTemplates.values.any { it.enrolledSamples.isNotEmpty() }
         if (hasAnyEnrolled) return
         val feat = extractAcousticFeatures(pcmBuffer, length)
