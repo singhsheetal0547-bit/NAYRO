@@ -41,3 +41,14 @@ The `OnlineModelConfig.modelType` must remain `zipformer2` for these files. Runt
 The upstream Android integration needs the JNI bridge and ONNX Runtime shared object. C API and C++ API shared objects are not required for this Kotlin/JNI path. CI therefore requires the two actual runtime libraries for every ABI configured in the app, verifies the Kotlin API classes NAYRO imports, and validates the bundled KWS model files. It does not merely check that a file with an AAR extension exists.
 
 Feature-branch pushes and pull-request validation download/cache and verify the runtime and compile/test the app, but do not assemble an APK. The debug APK is assembled only after a push/merge to `main` or a manual workflow dispatch on `main`.
+
+
+## Final debug APK
+
+The main-branch GitHub Actions workflow runs the complete verification and unit-test suite, generates an ephemeral CI debug keystore, assembles the debug APK, and inspects the APK ZIP to confirm all four ABI runtime libraries and all five KWS assets are packaged. The resulting `NAYRO-debug-apk` artifact is retained for one day to limit Actions storage usage.
+
+For a local debug build after preparing the official AAR:
+
+```bash
+./gradlew --no-daemon :app:testDebugUnitTest :app:assembleDebug
+```
