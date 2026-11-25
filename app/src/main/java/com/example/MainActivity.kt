@@ -586,7 +586,7 @@ fun NayroAppContent(
             onStartForegroundService = onStartForegroundService,
             onStartFloatingService = onStartFloatingService,
             onCompleteOnboarding = { name ->
-                val cleanName = name.trim().ifEmpty { "NAYRO" }
+                val cleanName = name.trim().ifEmpty { "Babu" }
                 assistantIdentityStore.updateDisplayName(cleanName)
                 permissionSetupManager.markSetupCompleted(cleanName)
                 agentRuntime.setAssistantIdentity(cleanName)
@@ -1063,7 +1063,7 @@ fun NayroAppContent(
                         onStartForegroundService = onStartForegroundService,
                         onStartFloatingService = onStartFloatingService,
                         onCompleteOnboarding = { name ->
-                            val cleanName = name.trim().ifEmpty { "NAYRO" }
+                            val cleanName = name.trim().ifEmpty { "Babu" }
                             assistantIdentityStore.updateDisplayName(cleanName)
                             permissionSetupManager.markSetupCompleted(cleanName)
                             agentRuntime.setAssistantIdentity(cleanName)
