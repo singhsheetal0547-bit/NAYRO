@@ -330,6 +330,12 @@ private fun WelcomeIdentityStep(
                     style = MaterialTheme.typography.labelSmall,
                     color = ForestGreen
                 )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = "For Gemini reasoning, add your own Google Gemini API key in Settings → AI Providers after setup. Voice commands use Android system speech recognition and device text-to-speech; an internet connection is needed for Gemini responses. The API key is not bundled in this APK.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
