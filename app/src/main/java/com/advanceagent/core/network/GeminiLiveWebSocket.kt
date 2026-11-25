@@ -93,7 +93,7 @@ class GeminiLiveWebSocket(
                 val failedBeforeSetup = !isSetupComplete
                 isSetupComplete = false
                 if (!manualDisconnect && failedBeforeSetup && !useCompatibilityFallbackSetup && code != 1000) {
-                    Log.w(TAG, "Setup rejected ($code / $reason); retrying with universal models/gemini-2.0-flash-exp compatibility config")
+                    Log.w(TAG, "Setup rejected ($code / $reason); retrying with universal models/gemini-3.8-live compatibility config")
                     useCompatibilityFallbackSetup = true
                     scheduleReconnect()
                     return
@@ -136,7 +136,7 @@ class GeminiLiveWebSocket(
             memories = memories
         )
         val resolvedModel = if (compatibilityMode) {
-            "models/gemini-2.0-flash-exp"
+            "models/gemini-3.8-live"
         } else if (modelId.startsWith("models/")) {
             modelId
         } else {
