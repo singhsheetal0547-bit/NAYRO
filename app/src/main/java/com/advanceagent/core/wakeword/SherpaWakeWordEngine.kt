@@ -8,19 +8,59 @@ import com.k2fsa.sherpa.onnx.KeywordSpotterConfig
 import com.k2fsa.sherpa.onnx.OnlineModelConfig
 import com.k2fsa.sherpa.onnx.OnlineStream
 import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
-import java.io.File
 
+/**
+ * Native Sherpa-ONNX Zipformer2/GigaSpeech open-vocabulary keyword spotter.
+ * Model files are read from app/src/main/assets/kws-model using Android AssetManager.
+ * The official sherpa-onnx AAR supplies the Kotlin API and JNI runtime.
+ * Initialization failures are surfaced; no wake word is fabricated by a fallback.
+ */
 class SherpaWakeWordEngine(
-    private val context: Context? = null,
+    private val context: Context,
     private val modelDirInAssets: String = "kws-model",
     var cooldownMs: Long = 2200L
 ) {
     private var spotter: KeywordSpotter? = null
     private var stream: OnlineStream? = null
-    private var tokenizer: WakeWordTokenizer? = null
+    private var activePhrases: List<String> = DEFAULT_WAKE_WORDS
+    private var phraseByAlias: Map<String, String> = emptyMap()
     private var lastTriggerTimestampMs: Long = 0L
 
+    @Volatile
+    var lastErrorMessage: String? = null
+        private set
+
+    @Volatile
+    var lastDetectionLatencyMs: Long = 0L
+        private set
+
     var currentTimeProvider: () -> Long = { System.currentTimeMillis() }
+
+    val isInitialized: Boolean
+        @Synchronized get() = spotter != null && stream != null
+
+    val keywordCount: Int
+        @Synchronized get() = activePhrases.size
+
+    fun areAssetsAvailable(): Boolean {
+        val required = listOf(
+            "encoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+            "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+            "joiner-epoch-12-avg-2-chunk-16-left-64.onnx",
+            "tokens.txt",
+            "keywords.txt"
+        )
+        return try {
+            val names = context.assets.list(modelDirInAssets)?.toSet().orEmpty()
+            required.all { name ->
+                if (name !in names) return@all false
+                context.assets.open("$modelDirInAssets/$name").use { it.read() >= 0 }
+            }
+        } catch (e: Throwable) {
+            lastErrorMessage = "Sherpa model assets are unavailable: ${e.message ?: e.javaClass.simpleName}"
+            false
+        }
+    }
 
     @Synchronized
     fun initialize(
@@ -29,57 +69,56 @@ class SherpaWakeWordEngine(
         triggerThreshold: Float = 0.25f
     ): Boolean {
         release()
+        lastErrorMessage = null
+
+        if (!areAssetsAvailable()) {
+            lastErrorMessage = lastErrorMessage
+                ?: "Missing encoder/decoder/joiner/tokens/keywords in assets/$modelDirInAssets."
+            Log.e(TAG, lastErrorMessage!!)
+            return false
+        }
+
         return try {
-            val tokensPath = "$modelDirInAssets/tokens.txt"
-            val resolvedTokenizer = if (context != null) {
-                WakeWordTokenizer(context.assets, tokensPath)
-            } else {
-                WakeWordTokenizer(WakeWordTokenizer.DEFAULT_FALLBACK_VOCAB)
+            val phrases = resolvePhrases(activeWakeWords)
+            val keywordsSpec = phrases.joinToString(separator = "\n") { phrase ->
+                "${phrase.uppercase()} :$boostingScore #$triggerThreshold @${toAlias(phrase)}"
             }
-            tokenizer = resolvedTokenizer
-
-            val defaultWords = listOf("HI BABU", "HEY BABU", "HI NAYRO")
-            val keywordsSpec = resolvedTokenizer.buildKeywordsSpec(
-                phrases = activeWakeWords.ifEmpty { defaultWords },
-                boostingScore = boostingScore,
-                triggerThreshold = triggerThreshold
-            )
-
-            val keywordsFile = if (context != null) {
-                File(context.filesDir, "active_keywords.txt").apply {
-                    writeText(keywordsSpec)
-                }
-            } else {
-                File.createTempFile("active_keywords", ".txt").apply {
-                    deleteOnExit()
-                    writeText(keywordsSpec)
-                }
-            }
-
-            val config = KeywordSpotterConfig(
-                featConfig = FeatureConfig(sampleRate = 16000, featureDim = 80),
-                modelConfig = OnlineModelConfig(
-                    transducer = OnlineTransducerModelConfig(
-                        encoder = "$modelDirInAssets/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-                        decoder = "$modelDirInAssets/decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
-                        joiner = "$modelDirInAssets/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
-                    ),
-                    tokens = tokensPath,
-                    numThreads = 2,
-                    debug = false,
-                    provider = "cpu"
+            val modelConfig = OnlineModelConfig(
+                transducer = OnlineTransducerModelConfig(
+                    encoder = "$modelDirInAssets/encoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+                    decoder = "$modelDirInAssets/decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+                    joiner = "$modelDirInAssets/joiner-epoch-12-avg-2-chunk-16-left-64.onnx"
                 ),
+                tokens = "$modelDirInAssets/tokens.txt",
+                modelType = "zipformer2",
+                numThreads = 2,
+                debug = false,
+                provider = "cpu"
+            )
+            val config = KeywordSpotterConfig(
+                featConfig = FeatureConfig(sampleRate = SAMPLE_RATE_HZ, featureDim = 80),
+                modelConfig = modelConfig,
                 maxActivePaths = 4,
-                keywordsFile = keywordsFile.absolutePath,
+                keywordsFile = "$modelDirInAssets/keywords.txt",
                 keywordsScore = boostingScore,
                 keywordsThreshold = triggerThreshold
             )
 
-            spotter = KeywordSpotter(assetManager = context?.assets, config = config)
-            stream = spotter?.createStream(keywordsSpec)
+            val nativeSpotter = KeywordSpotter(assetManager = context.assets, config = config)
+            val nativeStream = nativeSpotter.createStream(keywordsSpec)
+
+            spotter = nativeSpotter
+            stream = nativeStream
+            activePhrases = phrases
+            phraseByAlias = phrases.associateBy(::toAlias)
+            lastTriggerTimestampMs = 0L
+            lastErrorMessage = null
+            Log.i(TAG, "Native Sherpa-ONNX KWS ready; phrases=${phrases.joinToString()}")
             true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize Sherpa KWS", e)
+        } catch (e: Throwable) {
+            release()
+            lastErrorMessage = "Native Sherpa-ONNX initialization failed: ${e.message ?: e.javaClass.simpleName}"
+            Log.e(TAG, lastErrorMessage!!, e)
             false
         }
     }
@@ -89,44 +128,67 @@ class SherpaWakeWordEngine(
         activeWakeWords: List<String>,
         boostingScore: Float = 2.0f,
         triggerThreshold: Float = 0.25f
-    ) {
-        val currentSpotter = spotter ?: run {
-            initialize(activeWakeWords, boostingScore, triggerThreshold)
-            return
+    ): Boolean {
+        val currentSpotter = spotter
+        if (currentSpotter == null) return initialize(activeWakeWords, boostingScore, triggerThreshold)
+
+        return try {
+            val phrases = resolvePhrases(activeWakeWords)
+            val keywordsSpec = phrases.joinToString(separator = "\n") { phrase ->
+                "${phrase.uppercase()} :$boostingScore #$triggerThreshold @${toAlias(phrase)}"
+            }
+            val replacement = currentSpotter.createStream(keywordsSpec)
+            stream?.release()
+            stream = replacement
+            activePhrases = phrases
+            phraseByAlias = phrases.associateBy(::toAlias)
+            lastTriggerTimestampMs = 0L
+            lastErrorMessage = null
+            true
+        } catch (e: Throwable) {
+            lastErrorMessage = "Unable to reload Sherpa wake phrases: ${e.message ?: e.javaClass.simpleName}"
+            Log.e(TAG, lastErrorMessage!!, e)
+            false
         }
-        val spec = tokenizer?.buildKeywordsSpec(
-            phrases = activeWakeWords,
-            boostingScore = boostingScore,
-            triggerThreshold = triggerThreshold
-        ) ?: return
-        stream?.release()
-        stream = currentSpotter.createStream(spec)
     }
 
     @Synchronized
     fun processPcm16(pcm16: ShortArray, length: Int): String? {
         val kws = spotter ?: return null
-        val s = stream ?: return null
+        val activeStream = stream ?: return null
+        val safeLength = length.coerceIn(0, pcm16.size)
+        if (safeLength == 0) return null
 
-        val safeLen = length.coerceIn(0, pcm16.size)
-        if (safeLen == 0) return null
+        val startedAt = System.nanoTime()
+        val samples = FloatArray(safeLength) { index -> pcm16[index] / 32768.0f }
+        activeStream.acceptWaveform(samples, sampleRate = SAMPLE_RATE_HZ)
 
-        val floatSamples = FloatArray(safeLen) { i -> pcm16[i] / 32768.0f }
-        s.acceptWaveform(floatSamples, 16000)
-
-        while (kws.isReady(s)) {
-            kws.decode(s)
-            val result = kws.getResult(s)
-            val matched = result.keyword.trim()
-            if (matched.isNotBlank()) {
-                kws.reset(s)
+        while (kws.isReady(activeStream)) {
+            kws.decode(activeStream)
+            val rawKeyword = kws.getResult(activeStream).keyword.trim()
+            if (rawKeyword.isNotEmpty()) {
+                kws.reset(activeStream)
                 val now = currentTimeProvider()
-                // False-positive suppression & cooldown gate
-                if (now - lastTriggerTimestampMs < cooldownMs && lastTriggerTimestampMs > 0L) {
-                    return null
-                }
+                if (lastTriggerTimestampMs > 0L && now - lastTriggerTimestampMs < cooldownMs) return null
+
+                val alias = rawKeyword.substringAfterLast("@", rawKeyword)
+                    .trim()
+                    .replace(' ', '_')
+                    .uppercase()
+                val normalized = rawKeyword
+                    .substringBeforeLast("@", rawKeyword)
+                    .replace("▁", " ")
+                    .replace('_', ' ')
+                    .replace(Regex("\\s+"), " ")
+                    .trim()
+                    .uppercase()
+                val matchedPhrase = phraseByAlias[alias]
+                    ?: activePhrases.firstOrNull { it.uppercase() == normalized }
+                    ?: activePhrases.firstOrNull()
+
                 lastTriggerTimestampMs = now
-                return matched
+                lastDetectionLatencyMs = ((System.nanoTime() - startedAt) / 1_000_000L).coerceAtLeast(1L)
+                return matchedPhrase
             }
         }
         return null
@@ -139,17 +201,25 @@ class SherpaWakeWordEngine(
 
     @Synchronized
     fun release() {
-        try {
-            stream?.release()
-            spotter?.release()
-        } catch (_: Exception) {
-        } finally {
-            stream = null
-            spotter = null
-        }
+        try { stream?.release() } catch (_: Throwable) { }
+        try { spotter?.release() } catch (_: Throwable) { }
+        stream = null
+        spotter = null
     }
+
+    private fun resolvePhrases(input: List<String>): List<String> {
+        val compatible = input.map { it.trim() }
+            .filter { phrase -> phrase.length >= 3 && phrase.any(Char::isLetter) && phrase.all { it.code in 32..126 } }
+            .distinctBy { it.lowercase() }
+        return compatible.ifEmpty { DEFAULT_WAKE_WORDS }
+    }
+
+    private fun toAlias(phrase: String): String =
+        phrase.uppercase().replace(Regex("[^A-Z0-9]+"), "_").trim('_')
 
     companion object {
         private const val TAG = "SherpaWakeWordEngine"
+        private const val SAMPLE_RATE_HZ = 16000
+        private val DEFAULT_WAKE_WORDS = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro")
     }
 }
