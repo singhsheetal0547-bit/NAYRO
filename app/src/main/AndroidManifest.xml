@@ -10,6 +10,8 @@
     <!-- Permissions required by NAYRO Engine -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
@@ -175,6 +177,48 @@
             android:permission="android.permission.BROADCAST_SMS">
             <intent-filter>
                 <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- ADVANCE VOICE AGENT (com.advanceagent.core) Modular Activities & Services -->
+        <activity
+            android:name="com.advanceagent.core.ui.MainActivity"
+            android:exported="false" />
+
+        <activity
+            android:name="com.advanceagent.core.ui.SettingsActivity"
+            android:exported="false"
+            android:parentActivityName="com.advanceagent.core.ui.MainActivity" />
+
+        <service
+            android:name="com.advanceagent.core.service.WakeWordForegroundService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <service
+            android:name="com.advanceagent.core.ui.orb.FloatingOrbService"
+            android:enabled="true"
+            android:exported="false" />
+
+        <service
+            android:name="com.advanceagent.core.tools.AgentAccessibilityService"
+            android:exported="false"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <receiver
+            android:name="com.advanceagent.core.service.BootCompletedReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
     </application>

@@ -670,6 +670,9 @@ fun NayroAppContent(
                         },
                         onQuickActionClick = { tag ->
                             when (tag) {
+                                "action_advance_agent" -> context.startActivity(
+                                    Intent(context, com.advanceagent.core.ui.MainActivity::class.java)
+                                )
                                 "action_dashboard" -> currentScreen = Screen.AgentDashboard
                                 "action_background" -> currentScreen = Screen.BackgroundControl
                                 "action_perm" -> currentScreen = Screen.PermissionAccess

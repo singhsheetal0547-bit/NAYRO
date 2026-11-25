@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+<title>Advance Agent HUD</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: radial-gradient(circle at 50% 42%, #0e1e3d 0%, #060b16 70%);
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .ring-wrap { position: relative; width: 250px; height: 250px; display: flex; align-items: center; justify-content: center; }
+  canvas { width: 250px; height: 250px; }
+  .state-pill {
+    margin-top: 20px;
+    padding: 8px 18px;
+    border-radius: 999px;
+    background: rgba(0, 212, 255, 0.12);
+    border: 1px solid rgba(0, 212, 255, 0.38);
+    color: #7dd3fc;
+    font-size: 13px;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+  }
+  .wake-label {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #94a3b8;
+    text-align: center;
+    padding: 0 24px;
+  }
+</style>
+</head>
+<body>
+  <div class="ring-wrap">
+    <canvas id="orbCanvas" width="500" height="500"></canvas>
+  </div>
+  <div class="state-pill" id="stateText">STANDBY</div>
+  <div class="wake-label" id="wakeText">Wake Words: HI BABU, HEY BABU, HI NAYRO</div>
+
+<script>
+  const canvas = document.getElementById('orbCanvas');
+  const ctx = canvas.getContext('2d');
+  let targetAmp = 0.08;
+  let currentAmp = 0.08;
+  let state = 'idle'; // idle | listening | thinking | speaking | executing | live | off
+  let mode = 'idle';
+  let phase = 0;
+  let breathPhase = 0;
+
+  window.setAgentHudState = function(newMode, label, wakeWords) {
+    mode = (newMode || 'idle').toLowerCase();
+    state = mode;
+    document.getElementById('stateText').innerText = label || newMode || 'STANDBY';
+    if (wakeWords) document.getElementById('wakeText').innerText = 'Wake Words: ' + wakeWords;
+  };
+
+  window.setAudioAmplitude = function(amp) {
+    targetAmp = Math.max(0.05, Math.min(1.0, Number(amp) || 0.05));
+  };
+
+  window.updateAgentHud = function(newState, amp) {
+    const normalized = (newState || 'idle').toLowerCase();
+    state = normalized;
+    mode = normalized;
+    document.getElementById('stateText').innerText = (newState || 'STANDBY').toUpperCase();
+    if (typeof amp === 'number' && !isNaN(amp)) {
+      targetAmp = Math.max(0.05, Math.min(1.0, amp));
+    }
+  };
+
+  function draw() {
+    ctx.clearRect(0, 0, 500, 500);
+    currentAmp += (targetAmp - currentAmp) * 0.18;
+    const activeState = (state || mode || 'idle').toLowerCase();
+    const isListening = activeState === 'listening';
+    const isLiveOrSpeaking = activeState === 'live' || activeState === 'speaking';
+
+    phase += (isLiveOrSpeaking ? 0.075 : (isListening ? 0.045 : 0.03));
+    breathPhase += (isListening ? 0.045 : 0.02);
+
+    // Subtle rhythmic breathing transition on baseR when state is 'listening', independent of amplitude
+    const breathingOffset = isListening
+      ? (Math.sin(breathPhase) * 8.5 + Math.cos(breathPhase * 0.5) * 2.5)
+      : 0;
+
+    const cx = 250, cy = 250;
+    const baseR = 115 + breathingOffset + currentAmp * 45;
+    const primary = activeState === 'off' || activeState === 'error'
+      ? '#ef4444'
+      : (isLiveOrSpeaking || isListening ? '#00ffcc' : '#00d4ff');
+    const secondary = activeState === 'off' || activeState === 'error' ? '#991b1b' : '#7c4dff';
+
+    // Outer glow
+    const grad = ctx.createRadialGradient(cx, cy, 20, cx, cy, baseR + 60);
+    grad.addColorStop(0, primary + '55');
+    grad.addColorStop(0.55, secondary + '22');
+    grad.addColorStop(1, 'transparent');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(cx, cy, baseR + 60, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Animated wave ring
+    ctx.strokeStyle = primary;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    for (let a = 0; a <= Math.PI * 2 + 0.05; a += 0.05) {
+      const wave = Math.sin(a * 6 + phase) * (8 + currentAmp * 26)
+                 + Math.cos(a * 3 - phase * 1.4) * (5 + currentAmp * 14);
+      const r = baseR + wave;
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r;
+      if (a === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+    ctx.stroke();
+
+    // Inner core
+    ctx.strokeStyle = secondary;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy, baseR * 0.62, 0, Math.PI * 2);
+    ctx.stroke();
+
+    requestAnimationFrame(draw);
+  }
+  draw();
+</script>
+</body>
+</html>

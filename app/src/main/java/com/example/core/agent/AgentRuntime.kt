@@ -112,6 +112,22 @@ class AgentRuntime(
     private val actionVerifier = ActionVerifier(screenIntelligenceManager)
     val errorRecoveryEngine = ErrorRecoveryEngine()
 
+    val wakeWordEngine: com.advanceagent.core.wakeword.WakeWordEngine by lazy {
+        com.advanceagent.core.wakeword.WakeWordEngine(context)
+    }
+
+    val visualTaskOrchestrator: com.advanceagent.core.vision.VisualTaskOrchestrator by lazy {
+        com.advanceagent.core.vision.VisualTaskOrchestrator(context)
+    }
+
+    val geminiLiveService: com.advanceagent.core.network.GeminiLiveService by lazy {
+        com.advanceagent.core.network.GeminiLiveService(context)
+    }
+
+    fun executeDekhoVisionCommand(prompt: String = "Dekho"): Map<String, Any> {
+        return visualTaskOrchestrator.executeDekhoVisionCommand(prompt)
+    }
+
     val personalIntelligenceHub: com.example.core.identity.PersonalIntelligenceHub by lazy {
         val store = com.example.core.identity.AssistantIdentityStore.sharedInstance
             ?: com.example.core.identity.AssistantIdentityStore(context)

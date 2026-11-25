@@ -235,8 +235,10 @@ class OnlineAutonomousAgentAuditTests {
         )
 
         val manager = AIProviderManager(storage, monitor)
+        manager.maxTransientRetriesPerProvider = 0
         manager.saveApiKey("gemini_default", "key-gemini")
         manager.saveApiKey("openrouter_custom", "key-openrouter")
+        manager.setProviderEnabled("openrouter_custom", true)
         manager.selectPreferredProvider("gemini_default")
 
         val attemptedProviders = mutableListOf<String>()

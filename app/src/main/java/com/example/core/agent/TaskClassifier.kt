@@ -257,6 +257,14 @@ object TaskClassifier {
             trimmed.contains("स्क्रीन पढ़ो") ||
             trimmed.contains("स्क्रीन पर क्या") ||
             trimmed.contains("यह पेज पढ़ो") ||
+            lower == "dekho" ||
+            lower == "screen dekho" ||
+            lower == "yeh dekho" ||
+            lower == "isko dekho" ||
+            lower.startsWith("dekho ") ||
+            lower.contains("screen dekho") ||
+            trimmed == "देखो" ||
+            trimmed.contains("स्क्रीन देखो") ||
             (lower.contains("read") && lower.contains("screen") && !lower.contains("save"))
         ) {
             return ResolvedIntent(
@@ -605,6 +613,7 @@ object TaskClassifier {
             val isGenericRequest = strippedForQuery.isBlank() ||
                 strippedForQuery.lowercase() in setOf(
                     "koi achha gaana", "koi acha gaana", "achha gaana", "acha gaana",
+                    "koi achha", "koi acha", "achha", "acha",
                     "koi gaana", "good song", "a good song", "nice song", "some music", "music", "song", "gaana"
                 )
 

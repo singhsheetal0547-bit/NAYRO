@@ -37,7 +37,7 @@ import kotlinx.coroutines.launch
  * Holds Application-scoped singletons for background services, agent runtime,
  * health manager, and voice intelligence independent of Activity lifecycle.
  */
-class NayroApplication : Application() {
+class NayroApplication : com.advanceagent.core.AgentApplication() {
 
     companion object {
         lateinit var instance: NayroApplication

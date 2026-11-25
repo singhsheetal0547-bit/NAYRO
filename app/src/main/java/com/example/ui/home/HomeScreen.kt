@@ -128,6 +128,7 @@ fun HomeScreen(
         agentState is AgentState.Transcribing
 
     val quickActions = listOf(
+        QuickAction("Advance Voice Agent HUD", "Gemini Live WebSocket, Dual Wake-Word KWS & Screen-Vision Orb", Icons.Default.Hearing, "action_advance_agent"),
         QuickAction("Agent Control Center", "Autonomy levels, workflows, automations & Emergency Stop", Icons.Default.Tune, "action_dashboard"),
         QuickAction("Permissions & Wizard", "Verify runtime permissions, Accessibility & Overlay access", Icons.Default.Security, "action_perm"),
         QuickAction("Background & Floating", "Background listening ON/OFF & floating $cleanAssistantName bubble", Icons.Default.Layers, "action_background"),
