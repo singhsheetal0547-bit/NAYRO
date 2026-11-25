@@ -17,7 +17,7 @@ import kotlinx.coroutines.flow.asStateFlow
 class WakeWordEngine(
     private val context: Context? = null,
     private val preferences: SecurePreferences = SecurePreferences(context),
-    private val sherpaEngine: SherpaWakeWordEngine = SherpaWakeWordEngine(context = context),
+    private val sherpaEngine: SherpaWakeWordEngine? = context?.applicationContext?.let(::SherpaWakeWordEngine),
     var onWakePhraseDetected: ((String) -> Unit)? = null
 ) {
     enum class LifecycleState {
@@ -55,7 +55,12 @@ class WakeWordEngine(
     ): Boolean {
         val activePhrases = customPhrases?.takeIf { it.isNotEmpty() }
             ?: preferences.getAllActiveWakeWords()
-        val ok = sherpaEngine.initialize(
+        val engine = sherpaEngine
+        if (engine == null) {
+            _state.value = LifecycleState.ERROR
+            return false
+        }
+        val ok = engine.initialize(
             activeWakeWords = activePhrases,
             boostingScore = boostingScore,
             triggerThreshold = triggerThreshold
@@ -88,7 +93,7 @@ class WakeWordEngine(
         boostingScore: Float = preferences.wakeBoostingScore,
         triggerThreshold: Float = preferences.wakeTriggerThreshold
     ) {
-        sherpaEngine.reloadWakeWords(
+        sherpaEngine?.reloadWakeWords(
             activeWakeWords = phrases,
             boostingScore = boostingScore,
             triggerThreshold = triggerThreshold
@@ -101,7 +106,7 @@ class WakeWordEngine(
      */
     @Synchronized
     fun processPcm16Frame(pcm16: ShortArray, length: Int = pcm16.size): String? {
-        val detected = sherpaEngine.processPcm16(pcm16, length)
+        val detected = sherpaEngine?.processPcm16(pcm16, length)
         if (!detected.isNullOrBlank()) {
             _lastDetectedKeyword.value = detected
             _state.value = LifecycleState.WAKE_DETECTED
@@ -153,6 +158,6 @@ class WakeWordEngine(
 
     @Synchronized
     fun release() {
-        sherpaEngine.release()
+        sherpaEngine?.release()
     }
 }
