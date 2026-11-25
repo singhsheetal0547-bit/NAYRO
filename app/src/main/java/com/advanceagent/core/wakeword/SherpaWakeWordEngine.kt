@@ -79,10 +79,10 @@ class SherpaWakeWordEngine(
         }
 
         return try {
+            // keywords.txt was BPE-tokenized from the exact same model vocabulary by CI.
+            // KeywordSpotter.createStream(String) expects encoded subword tokens, not raw text;
+            // createStream() loads the verified pre-tokenized phrases from KeywordSpotterConfig.
             val phrases = resolvePhrases(activeWakeWords)
-            val keywordsSpec = phrases.joinToString(separator = "\n") { phrase ->
-                "${phrase.uppercase()} :$boostingScore #$triggerThreshold @${toAlias(phrase)}"
-            }
             val modelConfig = OnlineModelConfig(
                 transducer = OnlineTransducerModelConfig(
                     encoder = "$modelDirInAssets/encoder-epoch-12-avg-2-chunk-16-left-64.onnx",
@@ -105,7 +105,7 @@ class SherpaWakeWordEngine(
             )
 
             val nativeSpotter = KeywordSpotter(assetManager = context.assets, config = config)
-            val nativeStream = nativeSpotter.createStream(keywordsSpec)
+            val nativeStream = nativeSpotter.createStream()
 
             spotter = nativeSpotter
             stream = nativeStream
@@ -134,10 +134,8 @@ class SherpaWakeWordEngine(
 
         return try {
             val phrases = resolvePhrases(activeWakeWords)
-            val keywordsSpec = phrases.joinToString(separator = "\n") { phrase ->
-                "${phrase.uppercase()} :$boostingScore #$triggerThreshold @${toAlias(phrase)}"
-            }
-            val replacement = currentSpotter.createStream(keywordsSpec)
+            // Recreate from the model's pre-tokenized keywords.txt; never feed raw text to JNI.
+            val replacement = currentSpotter.createStream()
             stream?.release()
             stream = replacement
             activePhrases = phrases
@@ -208,10 +206,13 @@ class SherpaWakeWordEngine(
     }
 
     private fun resolvePhrases(input: List<String>): List<String> {
-        val compatible = input.map { it.trim() }
-            .filter { phrase -> phrase.length >= 3 && phrase.any(Char::isLetter) && phrase.all { it.code in 32..126 } }
-            .distinctBy { it.lowercase() }
-        return compatible.ifEmpty { DEFAULT_WAKE_WORDS }
+        // The bundled GigaSpeech BPE keywords are compiled at CI time for these four NAYRO
+        // wake phrases. Only report phrases the packaged model can actually recognize.
+        val requested = input.map { it.trim() }.filter { it.isNotEmpty() }
+        val selected = DEFAULT_WAKE_WORDS.filter { bundled ->
+            requested.isEmpty() || requested.any { it.equals(bundled, ignoreCase = true) }
+        }
+        return selected.ifEmpty { DEFAULT_WAKE_WORDS }
     }
 
     private fun toAlias(phrase: String): String =
