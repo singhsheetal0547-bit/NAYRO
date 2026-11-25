@@ -1528,24 +1528,10 @@ class LocalWakeWordEngine(private val context: Context?) {
      * (or has been explicitly loaded via [loadAcousticModel] in headless test mode).
      */
     fun isOfflineKwsModelAvailable(): Boolean {
+        // Android production builds use the native Sherpa model. Headless JVM tests may
+        // report availability only after explicitly loading the test templates.
         if (context != null) return sherpaWakeWordEngine?.areAssetsAvailable() == true
-        if (isEmbeddedModelEnabledForTesting && loadedTemplates.isNotEmpty()) {
-            return true
-        }
-        val ctx = context ?: return false
-        return try {
-            val assetList = ctx.assets.list("") ?: emptyArray()
-            if (assetList.contains(BUNDLED_KWS_MODEL_ASSET)) {
-                inspectBundledAssetFormat()
-                true
-            } else {
-                ctx.assets.open(BUNDLED_KWS_MODEL_ASSET).close()
-                inspectBundledAssetFormat()
-                true
-            }
-        } catch (_: Exception) {
-            false
-        }
+        return isEmbeddedModelEnabledForTesting && loadedTemplates.isNotEmpty()
     }
 
     fun getLoadedTemplateCount(): Int =
