@@ -139,13 +139,10 @@ fun SettingsScreen(
     var enrollmentRefreshTick by remember { mutableIntStateOf(0) }
     var personalIdentityNotice by remember { mutableStateOf("") }
 
-    val dynamicWakePhrases = remember(assistantName, configuredWakePhrases, enrollmentRefreshTick) {
-        if (configuredWakePhrases.isNotEmpty()) {
-            configuredWakePhrases.distinctBy { it.lowercase() }
-        } else {
-            val clean = assistantName.trim().ifEmpty { "NAYRO" }
-            listOf("Hi $clean", "Hey $clean", "Hi Nayro").distinctBy { it.lowercase() }
-        }
+    // This APK ships a fixed offline Sherpa-ONNX keyword model for these four phrases.
+    // Do not present arbitrary profile/custom phrases as supported by that packaged model.
+    val dynamicWakePhrases = remember {
+        listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro")
     }
 
     Column(
@@ -203,10 +200,10 @@ fun SettingsScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     Button(
                         onClick = {
-                            val clean = assistantNameDraft.trim().ifEmpty { "NAYRO" }
+                            val clean = assistantNameDraft.trim().ifEmpty { "Babu" }
                             assistantNameDraft = clean
                             onSaveAssistantName(clean)
-                            personalIdentityNotice = "Assistant name saved as '$clean'. Wake phrases synced."
+                            personalIdentityNotice = "Assistant name saved as '$clean'. The offline wake model recognizes Hi Babu, Hey Babu, Hi Nayro, and Hey Nayro."
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
                         modifier = Modifier.testTag("settings_save_assistant_name_button")
@@ -594,7 +591,7 @@ fun SettingsScreen(
                         )
                         Text(
                             text = backgroundListeningStatus.ifBlank {
-                                "Listens locally on-device using 13-MFCC + Sakoe-Chiba DTW. Custom wake phrases require real microphone voice enrollment to activate acoustic DTW matching."
+                                "Listens locally using the native Sherpa-ONNX neural keyword model. The packaged model recognizes Hi Babu, Hey Babu, Hi Nayro, and Hey Nayro."
                             },
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -610,212 +607,50 @@ fun SettingsScreen(
 
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Wake Detection Sensitivity: ${(selectedSensitivity * 100).toInt()}%",
-                    style = MaterialTheme.typography.bodyMedium
+                    text = "Wake detection sensitivity is controlled by the packaged neural model in this build. Custom threshold tuning is not exposed.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Spacer(modifier = Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Strict (80%)" to 0.80f, "Balanced (72%)" to 0.72f, "High (65%)" to 0.65f).forEach { (label, threshold) ->
-                        OutlinedButton(
-                            onClick = {
-                                selectedSensitivity = threshold
-                                onWakeSensitivityChange(threshold)
-                            },
-                            modifier = Modifier.testTag("wake_sensitivity_${(threshold * 100).toInt()}")
-                        ) {
-                            Text(label, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-                }
 
-                Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "Wake Phrases — Real Voice Enrollment (1.2s) & Live Calibration",
+                    text = "Offline Sherpa-ONNX Wake Phrases",
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold
                 )
                 Spacer(modifier = Modifier.height(6.dp))
-
+                Text(
+                    text = "The installed neural model recognizes these four phrases locally. Custom wake-phrase enrollment, phrase removal, and manual calibration are not supported by this packaged model yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(8.dp))
                 dynamicWakePhrases.forEach { phrase ->
-                    val engine = remember {
-                        try {
-                            com.example.NayroApplication.instance.voiceManager.wakeWordEngine
-                        } catch (_: Exception) {
-                            null
-                        }
-                    }
-                    val sampleCount = remember(phrase, enrollmentRefreshTick) {
-                        engine?.getEnrolledSampleCount(phrase) ?: 0
-                    }
-                    val supportStatus = remember(phrase, enrollmentRefreshTick) {
-                        engine?.getWakePhraseSupportStatus(phrase) ?: WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT
-                    }
-                    val statusLabel = when {
-                        sampleCount > 0 -> "Enrolled ($sampleCount/5)"
-                        supportStatus == WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE -> "Bundled (Enroll for accuracy)"
-                        else -> "Needs Enrollment"
-                    }
-
                     Card(
                         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)),
                         shape = RoundedCornerShape(12.dp),
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 4.dp)
+                            .padding(vertical = 3.dp)
                     ) {
-                        Column(modifier = Modifier.padding(10.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "\"$phrase\"",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                    Text(
-                                        text = statusLabel,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (sampleCount > 0) SuccessGreen else Coral
-                                    )
-                                }
-                                if (dynamicWakePhrases.size > 1) {
-                                    IconButton(
-                                        onClick = {
-                                            onRemoveWakePhrase(phrase)
-                                            enrollmentRefreshTick++
-                                            enrolledSamplesStatus = "Removed wake phrase '$phrase'."
-                                        },
-                                        modifier = Modifier.testTag("remove_wake_${phrase.lowercase().replace(" ", "_")}")
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Delete,
-                                            contentDescription = "Remove wake phrase $phrase",
-                                            tint = Coral
-                                        )
-                                    }
-                                }
-                            }
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(
-                                    enabled = !isRecordingWakeSample,
-                                    onClick = {
-                                        if (onEnrollWakePhraseAsync != null) {
-                                            isRecordingWakeSample = true
-                                            enrolledSamplesStatus = "Listening (1.2s)... Speak '$phrase' clearly now."
-                                            scope.launch {
-                                                val (_, msg) = onEnrollWakePhraseAsync(phrase)
-                                                enrolledSamplesStatus = msg
-                                                enrollmentRefreshTick++
-                                                isRecordingWakeSample = false
-                                            }
-                                        } else {
-                                            onEnrollWakePhrase(phrase)
-                                            enrollmentRefreshTick++
-                                            enrolledSamplesStatus = engine?.validateEnrollmentQuality(phrase)?.qualitySummary
-                                                ?: "Enrolled voice template for '$phrase'"
-                                        }
-                                    },
-                                    modifier = Modifier.testTag("enroll_wake_${phrase.lowercase().replace(" ", "_")}")
-                                ) {
-                                    Text(if (isRecordingWakeSample) "Recording..." else "Enroll (1.2s)", style = MaterialTheme.typography.bodySmall)
-                                }
-                                OutlinedButton(
-                                    enabled = !isRecordingWakeSample,
-                                    onClick = {
-                                        if (onTestWakePhraseAsync != null) {
-                                            isRecordingWakeSample = true
-                                            enrolledSamplesStatus = "Testing (1.2s)... Speak '$phrase' now to calibrate."
-                                            scope.launch {
-                                                val result = onTestWakePhraseAsync(phrase)
-                                                enrolledSamplesStatus = result.diagnosticMessage
-                                                isRecordingWakeSample = false
-                                            }
-                                        } else {
-                                            enrolledSamplesStatus = "Live microphone calibration requires Android device audio."
-                                        }
-                                    },
-                                    modifier = Modifier.testTag("test_wake_${phrase.lowercase().replace(" ", "_")}")
-                                ) {
-                                    Text("Test / Calibrate", style = MaterialTheme.typography.bodySmall)
-                                }
-                            }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "\"$phrase\"",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = "Built-in model",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SuccessGreen
+                            )
                         }
                     }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    OutlinedTextField(
-                        value = customWakePhraseDraft,
-                        onValueChange = { customWakePhraseDraft = it },
-                        label = { Text("Add Custom Wake Phrase") },
-                        singleLine = true,
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("settings_custom_wake_phrase_input")
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    OutlinedButton(
-                        onClick = {
-                            val cleanPhrase = customWakePhraseDraft.trim()
-                            if (cleanPhrase.length >= 3) {
-                                onAddCustomWakePhrase(cleanPhrase)
-                                customWakePhraseDraft = ""
-                                enrolledSamplesStatus = "Registered '$cleanPhrase'. Please enroll voice samples to enable acoustic DTW detection."
-                            }
-                        },
-                        modifier = Modifier.testTag("settings_add_wake_phrase_button")
-                    ) {
-                        Text("Add Phrase")
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    OutlinedButton(
-                        onClick = {
-                            val noiseReport = try {
-                                com.example.NayroApplication.instance.voiceManager.wakeWordEngine.runAmbientNoiseTest()
-                            } catch (_: Exception) {
-                                null
-                            }
-                            enrolledSamplesStatus = if (noiseReport != null) {
-                                "${noiseReport.environmentQuality}: ${noiseReport.recommendation}"
-                            } else {
-                                "Ambient Noise Floor: 220 RMS (Quiet Environment — Optimal for DTW recognition)"
-                            }
-                        },
-                        modifier = Modifier.testTag("btn_wake_noise_test")
-                    ) {
-                        Text("Run Noise Test", style = MaterialTheme.typography.bodySmall)
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            try {
-                                val eng = com.example.NayroApplication.instance.voiceManager.wakeWordEngine
-                                dynamicWakePhrases.forEach { eng.clearEnrolledSamples(it) }
-                            } catch (_: Exception) {}
-                            enrolledSamplesStatus = "Cleared enrolled samples. Ready for fresh re-enrollment."
-                        },
-                        modifier = Modifier.testTag("btn_wake_reset_enrollment")
-                    ) {
-                        Text("Re-Enroll / Reset", style = MaterialTheme.typography.bodySmall)
-                    }
-                }
-                if (enrolledSamplesStatus.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = enrolledSamplesStatus,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = SuccessGreen
-                    )
                 }
             }
         }
