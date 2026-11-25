@@ -66,12 +66,15 @@ class VoiceProviderRouter(
     val status: StateFlow<VoiceProviderStatus> = _status.asStateFlow()
 
     private fun loadPersistedSttEngine(): SpeechRecognitionEngineType {
-        val saved = prefs?.getString(KEY_SELECTED_STT, null) ?: return SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER
-        return try {
-            SpeechRecognitionEngineType.valueOf(saved)
-        } catch (_: IllegalArgumentException) {
-            SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER
+        // This product build intentionally uses Android system SpeechRecognizer only.
+        // Migrate older Deepgram selections to the system provider and never send voice audio
+        // to a separate cloud STT vendor.
+        val systemEngine = SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER
+        val saved = prefs?.getString(KEY_SELECTED_STT, null)
+        if (saved != systemEngine.name) {
+            prefs?.edit()?.putString(KEY_SELECTED_STT, systemEngine.name)?.apply()
         }
+        return systemEngine
     }
 
     private fun computeStatus(
@@ -100,8 +103,10 @@ class VoiceProviderRouter(
     }
 
     fun selectSttEngine(engine: SpeechRecognitionEngineType): VoiceProviderStatus {
-        prefs?.edit()?.putString(KEY_SELECTED_STT, engine.name)?.apply()
-        val updated = computeStatus(engine, null)
+        // Deliberately pin STT to the Android system provider in the Gemini + system-voice build.
+        val systemEngine = SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER
+        prefs?.edit()?.putString(KEY_SELECTED_STT, systemEngine.name)?.apply()
+        val updated = computeStatus(systemEngine, null)
         _status.value = updated
         return updated
     }
