@@ -16,23 +16,24 @@ mkdir -p "${DEST_DIR}"
 
 verify_aar() {
   local file="$1"
-  echo "${EXPECTED_SHA256}  ${file}" | sha256sum --check --status
-  unzip -t "${file}" >/dev/null
+  echo "${EXPECTED_SHA256}  ${file}" | sha256sum --check --status || return 1
+  unzip -t "${file}" >/dev/null || return 1
   local abi
   for abi in arm64-v8a armeabi-v7a x86 x86_64; do
-    unzip -Z1 "${file}" | grep -Fxq "jni/${abi}/libsherpa-onnx-jni.so"
-    unzip -Z1 "${file}" | grep -Fxq "jni/${abi}/libonnxruntime.so"
+    unzip -Z1 "${file}" | grep -Fxq "jni/${abi}/libsherpa-onnx-jni.so" || return 1
+    unzip -Z1 "${file}" | grep -Fxq "jni/${abi}/libonnxruntime.so" || return 1
   done
   local nested_jar="${file}.classes.jar"
-  unzip -p "${file}" classes.jar > "${nested_jar}"
+  unzip -p "${file}" classes.jar > "${nested_jar}" || return 1
   for class_file in \
     "com/k2fsa/sherpa/onnx/KeywordSpotter.class" \
     "com/k2fsa/sherpa/onnx/KeywordSpotterConfig.class" \
     "com/k2fsa/sherpa/onnx/OnlineStream.class" \
     "com/k2fsa/sherpa/onnx/FeatureConfig.class"; do
-    jar tf "${nested_jar}" | grep -Fxq "${class_file}"
+    jar tf "${nested_jar}" | grep -Fxq "${class_file}" || return 1
   done
   rm -f "${nested_jar}"
+  return 0
 }
 
 if [[ -s "${DEST}" ]] && verify_aar "${DEST}"; then
