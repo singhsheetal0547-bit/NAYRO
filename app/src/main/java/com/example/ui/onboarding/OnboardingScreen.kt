@@ -326,7 +326,7 @@ private fun WelcomeIdentityStep(
                 )
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
-                    text = "Default wake phrases: \"Hey Babu\", \"Hi Babu\", \"Hi Nayro\", \"Hey Cutie\"",
+                    text = "Default wake phrases: \"Hi Babu\", \"Hey Babu\", \"Hi Nayro\", \"Hey Nayro\"",
                     style = MaterialTheme.typography.labelSmall,
                     color = ForestGreen
                 )
