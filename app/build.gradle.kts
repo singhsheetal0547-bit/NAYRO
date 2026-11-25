@@ -1,5 +1,6 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
 
 plugins {
   alias(libs.plugins.android.application)
@@ -19,16 +20,10 @@ android {
     targetSdk = 36
     versionCode = 1
     versionName = "1.0"
-
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-    ndk {
-      abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-    }
+    ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64") }
   }
 
-  // Do not remove or modify these signingConfigs. They are necessary for building, installing,
-  // and updating Android apps in AI Studio.
   signingConfigs {
     create("release") {
       val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
@@ -50,36 +45,21 @@ android {
       isCrunchPngs = false
       isMinifyEnabled = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-      // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-      // AI Studio.
       signingConfig = signingConfigs.getByName("release")
     }
-    debug {
-      // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
-      // AI Studio.
-      signingConfig = signingConfigs.getByName("debugConfig")
-    }
+    debug { signingConfig = signingConfigs.getByName("debugConfig") }
   }
   compileOptions {
     sourceCompatibility = JavaVersion.VERSION_11
     targetCompatibility = JavaVersion.VERSION_11
   }
-  buildFeatures {
-    compose = true
-    buildConfig = true
-  }
-  androidResources {
-    noCompress += listOf("onnx", "tflite", "txt")
-  }
+  buildFeatures { compose = true; buildConfig = true }
+  androidResources { noCompress += listOf("onnx", "tflite", "txt") }
   packaging {
     jniLibs {
       useLegacyPackaging = true
-      pickFirsts += listOf(
-        "**/libonnxruntime.so",
-        "**/libsherpa-onnx-jni.so",
-        "**/libsherpa-onnx-c-api.so",
-        "**/libsherpa-onnx-cxx-api.so"
-      )
+      // Do not use pickFirst for Sherpa/ONNX Runtime. Duplicate native runtimes must fail
+      // packaging rather than silently selecting an arbitrary, potentially incompatible library.
     }
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
@@ -89,47 +69,56 @@ android {
   }
 }
 
-// Configure the Secrets Gradle Plugin to use .env and .env.example files
-// to match the convention used in Web projects.
 secrets {
   propertiesFileName = ".env"
   defaultPropertiesFileName = ".env.example"
   ignoreList.add("FIREBASE_APPCHECK_DEBUG_TOKEN")
 }
-
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
+val sherpaAar = layout.projectDirectory.file("libs/sherpa-onnx-2.0.3.aar").asFile
+val sherpaKwsDir = layout.projectDirectory.dir("src/main/assets/kws-model").asFile
+val sherpaAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+
 tasks.register("verifySherpaRuntimeAssets") {
-  val libsDir = layout.projectDirectory.dir("libs").asFile
-  val kwsDir = layout.projectDirectory.dir("src/main/assets/kws-model").asFile
+  inputs.file(sherpaAar)
+  inputs.dir(sherpaKwsDir)
   doLast {
-    val aarFiles = libsDir.listFiles { f -> f.isFile && f.name.startsWith("sherpa-onnx") && f.name.endsWith(".aar") }
-    if (aarFiles.isNullOrEmpty()) {
-      throw GradleException("Missing official Sherpa-ONNX Android AAR in app/libs/.")
+    if (!sherpaAar.isFile || sherpaAar.length() == 0L) {
+      throw GradleException("Official Sherpa-ONNX v2.0.3 AAR is missing. Run: bash scripts/prepare-sherpa-onnx-android.sh")
     }
-    val aarFile = aarFiles.first()
-    val requiredAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-    val requiredNativeLibs = listOf(
-      "libsherpa-onnx-jni.so",
-      "libonnxruntime.so",
-      "libsherpa-onnx-c-api.so",
-      "libsherpa-onnx-cxx-api.so"
-    )
-    ZipFile(aarFile).use { zip ->
-      val entryNames = zip.entries().asSequence().map { it.name }.toSet()
-      if (!entryNames.contains("classes.jar")) {
-        throw GradleException("Invalid Sherpa-ONNX AAR (${aarFile.name}): missing classes.jar")
+    ZipFile(sherpaAar).use { aar ->
+      val entries = aar.entries().asSequence().associateBy { it.name }
+      val classesJar = entries["classes.jar"]
+        ?: throw GradleException("Invalid Sherpa-ONNX AAR: classes.jar is missing.")
+      val requiredClasses = setOf(
+        "com/k2fsa/sherpa/onnx/KeywordSpotter.class",
+        "com/k2fsa/sherpa/onnx/KeywordSpotterConfig.class",
+        "com/k2fsa/sherpa/onnx/OnlineStream.class",
+        "com/k2fsa/sherpa/onnx/FeatureConfig.class"
+      )
+      val actualClasses = mutableSetOf<String>()
+      ZipInputStream(aar.getInputStream(classesJar)).use { nested ->
+        while (true) {
+          val entry = nested.nextEntry ?: break
+          actualClasses += entry.name
+        }
       }
-      for (abi in requiredAbis) {
-        for (soName in requiredNativeLibs) {
-          val expectedEntry = "jni/$abi/$soName"
-          val entry = zip.getEntry(expectedEntry)
+      val missingClasses = requiredClasses - actualClasses
+      if (missingClasses.isNotEmpty()) {
+        throw GradleException("Sherpa-ONNX AAR is missing official Kotlin API classes: ${missingClasses.joinToString()}")
+      }
+      for (abi in sherpaAbis) {
+        for (library in listOf("libsherpa-onnx-jni.so", "libonnxruntime.so")) {
+          val path = "jni/${abi}/${library}"
+          val entry = entries[path]
           if (entry == null || entry.size <= 0L) {
-            throw GradleException("Missing or empty native library '$expectedEntry' inside ${aarFile.name}")
+            throw GradleException("Sherpa-ONNX AAR is missing required native runtime library: ${path}")
           }
         }
       }
     }
+
     val requiredModels = listOf(
       "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
       "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
@@ -138,22 +127,18 @@ tasks.register("verifySherpaRuntimeAssets") {
       "keywords.txt"
     )
     requiredModels.forEach { modelName ->
-      val f = File(kwsDir, modelName)
-      if (!f.exists() || f.length() <= 0L) {
-        throw GradleException("Missing or empty required Sherpa-ONNX KWS asset: ${f.path}")
+      val modelFile = File(sherpaKwsDir, modelName)
+      if (!modelFile.isFile || modelFile.length() <= 0L) {
+        throw GradleException("Missing or empty Sherpa-ONNX KWS model asset: ${modelFile.path}")
       }
     }
+    logger.lifecycle("Verified official Sherpa-ONNX v2.0.3 Kotlin AAR, JNI + ONNX Runtime for ${sherpaAbis.size} ABIs, and KWS model assets.")
   }
 }
+tasks.named("preBuild") { dependsOn("verifySherpaRuntimeAssets") }
 
-tasks.named("preBuild") {
-  dependsOn("verifySherpaRuntimeAssets")
-}
-
-// Some unused dependencies are commented out below instead of being removed.
-// This makes it easy to add them back in the future if needed.
 dependencies {
-  implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
+  implementation(files("libs/sherpa-onnx-2.0.3.aar"))
   implementation(platform(libs.androidx.compose.bom))
   implementation(platform(libs.firebase.bom))
   implementation(libs.accompanist.permissions)
@@ -179,11 +164,7 @@ dependencies {
   // implementation(libs.coil.compose)
   implementation(libs.converter.moshi)
   implementation(libs.firebase.ai)
-  // Uncomment to use Firestore:
   // implementation(libs.firebase.firestore)
-
-  // Uncomment ALL FOUR of the following dependencies together to use Firebase Auth and Google
-  // Sign-In via Credential Manager:
   // implementation(libs.firebase.auth)
   // implementation(libs.androidx.credentials)
   // implementation(libs.androidx.credentials.play.services)
