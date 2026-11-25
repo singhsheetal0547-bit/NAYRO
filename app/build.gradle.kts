@@ -11,45 +11,16 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
-// Resolve the official Sherpa-ONNX AAR automatically for local Android Studio builds too.
-// CI performs the same download in a separate preflight step and this task verifies its checksum.
+// Download the official Sherpa AAR for Android Studio builds when the file is not already present.
+// The implementation is a standalone shell script so the Gradle Exec task remains configuration-cache safe.
 val sherpaAarFile = layout.projectDirectory.file("libs/sherpa-onnx-2.0.3.aar")
-val ensureSherpaOnnxAar by tasks.registering {
+val ensureSherpaOnnxAar by tasks.registering(Exec::class) {
+  commandLine(
+    "bash",
+    rootProject.file(".github/scripts/ensure-sherpa-aar.sh").absolutePath,
+    sherpaAarFile.asFile.absolutePath
+  )
   outputs.file(sherpaAarFile)
-  doLast {
-    val target = sherpaAarFile.asFile
-    target.parentFile.mkdirs()
-
-    if (!target.exists()) {
-      val temporary = File(target.parentFile, "${target.name}.download")
-      val connection = URL(
-        "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-2.0.3.aar"
-      ).openConnection().apply {
-        connectTimeout = 20_000
-        readTimeout = 90_000
-      }
-      connection.getInputStream().use { input ->
-        temporary.outputStream().use { output -> input.copyTo(output) }
-      }
-      val digest = MessageDigest.getInstance("SHA-256")
-        .digest(temporary.readBytes())
-        .joinToString("") { "%02x".format(it) }
-      check(digest == "4c766e2e74c9d33d595338c21fe3b305c73ba45d47e96a235675c33142a2ec50") {
-        "Sherpa-ONNX AAR checksum mismatch. Refusing to use an unverified native runtime."
-      }
-      temporary.copyTo(target, overwrite = true)
-      check(temporary.delete()) {
-        "Unable to remove temporary Sherpa-ONNX AAR download."
-      }
-    } else {
-      val digest = MessageDigest.getInstance("SHA-256")
-        .digest(target.readBytes())
-        .joinToString("") { "%02x".format(it) }
-      check(digest == "4c766e2e74c9d33d595338c21fe3b305c73ba45d47e96a235675c33142a2ec50") {
-        "Sherpa-ONNX AAR checksum mismatch at ${target.absolutePath}."
-      }
-    }
-  }
 }
 
 tasks.matching { it.name == "preBuild" }.configureEach {
