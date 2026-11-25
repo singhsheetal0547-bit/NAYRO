@@ -2,7 +2,7 @@ name: NAYRO Android Debug APK
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/nayro-ready-agent]
   workflow_dispatch:
 
 permissions:
@@ -10,14 +10,14 @@ permissions:
   actions: write
 
 concurrency:
-  group: nayro-debug-apk-${{ github.ref }}
+  group: nayro-final-apk-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build debug APK
+    name: Validate and build the one final NAYRO APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout source
@@ -30,11 +30,44 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Set up Android SDK tools without interactive license prompt
-        uses: android-actions/setup-android@v3
+      - name: Set up Python for official Sherpa tokenizer
+        uses: actions/setup-python@v5
         with:
-          accept-android-sdk-licenses: false
-          packages: ''
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install pinned Sherpa-ONNX model tooling
+        run: python -m pip install --disable-pip-version-check "sherpa-onnx==2.0.3"
+
+      - name: Download and prepare official GigaSpeech Zipformer2 KWS assets
+        run: bash .github/scripts/prepare-sherpa-kws-assets.sh
+
+      - name: Download official Sherpa-ONNX Android AAR
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/libs
+          curl --fail --location --retry 4 --retry-delay 2 \
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-2.0.3.aar" \
+            --output app/libs/sherpa-onnx-2.0.3.aar
+          echo "4c766e2e74c9d33d595338c21fe3b305c73ba45d47e96a235675c33142a2ec50  app/libs/sherpa-onnx-2.0.3.aar" | sha256sum -c -
+          ls -lh app/libs/sherpa-onnx-2.0.3.aar
+
+      - name: Verify official AAR API classes and JNI dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          AAR="app/libs/sherpa-onnx-2.0.3.aar"
+          ENTRIES="$(unzip -Z1 "$AAR")"
+          echo "$ENTRIES" | grep -Fxq 'classes.jar'
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            echo "$ENTRIES" | grep -Fxq "jni/$ABI/libsherpa-onnx-jni.so"
+            echo "$ENTRIES" | grep -Fxq "jni/$ABI/libonnxruntime.so"
+          done
+          echo "Verified official Kotlin API and sherpa/ONNX native libraries for ARM64, ARMv7 and x86_64."
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v3
 
       - name: Install exact Android SDK required by this repository
         shell: bash
@@ -44,23 +77,15 @@ jobs:
           yes | sdkmanager --licenses >/dev/null
           set -o pipefail
           sdkmanager --install "platforms;android-36.1" "build-tools;36.0.0" "platform-tools"
-
-      - name: Verify Android SDK packages
-        shell: bash
-        run: |
-          set -euo pipefail
           test -d "$ANDROID_HOME/platforms/android-36.1"
           test -d "$ANDROID_HOME/build-tools/36.0.0"
-          echo "Installed compile platform and build tools:"
-          ls -la "$ANDROID_HOME/platforms"
-          ls -la "$ANDROID_HOME/build-tools"
 
       - name: Validate Gradle wrapper
         run: |
           chmod +x ./gradlew
           ./gradlew --version
 
-      - name: Generate and verify CI debug keystore
+      - name: Generate CI debug signing key
         shell: bash
         run: |
           set -euo pipefail
@@ -70,22 +95,63 @@ jobs:
           fi
           test -s "$KEYSTORE"
           keytool -list -keystore "$KEYSTORE" -storepass android -alias androiddebugkey
-      - name: Build NAYRO debug APK
+
+      - name: Resolve app runtime dependencies without assembling an APK
+        run: ./gradlew --no-daemon --stacktrace :app:dependencies --configuration debugRuntimeClasspath
+
+      - name: Validate all Sherpa ONNX model assets before compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR="app/src/main/assets/kws-model"
+          for MODEL in \
+            encoder-epoch-12-avg-2-chunk-16-left-64.onnx \
+            decoder-epoch-12-avg-2-chunk-16-left-64.onnx \
+            joiner-epoch-12-avg-2-chunk-16-left-64.onnx \
+            tokens.txt keywords.txt; do
+            test -s "$DIR/$MODEL"
+          done
+          echo "All 3 ONNX model files plus tokens and BPE keyword tokens are present."
+          du -h "$DIR"/*
+          sha256sum "$DIR"/*.onnx "$DIR/tokens.txt" "$DIR/keywords.txt"
+
+      - name: Run JVM tests before the only APK assembly
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Assemble the final NAYRO APK once
         run: ./gradlew --no-daemon --stacktrace --warning-mode all :app:assembleDebug
 
-      - name: Verify APK and print merged manifest permissions
+      - name: Inspect the final APK payload and required permissions
         shell: bash
         run: |
           set -euo pipefail
           APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
           test -n "$APK"
-          echo "APK produced: $APK"
+          echo "Final APK: $APK"
           ls -lh "$APK"
+
+          ENTRIES="$(unzip -Z1 "$APK")"
+          for MODEL in \
+            encoder-epoch-12-avg-2-chunk-16-left-64.onnx \
+            decoder-epoch-12-avg-2-chunk-16-left-64.onnx \
+            joiner-epoch-12-avg-2-chunk-16-left-64.onnx \
+            tokens.txt keywords.txt; do
+            echo "$ENTRIES" | grep -Fxq "assets/kws-model/$MODEL"
+          done
+
+          for ABI in arm64-v8a armeabi-v7a x86_64; do
+            echo "$ENTRIES" | grep -Fxq "lib/$ABI/libsherpa-onnx-jni.so"
+            echo "$ENTRIES" | grep -Fxq "lib/$ABI/libonnxruntime.so"
+          done
+          echo "APK contains all ONNX models, keyword assets, and native Sherpa/ONNX libraries."
+
           AAPT="$ANDROID_HOME/build-tools/36.0.0/aapt"
-          "$AAPT" dump permissions "$APK" || true
+          "$AAPT" dump permissions "$APK" | tee apk-permissions.txt
+          grep -q 'android.permission.RECORD_AUDIO' apk-permissions.txt
+          grep -q 'android.permission.FOREGROUND_SERVICE_MICROPHONE' apk-permissions.txt
           echo "$APK" > apk-path.txt
 
-      - name: Remove previous NAYRO debug APK artifacts to free Actions storage
+      - name: Remove previous NAYRO APK artifacts to free Actions storage
         uses: actions/github-script@v7
         with:
           script: |
@@ -97,31 +163,23 @@ jobs:
                 per_page: 100
               }
             );
-
             const previousApks = artifacts.filter(
-              artifact =>
-                artifact.name === "NAYRO-debug-apk" &&
-                !artifact.expired
+              artifact => artifact.name === "NAYRO-debug-apk" && !artifact.expired
             );
-
             for (const artifact of previousApks) {
-              core.info(`Deleting old artifact ${artifact.name} (ID: ${artifact.id}, size: ${artifact.size_in_bytes} bytes)`);
+              core.info(`Deleting old NAYRO APK artifact ID ${artifact.id} (${artifact.size_in_bytes} bytes)`);
               await github.rest.actions.deleteArtifact({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 artifact_id: artifact.id
               });
             }
+            core.info(`Deleted ${previousApks.length} previous APK artifact(s).`);
 
-            core.info(`Deleted ${previousApks.length} previous NAYRO debug APK artifact(s).`);
-
-      - name: Upload debug APK
+      - name: Upload the one final NAYRO APK
         uses: actions/upload-artifact@v4
         with:
           name: NAYRO-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 1
-
-      - name: Run unit tests
-        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
