@@ -65,13 +65,12 @@ data class AssistantIdentityProfile(
 ) {
     companion object {
         const val PRODUCT_NAME = "NAYRO"
-        const val DEFAULT_DISPLAY_NAME = "NAYRO"
+        const val DEFAULT_DISPLAY_NAME = "Babu"
         val DEFAULT_WAKE_PHRASES = listOf(
-            "Hi Nayro",
-            "Hey Nayro",
-            "Hi Nero",
             "Hi Babu",
-            "Hi Qki"
+            "Hey Babu",
+            "Hi Nayro",
+            "Hey Nayro"
         )
         val USER_ADDRESS_PRESETS = listOf("Sir", "Madam", "Boss", "Babu", "Sona")
         val ASSISTANT_NAME_PRESETS = listOf("NAYRO", "QT", "Babu", "Wavy")
