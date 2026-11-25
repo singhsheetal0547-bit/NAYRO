@@ -1558,7 +1558,10 @@ class LocalWakeWordEngine(private val context: Context?) {
         val clean = phrase.trim()
         if (clean.length < 3) return WakePhraseSupportStatus.INVALID_PHRASE
         if (context != null) {
-            val supported = clean.all { it.code in 32..126 } &&
+            // The packaged GigaSpeech BPE model contains only these four keywords.
+            // An arbitrary ASCII/custom phrase cannot be recognized by this fixed model.
+            val bundledPhrases = listOf("Hi Babu", "Hey Babu", "Hi Nayro", "Hey Nayro")
+            val supported = bundledPhrases.any { it.equals(clean, ignoreCase = true) } &&
                 sherpaWakeWordEngine?.areAssetsAvailable() == true
             return if (supported) WakePhraseSupportStatus.READY_BUNDLED_ACOUSTIC_TEMPLATE
             else WakePhraseSupportStatus.REQUIRES_VOICE_ENROLLMENT
