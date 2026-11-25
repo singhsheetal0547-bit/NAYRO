@@ -669,96 +669,10 @@ fun SettingsScreen(
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = "Active STT: ${voiceProviderStatus.effectiveSttEngine.displayName} • TTS: ${voiceProviderStatus.selectedTtsEngine.displayName}. Local wake-word detection stays 100% offline and independent of cloud APIs.",
+                    text = "Speech Recognition: Android system SpeechRecognizer • Speech Output: Android native TextToSpeech. NAYRO uses the Android system voice pipeline; separate Deepgram cloud STT routing is disabled in this build.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                voiceProviderStatus.fallbackActiveReason?.let { fallbackMsg ->
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = fallbackMsg,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = Coral
-                    )
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    SpeechRecognitionEngineType.entries.forEach { engineType ->
-                        val isSelected = voiceProviderStatus.selectedSttEngine == engineType
-                        if (isSelected) {
-                            Button(
-                                onClick = { onSelectSttEngine(engineType) },
-                                colors = ButtonDefaults.buttonColors(containerColor = ForestGreen),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .testTag("stt_engine_${engineType.name.lowercase()}")
-                            ) {
-                                Text(
-                                    if (engineType == SpeechRecognitionEngineType.DEEPGRAM_CLOUD) "Deepgram STT" else "Android STT",
-                                    style = MaterialTheme.typography.labelSmall
-                                )
-                            }
-                        } else {
-                            OutlinedButton(
-                                onClick = { onSelectSttEngine(engineType) },
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .testTag("stt_engine_${engineType.name.lowercase()}")
-                            ) {
-                                Text(
-                                    if (engineType == SpeechRecognitionEngineType.DEEPGRAM_CLOUD) "Deepgram STT" else "Android STT",
-                                    style = MaterialTheme.typography.labelSmall
-                                )
-                            }
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Deepgram Cloud STT API Key Card (Add / Edit / Delete / Test)
-                ProviderEntryCard(
-                    title = "Deepgram Cloud STT (Nova-2)",
-                    modelInfo = "Model: nova-2 • Automatic fallback to Android SpeechRecognizer if key missing or offline",
-                    hasKey = voiceProviderStatus.hasDeepgramKey,
-                    isActive = voiceProviderStatus.effectiveSttEngine == SpeechRecognitionEngineType.DEEPGRAM_CLOUD,
-                    inputValue = deepgramKeyInput,
-                    onInputChange = { deepgramKeyInput = it },
-                    label = "Deepgram API Key",
-                    onSave = {
-                        if (deepgramKeyInput.isNotBlank()) {
-                            onSaveDeepgramKey(deepgramKeyInput)
-                            deepgramKeyInput = ""
-                            deepgramStatusNote = "Deepgram API key securely saved in Android KeyStore."
-                        }
-                    },
-                    onDelete = {
-                        onDeleteDeepgramKey()
-                        deepgramStatusNote = "Deepgram API key deleted. Using Android SpeechRecognizer."
-                    },
-                    onTest = {
-                        if (onTestDeepgramConnection != null) {
-                            deepgramStatusNote = "Testing Deepgram API connection..."
-                            scope.launch {
-                                val (_, msg) = onTestDeepgramConnection()
-                                deepgramStatusNote = msg
-                            }
-                        }
-                    },
-                    testTag = "deepgram"
-                )
-                if (deepgramStatusNote.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = deepgramStatusNote,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = SuccessGreen
-                    )
-                }
-
                 Spacer(modifier = Modifier.height(16.dp))
 
                 Text(
