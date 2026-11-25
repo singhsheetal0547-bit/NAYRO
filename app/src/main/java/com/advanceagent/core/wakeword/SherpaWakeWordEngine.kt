@@ -52,7 +52,8 @@ class SherpaWakeWordEngine(
                 tokens = "$modelDirInAssets/$TOKENS_ASSET_NAME",
                 numThreads = 2,
                 debug = false,
-                provider = "cpu"
+                provider = "cpu",
+                modelType = "zipformer2"
             ),
             maxActivePaths = 4,
             keywordsFile = "$modelDirInAssets/$KEYWORDS_ASSET_NAME",
