@@ -189,7 +189,16 @@ class SecurePreferences(context: Context? = null) {
         set(value) = putBoolean(KEY_YOUTUBE_API_ENABLED, value)
 
     var geminiModel: String
-        get() = normalizeModelId(getString(KEY_GEMINI_MODEL, DEFAULT_MODEL))
+        get() {
+            val stored = normalizeModelId(getString(KEY_GEMINI_MODEL, DEFAULT_MODEL))
+            // Migrate IDs that are no longer suitable for this app's current Gemini Live session.
+            return if (stored in RETIRED_LIVE_MODEL_IDS) {
+                putString(KEY_GEMINI_MODEL, DEFAULT_MODEL)
+                DEFAULT_MODEL
+            } else {
+                stored
+            }
+        }
         set(value) = putString(KEY_GEMINI_MODEL, normalizeModelId(value))
 
     var voiceName: String
@@ -313,6 +322,12 @@ class SecurePreferences(context: Context? = null) {
 
         const val DEFAULT_APP_WAKE_PHRASES = "HI BABU, HEY BABU, HI NAYRO"
         const val DEFAULT_MODEL = "models/gemini-3.8-live"
+        private val RETIRED_LIVE_MODEL_IDS = setOf(
+            "models/gemini-2.0-flash-exp",
+            "models/gemini-2.0-flash-live-001",
+            "models/gemini-2.5-flash-native-audio-preview-09-2025",
+            "models/gemini-2.5-flash-native-audio-preview-12-2025"
+        )
 
         val SUPPORTED_VOICES = listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede")
         val RECOMMENDED_LIVE_MODELS = listOf(
