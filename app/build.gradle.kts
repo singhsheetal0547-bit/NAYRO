@@ -51,7 +51,7 @@ val ensureSherpaOnnxAar by tasks.registering {
   }
 }
 
-tasks.named("preBuild").configure {
+tasks.matching { it.name == "preBuild" }.configureEach {
   dependsOn(ensureSherpaOnnxAar)
 }
 
