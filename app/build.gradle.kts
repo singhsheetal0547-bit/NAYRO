@@ -91,7 +91,7 @@ googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.W
 // This makes it easy to add them back in in the future if needed.
 dependencies {
   // Official Sherpa-ONNX Android runtime: Kotlin API + JNI/native ONNX Runtime libraries.
-  implementation("com.k2fsa.sherpa:sherpa-onnx:2.0.3@aar")
+  implementation(files("libs/sherpa-onnx-2.0.3.aar"))
   implementation(platform(libs.androidx.compose.bom))
   implementation(platform(libs.firebase.bom))
   implementation(libs.accompanist.permissions)
