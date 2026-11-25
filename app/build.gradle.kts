@@ -1,4 +1,47 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.security.MessageDigest
+
+// Resolve the official Sherpa-ONNX AAR automatically for local Android Studio builds too.
+// CI performs the same download in a separate preflight step and this task verifies its checksum.
+val sherpaAarFile = layout.projectDirectory.file("libs/sherpa-onnx-2.0.3.aar")
+val ensureSherpaOnnxAar by tasks.registering {
+  outputs.file(sherpaAarFile)
+  doLast {
+    val target = sherpaAarFile.asFile
+    target.parentFile.mkdirs()
+
+    if (!target.exists()) {
+      val temporary = java.io.File(target.parentFile, "${target.name}.download")
+      val connection = java.net.URL(
+        "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.3/sherpa-onnx-2.0.3.aar"
+      ).openConnection().apply {
+        connectTimeout = 20_000
+        readTimeout = 90_000
+      }
+      connection.getInputStream().use { input ->
+        temporary.outputStream().use { output -> input.copyTo(output) }
+      }
+      val digest = MessageDigest.getInstance("SHA-256")
+        .digest(temporary.readBytes())
+        .joinToString("") { "%02x".format(it) }
+      check(digest == "4c766e2e74c9d33d595338c21fe3b305c73ba45d47e96a235675c33142a2ec50") {
+        "Sherpa-ONNX AAR checksum mismatch. Refusing to use an unverified native runtime."
+      }
+      java.nio.file.Files.move(
+        temporary.toPath(),
+        target.toPath(),
+        java.nio.file.StandardCopyOption.REPLACE_EXISTING
+      )
+    } else {
+      val digest = MessageDigest.getInstance("SHA-256")
+        .digest(target.readBytes())
+        .joinToString("") { "%02x".format(it) }
+      check(digest == "4c766e2e74c9d33d595338c21fe3b305c73ba45d47e96a235675c33142a2ec50") {
+        "Sherpa-ONNX AAR checksum mismatch at ${target.absolutePath}."
+      }
+    }
+  }
+}
 
 plugins {
   alias(libs.plugins.android.application)
@@ -6,6 +49,10 @@ plugins {
   alias(libs.plugins.google.devtools.ksp)
   alias(libs.plugins.secrets)
   alias(libs.plugins.google.services)
+}
+
+tasks.named("preBuild").configure {
+  dependsOn(ensureSherpaOnnxAar)
 }
 
 android {
