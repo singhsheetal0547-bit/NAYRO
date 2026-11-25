@@ -112,15 +112,14 @@ object OfficialSherpaOnnxJniBridge : SherpaOnnxJniBridge {
         spotter: KeywordSpotter,
         keywordsSpec: String
     ): OnlineStream? {
-        var stream = if (keywordsSpec.isNotBlank()) {
-            spotter.createStream(keywordsSpec)
-        } else {
-            spotter.createStream("")
+        if (keywordsSpec.isBlank()) return null
+        return try {
+            spotter.createStream(keywordsSpec).takeIf { it.ptr != 0L }
+        } catch (_: Throwable) {
+            // The official OnlineStream constructor rejects a zero native pointer. Do not
+            // silently fall back to keywords.txt, because that would ignore the active phrase set.
+            null
         }
-        if (stream.ptr == 0L) {
-            stream = spotter.createStream("")
-        }
-        return if (stream.ptr != 0L) stream else null
     }
 
     override fun acceptWaveform(
