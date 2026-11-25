@@ -323,8 +323,11 @@ class SecurePreferences(context: Context? = null) {
         const val DEFAULT_APP_WAKE_PHRASES = "HI BABU, HEY BABU, HI NAYRO"
         const val DEFAULT_MODEL = "models/gemini-3.8-live"
         private val RETIRED_LIVE_MODEL_IDS = setOf(
+            "models/gemini-2.0-flash",
             "models/gemini-2.0-flash-exp",
             "models/gemini-2.0-flash-live-001",
+            "models/gemini-2.5-flash",
+            "models/gemini-2.5-pro",
             "models/gemini-2.5-flash-native-audio-preview-09-2025",
             "models/gemini-2.5-flash-native-audio-preview-12-2025"
         )
