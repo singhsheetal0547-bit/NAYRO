@@ -28,7 +28,9 @@ enum class NayroPersonalityMode(val label: String, val systemInstructionDirectiv
 
 class SecurePreferences(context: Context? = null) {
 
-    private val keystoreManager: KeystoreManager? = context?.let {
+    private val appContext: Context? = context?.applicationContext ?: context
+
+    private val keystoreManager: KeystoreManager? = appContext?.let {
         try {
             KeystoreManager(it)
         } catch (_: Throwable) {
@@ -36,7 +38,15 @@ class SecurePreferences(context: Context? = null) {
         }
     }
 
-    private val prefs: SharedPreferences? = context?.let {
+    private val nayroEncryptedStorage: com.example.core.security.EncryptedStorageManager? = appContext?.let {
+        try {
+            com.example.core.security.EncryptedStorageManager(it)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private val prefs: SharedPreferences? = appContext?.let {
         try {
             it.getSharedPreferences("advance_agent_secure_prefs", Context.MODE_PRIVATE)
         } catch (_: Throwable) {
@@ -116,9 +126,55 @@ class SecurePreferences(context: Context? = null) {
         }
     }
 
+    private fun resolveBuildConfigGeminiKey(): String {
+        val candidateClasses = listOf(
+            "com.example.BuildConfig",
+            "com.advanceagent.core.BuildConfig"
+        )
+        for (className in candidateClasses) {
+            try {
+                val clazz = Class.forName(className)
+                val field = clazz.getDeclaredField("GEMINI_API_KEY")
+                field.isAccessible = true
+                val value = (field.get(null) as? String)?.trim().orEmpty()
+                if (value.isNotEmpty() && !value.startsWith("YOUR_", ignoreCase = true)) {
+                    return value
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return ""
+    }
+
     var geminiApiKey: String
-        get() = decryptSecret(KEY_GEMINI_API, KEY_GEMINI_API_PLAIN)
-        set(value) = putString(KEY_GEMINI_API, encryptSecret(value, KEY_GEMINI_API_PLAIN))
+        get() {
+            val localKey = decryptSecret(KEY_GEMINI_API, KEY_GEMINI_API_PLAIN).trim()
+            if (localKey.isNotEmpty()) return localKey
+            val nayroKey = try {
+                nayroEncryptedStorage?.getApiKey("gemini_default")?.trim().orEmpty()
+            } catch (_: Throwable) {
+                ""
+            }
+            if (nayroKey.isNotEmpty()) {
+                inMemoryStore[KEY_GEMINI_API_PLAIN] = nayroKey
+                return nayroKey
+            }
+            return resolveBuildConfigGeminiKey()
+        }
+        set(value) {
+            val clean = value.trim()
+            putString(KEY_GEMINI_API, encryptSecret(clean, KEY_GEMINI_API_PLAIN))
+            try {
+                if (clean.isEmpty()) {
+                    nayroEncryptedStorage?.removeApiKey("gemini_default")
+                } else {
+                    nayroEncryptedStorage?.saveApiKey("gemini_default", clean)
+                }
+                val nayroApp = appContext as? com.example.NayroApplication
+                nayroApp?.providerManager?.refreshActiveProvider()
+            } catch (_: Throwable) {
+            }
+        }
 
     var ephemeralAccessToken: String
         get() = decryptSecret(KEY_EPHEMERAL_TOKEN, KEY_EPHEMERAL_TOKEN_PLAIN)
@@ -133,7 +189,7 @@ class SecurePreferences(context: Context? = null) {
         set(value) = putBoolean(KEY_YOUTUBE_API_ENABLED, value)
 
     var geminiModel: String
-        get() = getString(KEY_GEMINI_MODEL, DEFAULT_MODEL)
+        get() = normalizeModelId(getString(KEY_GEMINI_MODEL, DEFAULT_MODEL))
         set(value) = putString(KEY_GEMINI_MODEL, normalizeModelId(value))
 
     var voiceName: String
@@ -220,7 +276,7 @@ class SecurePreferences(context: Context? = null) {
     }
 
     var isMasterPowerOn: Boolean
-        get() = getBoolean(KEY_MASTER_POWER, false)
+        get() = getBoolean(KEY_MASTER_POWER, true)
         set(value) = putBoolean(KEY_MASTER_POWER, value)
 
     var autoStartOnBoot: Boolean
@@ -256,12 +312,13 @@ class SecurePreferences(context: Context? = null) {
         private const val KEY_BOOT_AUTO_START = "boot_auto_start"
 
         const val DEFAULT_APP_WAKE_PHRASES = "HI BABU, HEY BABU, HI NAYRO"
-        const val DEFAULT_MODEL = "models/gemini-2.5-flash-native-audio-preview-09-2025"
+        const val DEFAULT_MODEL = "models/gemini-2.0-flash-exp"
 
         val SUPPORTED_VOICES = listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede")
         val RECOMMENDED_LIVE_MODELS = listOf(
-            "models/gemini-2.5-flash-native-audio-preview-09-2025",
+            "models/gemini-2.0-flash-exp",
             "models/gemini-2.0-flash-live-001",
+            "models/gemini-2.5-flash-native-audio-preview-09-2025",
             "models/gemini-2.5-flash"
         )
 

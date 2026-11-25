@@ -58,6 +58,7 @@ class GeminiLiveWebSocket(
 
     @Volatile private var currentResumptionHandle: String = initialSessionResumptionHandle
     @Volatile private var manualDisconnect = false
+    @Volatile private var useCompatibilityFallbackSetup = false
     private var reconnectAttempt = 0
     private val cancelledToolCallIds: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
@@ -74,7 +75,7 @@ class GeminiLiveWebSocket(
 
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.i(TAG, "Connected to Gemini Live WebSocket")
+                Log.i(TAG, "Connected to Gemini Live WebSocket (compatFallback=$useCompatibilityFallbackSetup)")
                 reconnectAttempt = 0
                 sendInitialSetup(webSocket)
             }
@@ -89,15 +90,26 @@ class GeminiLiveWebSocket(
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 Log.w(TAG, "WebSocket Closing: $code / $reason")
+                val failedBeforeSetup = !isSetupComplete
                 isSetupComplete = false
+                if (!manualDisconnect && failedBeforeSetup && !useCompatibilityFallbackSetup && code != 1000) {
+                    Log.w(TAG, "Setup rejected ($code / $reason); retrying with universal models/gemini-2.0-flash-exp compatibility config")
+                    useCompatibilityFallbackSetup = true
+                    scheduleReconnect()
+                    return
+                }
                 onStateChanged("DISCONNECTED")
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                 Log.e(TAG, "WebSocket Failure: ${t.message}", t)
+                val failedBeforeSetup = !isSetupComplete
                 isSetupComplete = false
+                if (!manualDisconnect && failedBeforeSetup && !useCompatibilityFallbackSetup) {
+                    useCompatibilityFallbackSetup = true
+                }
                 onStateChanged("ERROR")
-                if (!manualDisconnect && enableSessionResumption && reconnectAttempt < 3) {
+                if (!manualDisconnect && (enableSessionResumption || failedBeforeSetup) && reconnectAttempt < 3) {
                     scheduleReconnect()
                 }
             }
@@ -116,45 +128,63 @@ class GeminiLiveWebSocket(
         }
     }
 
-    private fun sendInitialSetup(ws: WebSocket) {
+    internal fun buildInitialSetupMessage(compatibilityMode: Boolean = useCompatibilityFallbackSetup): BidiSetupMessage {
         val systemPrompt = PromptGenerator.buildGeminiLiveSystemInstruction(
             assistantName = assistantName,
             userName = userName,
             personalityMode = personalityMode,
             memories = memories
         )
+        val resolvedModel = if (compatibilityMode) {
+            "models/gemini-2.0-flash-exp"
+        } else if (modelId.startsWith("models/")) {
+            modelId
+        } else {
+            "models/$modelId"
+        }
 
-        val setupMsg = BidiSetupMessage(
-            setup = BidiSetupConfig(
-                model = if (modelId.startsWith("models/")) modelId else "models/$modelId",
-                generationConfig = GenerationConfig(
-                    responseModalities = listOf("AUDIO"),
-                    speechConfig = SpeechConfig(
-                        voiceConfig = VoiceConfig(
-                            prebuiltVoiceConfig = PrebuiltVoiceConfig(voiceName = voiceName)
+        return if (compatibilityMode) {
+            BidiSetupMessage(
+                setup = BidiSetupConfig(
+                    model = resolvedModel,
+                    generationConfig = GenerationConfig(
+                        responseModalities = listOf("AUDIO"),
+                        speechConfig = SpeechConfig(
+                            voiceConfig = VoiceConfig(
+                                prebuiltVoiceConfig = PrebuiltVoiceConfig(voiceName = voiceName)
+                            )
                         )
-                    )
-                ),
-                systemInstruction = SystemInstruction(parts = listOf(TextPart(systemPrompt))),
-                tools = AgentToolDeclarations.allTools(includeGoogleSearchGrounding = includeGoogleSearchGrounding),
-                realtimeInputConfig = RealtimeInputConfig(
-                    automaticActivityDetection = AutomaticActivityDetectionConfig(
-                        disabled = false,
-                        prefixPaddingMs = 300,
-                        silenceDurationMs = 700
-                    )
-                ),
-                inputAudioTranscription = if (enableLiveTranscription) emptyMap() else null,
-                outputAudioTranscription = if (enableLiveTranscription) emptyMap() else null,
-                sessionResumption = if (enableSessionResumption) {
-                    SessionResumptionConfig(handle = currentResumptionHandle.takeIf { it.isNotBlank() })
-                } else null,
-                contextWindowCompression = ContextWindowCompressionConfig(
-                    slidingWindow = SlidingWindowConfig(targetTokens = 16384)
+                    ),
+                    systemInstruction = SystemInstruction(parts = listOf(TextPart(systemPrompt))),
+                    tools = AgentToolDeclarations.allTools(includeGoogleSearchGrounding = false)
                 )
             )
-        )
+        } else {
+            BidiSetupMessage(
+                setup = BidiSetupConfig(
+                    model = resolvedModel,
+                    generationConfig = GenerationConfig(
+                        responseModalities = listOf("AUDIO"),
+                        speechConfig = SpeechConfig(
+                            voiceConfig = VoiceConfig(
+                                prebuiltVoiceConfig = PrebuiltVoiceConfig(voiceName = voiceName)
+                            )
+                        )
+                    ),
+                    systemInstruction = SystemInstruction(parts = listOf(TextPart(systemPrompt))),
+                    tools = AgentToolDeclarations.allTools(includeGoogleSearchGrounding = includeGoogleSearchGrounding),
+                    inputAudioTranscription = if (enableLiveTranscription) emptyMap() else null,
+                    outputAudioTranscription = if (enableLiveTranscription) emptyMap() else null,
+                    sessionResumption = if (enableSessionResumption && currentResumptionHandle.isNotBlank()) {
+                        SessionResumptionConfig(handle = currentResumptionHandle)
+                    } else null
+                )
+            )
+        }
+    }
 
+    private fun sendInitialSetup(ws: WebSocket) {
+        val setupMsg = buildInitialSetupMessage(useCompatibilityFallbackSetup)
         val json = gson.toJson(setupMsg)
         ws.send(json)
     }

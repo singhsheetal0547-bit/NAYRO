@@ -1,5 +1,6 @@
 package com.advanceagent.core.service
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,11 +8,16 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.advanceagent.core.AgentApplication
 import com.advanceagent.core.R
 import com.advanceagent.core.audio.AudioStreamManager
@@ -38,7 +44,7 @@ class WakeWordForegroundService : Service() {
     companion object {
         private const val TAG = "WakeWordService"
         private const val CHANNEL_ID = "advance_agent_channel"
-        private const val NOTIF_ID = 1001
+        private const val NOTIF_ID = 1002
 
         const val ACTION_START_LISTENING = "com.advanceagent.core.ACTION_START_LISTENING"
         const val ACTION_START_ENGINE = "com.advanceagent.core.ACTION_START_ENGINE"
@@ -65,6 +71,7 @@ class WakeWordForegroundService : Service() {
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var prefs: SecurePreferences
     private lateinit var soundEffects: SoundEffectsManager
     private var wakeLock: PowerManager.WakeLock? = null
@@ -79,6 +86,36 @@ class WakeWordForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private fun hasRecordAudioPermission(): Boolean {
+        return try {
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun promoteToForegroundSafely(statusText: String): Boolean {
+        val notification = buildNotification(statusText)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                startForeground(
+                    NOTIF_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                )
+            } else {
+                startForeground(NOTIF_ID, notification)
+            }
+            true
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed to start foreground microphone service: ${e.message}")
+            false
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
@@ -89,7 +126,18 @@ class WakeWordForegroundService : Service() {
         }
         ChatRepository.nayroRepository = (application as? NayroApplication)?.repository
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification("NAYRO (${prefs.assistantName}) Standby"))
+
+        if (!hasRecordAudioPermission()) {
+            Log.w(TAG, "RECORD_AUDIO permission not yet granted; deferring WakeWordForegroundService.")
+            _agentOrbStateFlow.value = "ERROR"
+            stopSelf()
+            return
+        }
+
+        if (!promoteToForegroundSafely("NAYRO (${prefs.assistantName}) Standby")) {
+            stopSelf()
+            return
+        }
 
         toolRouter = AgentToolRouter(applicationContext, app.memoryDb)
 
@@ -98,16 +146,28 @@ class WakeWordForegroundService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (!prefs.isMasterPowerOn && intent?.action != ACTION_COMPLETE_SHUTDOWN) {
-            Log.w(TAG, "Master Power is OFF. Stopping WakeWordForegroundService.")
+        if (intent?.action == ACTION_COMPLETE_SHUTDOWN) {
+            soundEffects.onErrorOrShutdown()
+            stopGeminiLiveSession()
             stopSelf()
             return START_NOT_STICKY
+        }
+
+        if (!hasRecordAudioPermission()) {
+            Log.w(TAG, "RECORD_AUDIO permission missing in onStartCommand; stopping service.")
+            _agentOrbStateFlow.value = "ERROR"
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (!prefs.isMasterPowerOn) {
+            prefs.isMasterPowerOn = true
         }
 
         soundEffects.isEnabled = prefs.soundAndHapticsEnabled
 
         when (intent?.action) {
-            ACTION_START_LISTENING, ACTION_START_ENGINE -> {
+            ACTION_START_LISTENING, ACTION_START_ENGINE, null -> {
                 initializeEngines()
             }
             ACTION_RELOAD_WAKE_WORDS -> {
@@ -131,18 +191,12 @@ class WakeWordForegroundService : Service() {
             ACTION_STREAM_SCREEN_VISION -> {
                 streamScreenVisionFrame()
             }
-            ACTION_COMPLETE_SHUTDOWN -> {
-                soundEffects.onErrorOrShutdown()
-                stopGeminiLiveSession()
-                stopSelf()
-                return START_NOT_STICKY
-            }
         }
         return START_STICKY
     }
 
     private fun initializeEngines() {
-        if (!prefs.isMasterPowerOn) return
+        if (!prefs.isMasterPowerOn || !hasRecordAudioPermission()) return
 
         if (kwsEngine == null) {
             kwsEngine = SherpaWakeWordEngine(context = applicationContext)
@@ -163,7 +217,13 @@ class WakeWordForegroundService : Service() {
     }
 
     private fun startContinuousMicrophoneLoop() {
-        audioStream.startCapture(
+        // Release NAYRO's secondary wake AudioRecord if active so two AudioRecord instances never collide
+        try {
+            (application as? NayroApplication)?.voiceManager?.wakeWordEngine?.pauseForAsr()
+        } catch (_: Throwable) {
+        }
+
+        val started = audioStream.startCapture(
             scope = serviceScope,
             onPcmShortChunk = { pcmShorts, readCount ->
                 if (!prefs.isMasterPowerOn) return@startCapture
@@ -189,6 +249,9 @@ class WakeWordForegroundService : Service() {
                 }
             }
         )
+        if (started && !isLiveSessionActive) {
+            _agentOrbStateFlow.value = "IDLE"
+        }
     }
 
     private fun reloadWakeWordsLive() {
@@ -204,10 +267,18 @@ class WakeWordForegroundService : Service() {
         val apiKey = prefs.geminiApiKey.trim()
         val ephemeralToken = prefs.ephemeralAccessToken.trim()
         if (apiKey.isEmpty() && ephemeralToken.isEmpty()) {
-            Log.e(TAG, "Gemini API Key and Ephemeral Token are empty! Please set API key in Settings.")
-            _agentOrbStateFlow.value = "ERROR"
-            soundEffects.onErrorOrShutdown()
-            updateNotification("Missing Gemini API Key in Settings")
+            Log.w(TAG, "Gemini Live API Key not set; delegating wake trigger ($triggerSource) to local NAYRO VoiceManager.")
+            _agentOrbStateFlow.value = "LISTENING"
+            soundEffects.onListeningStarted()
+            updateNotification("Listening locally ($triggerSource) — Add Gemini API Key in Settings for Gemini Live")
+            mainHandler.post {
+                try {
+                    val nayroApp = application as? NayroApplication
+                    audioStream.stopCapture()
+                    nayroApp?.voiceManager?.startListening()
+                } catch (_: Throwable) {
+                }
+            }
             return
         }
 
@@ -317,7 +388,7 @@ class WakeWordForegroundService : Service() {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AdvanceVoiceAgent::WakeWordLock").apply {
                 setReferenceCounted(false)
-                acquire(10 * 60 * 1000L)
+                acquire(6 * 60 * 60 * 1000L)
             }
         } catch (e: Exception) {
             Log.e(TAG, "WakeLock error: ${e.message}")

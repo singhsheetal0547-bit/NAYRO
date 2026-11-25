@@ -188,10 +188,31 @@ class AIProviderManager(
         storage.savePreference("provider_enabled_${cfg.id}", cfg.isEnabled.toString())
     }
 
+    private fun syncGeminiKeyFromAdvancePrefsIfMissing(): String {
+        val storage = encryptedStorageManager ?: return ""
+        val current = storage.getApiKey("gemini_default").trim()
+        if (current.isNotEmpty()) return current
+        return try {
+            val fallbackKey = com.example.NayroApplication.instance.prefs.geminiApiKey.trim()
+            if (fallbackKey.isNotEmpty()) {
+                storage.saveApiKey("gemini_default", fallbackKey)
+            }
+            fallbackKey
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
     fun refreshActiveProvider() {
+        syncGeminiKeyFromAdvancePrefsIfMissing()
         val providers = _configuredProviders.value.map { cfg ->
             val key = encryptedStorageManager?.getApiKey(cfg.id) ?: ""
-            cfg.copy(hasKeySaved = key.isNotBlank() || cfg.type == ProviderType.LOCAL_MODEL)
+            val hasKey = key.isNotBlank() || cfg.type == ProviderType.LOCAL_MODEL
+            val autoEnableGemini = cfg.id == "gemini_default" && key.isNotBlank()
+            cfg.copy(
+                hasKeySaved = hasKey,
+                isEnabled = cfg.isEnabled || autoEnableGemini
+            )
         }
         _configuredProviders.value = providers
 
@@ -226,6 +247,12 @@ class AIProviderManager(
             return
         }
         encryptedStorageManager?.saveApiKey(providerId, cleanKey)
+        if (providerId == "gemini_default") {
+            try {
+                com.example.NayroApplication.instance.prefs.geminiApiKey = cleanKey
+            } catch (_: Throwable) {
+            }
+        }
         val updatedList = _configuredProviders.value.map { cfg ->
             if (cfg.id == providerId) {
                 val updated = cfg.copy(isEnabled = true, hasKeySaved = true)
@@ -244,6 +271,12 @@ class AIProviderManager(
      */
     fun deleteApiKey(providerId: String) {
         encryptedStorageManager?.removeApiKey(providerId)
+        if (providerId == "gemini_default") {
+            try {
+                com.example.NayroApplication.instance.prefs.geminiApiKey = ""
+            } catch (_: Throwable) {
+            }
+        }
         val updatedList = _configuredProviders.value.map { cfg ->
             if (cfg.id == providerId) {
                 cfg.copy(hasKeySaved = cfg.type == ProviderType.LOCAL_MODEL)

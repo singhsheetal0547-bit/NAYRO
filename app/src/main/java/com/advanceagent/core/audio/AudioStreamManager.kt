@@ -31,54 +31,96 @@ class AudioStreamManager {
         onPcmShortChunk: (ShortArray, Int) -> Unit,
         onAmplitude: ((Float) -> Unit)? = null,
         onPcmByteChunk: ((ByteArray) -> Unit)? = null
-    ) {
+    ): Boolean {
         stopCapture()
 
-        val minBuf = AudioRecord.getMinBufferSize(
-            INPUT_SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(3200)
+        val minBuf = try {
+            AudioRecord.getMinBufferSize(
+                INPUT_SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(3200)
+        } catch (_: Throwable) {
+            3200
+        }
 
-        val record = AudioRecord(
+        val sources = intArrayOf(
             MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-            INPUT_SAMPLE_RATE,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            minBuf * 2
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC
         )
 
-        if (AcousticEchoCanceler.isAvailable()) {
-            echoCanceler = AcousticEchoCanceler.create(record.audioSessionId)?.apply { enabled = true }
-        }
-        if (NoiseSuppressor.isAvailable()) {
-            noiseSuppressor = NoiseSuppressor.create(record.audioSessionId)?.apply { enabled = true }
+        var initializedRecord: AudioRecord? = null
+        for (source in sources) {
+            try {
+                val candidate = AudioRecord(
+                    source,
+                    INPUT_SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    minBuf * 2
+                )
+                if (candidate.state == AudioRecord.STATE_INITIALIZED) {
+                    initializedRecord = candidate
+                    break
+                } else {
+                    candidate.release()
+                }
+            } catch (_: Throwable) {
+            }
         }
 
-        audioRecord = record
-        record.startRecording()
+        val record = initializedRecord ?: return false
 
-        captureJob = scope.launch(Dispatchers.IO) {
-            val shortBuf = ShortArray(1600)
-            while (isActive) {
-                val read = record.read(shortBuf, 0, shortBuf.size)
-                if (read > 0) {
-                    onPcmShortChunk(shortBuf, read)
-                    onAmplitude?.let { cb ->
-                        var maxSample = 0
-                        for (i in 0 until read) {
-                            val a = abs(shortBuf[i].toInt())
-                            if (a > maxSample) maxSample = a
-                        }
-                        cb((maxSample / 32768f).coerceIn(0f, 1f))
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                echoCanceler = AcousticEchoCanceler.create(record.audioSessionId)?.apply { enabled = true }
+            }
+        } catch (_: Throwable) {
+        }
+        try {
+            if (NoiseSuppressor.isAvailable()) {
+                noiseSuppressor = NoiseSuppressor.create(record.audioSessionId)?.apply { enabled = true }
+            }
+        } catch (_: Throwable) {
+        }
+
+        return try {
+            audioRecord = record
+            record.startRecording()
+
+            captureJob = scope.launch(Dispatchers.IO) {
+                val shortBuf = ShortArray(1600)
+                while (isActive) {
+                    val read = try {
+                        record.read(shortBuf, 0, shortBuf.size)
+                    } catch (_: Throwable) {
+                        -1
                     }
-                    onPcmByteChunk?.let { byteCallback ->
-                        val bb = ByteBuffer.allocate(read * 2).order(ByteOrder.LITTLE_ENDIAN)
-                        for (i in 0 until read) bb.putShort(shortBuf[i])
-                        byteCallback(bb.array())
+                    if (read > 0) {
+                        onPcmShortChunk(shortBuf, read)
+                        onAmplitude?.let { cb ->
+                            var maxSample = 0
+                            for (i in 0 until read) {
+                                val a = abs(shortBuf[i].toInt())
+                                if (a > maxSample) maxSample = a
+                            }
+                            cb((maxSample / 32768f).coerceIn(0f, 1f))
+                        }
+                        onPcmByteChunk?.let { byteCallback ->
+                            val bb = ByteBuffer.allocate(read * 2).order(ByteOrder.LITTLE_ENDIAN)
+                            for (i in 0 until read) bb.putShort(shortBuf[i])
+                            byteCallback(bb.array())
+                        }
+                    } else if (read < 0) {
+                        break
                     }
                 }
             }
+            true
+        } catch (_: Throwable) {
+            stopCapture()
+            false
         }
     }
 
