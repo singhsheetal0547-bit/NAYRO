@@ -312,14 +312,14 @@ class SecurePreferences(context: Context? = null) {
         private const val KEY_BOOT_AUTO_START = "boot_auto_start"
 
         const val DEFAULT_APP_WAKE_PHRASES = "HI BABU, HEY BABU, HI NAYRO"
-        const val DEFAULT_MODEL = "models/gemini-2.0-flash-exp"
+        const val DEFAULT_MODEL = "models/gemini-3.8-live"
 
         val SUPPORTED_VOICES = listOf("Puck", "Charon", "Kore", "Fenrir", "Aoede")
         val RECOMMENDED_LIVE_MODELS = listOf(
-            "models/gemini-2.0-flash-exp",
-            "models/gemini-2.0-flash-live-001",
-            "models/gemini-2.5-flash-native-audio-preview-09-2025",
-            "models/gemini-2.5-flash"
+            "models/gemini-3.8-live",
+            "models/gemini-3.8-live-extended-thinking",
+            "models/gemini-3.1-flash-live-preview",
+            "models/gemini-2.5-flash-native-audio-preview-12-2025"
         )
 
         fun normalizeModelId(raw: String): String {
