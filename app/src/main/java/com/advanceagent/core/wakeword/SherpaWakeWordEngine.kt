@@ -206,13 +206,16 @@ class SherpaWakeWordEngine(
     }
 
     private fun resolvePhrases(input: List<String>): List<String> {
-        // The bundled GigaSpeech BPE keywords are compiled at CI time for these four NAYRO
-        // wake phrases. Only report phrases the packaged model can actually recognize.
-        val requested = input.map { it.trim() }.filter { it.isNotEmpty() }
-        val selected = DEFAULT_WAKE_WORDS.filter { bundled ->
-            requested.isEmpty() || requested.any { it.equals(bundled, ignoreCase = true) }
+        // keywords.txt inside this APK contains all four pre-tokenized phrases. Keep the
+        // alias map aligned with that complete file; custom phrases are not claimed as active.
+        val unsupported = input.map { it.trim() }
+            .filter { candidate ->
+                candidate.isNotEmpty() && DEFAULT_WAKE_WORDS.none { it.equals(candidate, ignoreCase = true) }
+            }
+        if (unsupported.isNotEmpty()) {
+            Log.w(TAG, "Wake phrases not included in the packaged BPE model were ignored: ${unsupported.joinToString()}")
         }
-        return selected.ifEmpty { DEFAULT_WAKE_WORDS }
+        return DEFAULT_WAKE_WORDS
     }
 
     private fun toAlias(phrase: String): String =
