@@ -1,6 +1,14 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
 import java.security.MessageDigest
 
+plugins {
+  alias(libs.plugins.android.application)
+  alias(libs.plugins.kotlin.compose)
+  alias(libs.plugins.google.devtools.ksp)
+  alias(libs.plugins.secrets)
+  alias(libs.plugins.google.services)
+}
+
 // Resolve the official Sherpa-ONNX AAR automatically for local Android Studio builds too.
 // CI performs the same download in a separate preflight step and this task verifies its checksum.
 val sherpaAarFile = layout.projectDirectory.file("libs/sherpa-onnx-2.0.3.aar")
