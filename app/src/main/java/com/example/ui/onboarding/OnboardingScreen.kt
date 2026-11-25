@@ -693,7 +693,7 @@ private fun ServiceActivationStep(
                         text = if (isAccessibilityEnabled) {
                             "Accessibility Service is VERIFIED ENABLED. Screen reading & UI automation are ready."
                         } else {
-                            "Optional: Enable NAYRO in Android Accessibility Settings for cross-app UI reading & clicking."
+                            "Required for full cross-app control: enable NAYRO in Android Accessibility Settings so Babu can read screens, click, type, scroll, and verify supported app actions. Without it, some actions will fall back to opening apps or drafting content for manual completion."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
