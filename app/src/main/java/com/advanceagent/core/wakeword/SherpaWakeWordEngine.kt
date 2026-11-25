@@ -79,7 +79,7 @@ class SherpaWakeWordEngine(
         val appContext = context
         if (appContext == null) {
             lastErrorMessage = "Android Context is unavailable; native Sherpa-ONNX initialization is not possible in a headless JVM test."
-            Log.e(TAG, lastErrorMessage!!)
+            // Do not call android.util.Log here: headless JVM tests intentionally have no Android runtime.
             return false
         }
         if (!areAssetsAvailable()) {
