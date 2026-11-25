@@ -20,6 +20,9 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    ndk {
+      abiFilters += setOf("arm64-v8a", "armeabi-v7a", "x86_64")
+    }
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
@@ -64,6 +67,10 @@ android {
     buildConfig = true
   }
   testOptions { unitTests { isIncludeAndroidResources = true } }
+  androidResources {
+    // Sherpa-ONNX reads model files directly from Android AssetManager.
+    noCompress += "onnx"
+  }
   dependenciesInfo {
     includeInApk = false
     includeInBundle = true
@@ -81,8 +88,10 @@ secrets {
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
 // Some unused dependencies are commented out below instead of being removed.
-// This makes it easy to add them back in the future if needed.
+// This makes it easy to add them back in in the future if needed.
 dependencies {
+  // Official Sherpa-ONNX Android runtime: Kotlin API + JNI/native ONNX Runtime libraries.
+  implementation("com.k2fsa.sherpa:sherpa-onnx:2.0.3@aar")
   implementation(platform(libs.androidx.compose.bom))
   implementation(platform(libs.firebase.bom))
   implementation(libs.accompanist.permissions)
