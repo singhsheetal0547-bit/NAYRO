@@ -1,6 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
-import java.util.zip.ZipFile
-import java.util.zip.ZipInputStream
+import org.gradle.api.tasks.Exec
 
 plugins {
   alias(libs.plugins.android.application)
@@ -76,67 +75,10 @@ secrets {
 }
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
-val sherpaAar = layout.projectDirectory.file("libs/sherpa-onnx-2.0.3.aar").asFile
-val sherpaKwsDir = layout.projectDirectory.dir("src/main/assets/kws-model").asFile
-val sherpaAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
-
-tasks.register("verifySherpaRuntimeAssets") {
-  inputs.file(sherpaAar)
-  inputs.dir(sherpaKwsDir)
-  doLast {
-    if (!sherpaAar.isFile || sherpaAar.length() == 0L) {
-      throw GradleException("Official Sherpa-ONNX v2.0.3 AAR is missing. Run: bash scripts/prepare-sherpa-onnx-android.sh")
-    }
-    ZipFile(sherpaAar).use { aar ->
-      val entries = aar.entries().asSequence().associateBy { it.name }
-      val classesJar = entries["classes.jar"]
-        ?: throw GradleException("Invalid Sherpa-ONNX AAR: classes.jar is missing.")
-      val requiredClasses = setOf(
-        "com/k2fsa/sherpa/onnx/KeywordSpotter.class",
-        "com/k2fsa/sherpa/onnx/KeywordSpotterConfig.class",
-        "com/k2fsa/sherpa/onnx/OnlineStream.class",
-        "com/k2fsa/sherpa/onnx/FeatureConfig.class",
-        "com/k2fsa/sherpa/onnx/KeywordSpotterResult.class",
-        "com/k2fsa/sherpa/onnx/OnlineModelConfig.class",
-        "com/k2fsa/sherpa/onnx/OnlineTransducerModelConfig.class"
-      )
-      val actualClasses = mutableSetOf<String>()
-      ZipInputStream(aar.getInputStream(classesJar)).use { nested ->
-        while (true) {
-          val entry = nested.nextEntry ?: break
-          actualClasses += entry.name
-        }
-      }
-      val missingClasses = requiredClasses - actualClasses
-      if (missingClasses.isNotEmpty()) {
-        throw GradleException("Sherpa-ONNX AAR is missing official Kotlin API classes: ${missingClasses.joinToString()}")
-      }
-      for (abi in sherpaAbis) {
-        for (library in listOf("libsherpa-onnx-jni.so", "libonnxruntime.so")) {
-          val path = "jni/${abi}/${library}"
-          val entry = entries[path]
-          if (entry == null || entry.size <= 0L) {
-            throw GradleException("Sherpa-ONNX AAR is missing required native runtime library: ${path}")
-          }
-        }
-      }
-    }
-
-    val requiredModels = listOf(
-      "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-      "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
-      "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-      "tokens.txt",
-      "keywords.txt"
-    )
-    requiredModels.forEach { modelName ->
-      val modelFile = File(sherpaKwsDir, modelName)
-      if (!modelFile.isFile || modelFile.length() <= 0L) {
-        throw GradleException("Missing or empty Sherpa-ONNX KWS model asset: ${modelFile.path}")
-      }
-    }
-    logger.lifecycle("Verified official Sherpa-ONNX v2.0.3 Kotlin AAR, JNI + ONNX Runtime for ${sherpaAbis.size} ABIs, and KWS model assets.")
-  }
+tasks.register<Exec>("verifySherpaRuntimeAssets") {
+  // Exec is a built-in, configuration-cache-compatible task. The script performs the strict
+  // AAR/API/ABI/model checks without capturing Gradle script objects in a doLast closure.
+  commandLine("bash", "../scripts/verify-sherpa-onnx-runtime.sh")
 }
 tasks.named("preBuild") { dependsOn("verifySherpaRuntimeAssets") }
 
