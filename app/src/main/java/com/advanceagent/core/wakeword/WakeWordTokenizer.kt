@@ -38,8 +38,9 @@ class WakeWordTokenizer {
             .filter { it.isNotEmpty() }
             .mapNotNull { phrase ->
                 val tokens = tokenizePhrase(phrase)
+                val safeLabel = phrase.replace(Regex("\\s+"), "_")
                 if (tokens.isEmpty()) null
-                else "${tokens.joinToString(" ")} :$boostingScore #$triggerThreshold @$phrase"
+                else "${tokens.joinToString(" ")} :$boostingScore #$triggerThreshold @$safeLabel"
             }
             .joinToString("\n")
     }

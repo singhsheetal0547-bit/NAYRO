@@ -210,7 +210,7 @@ class WakeWordForegroundService : Service() {
         ) ?: false
 
         if (!initialized) {
-            Log.w(TAG, "Sherpa-ONNX KWS running in manual trigger standby mode.")
+            Log.w(TAG, "Sherpa-ONNX KWS running in manual trigger standby mode: ${kwsEngine?.lastInitError}")
         }
 
         startContinuousMicrophoneLoop()

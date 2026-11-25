@@ -1,4 +1,5 @@
 import com.google.gms.googleservices.GoogleServicesPlugin.MissingGoogleServicesStrategy
+import java.util.zip.ZipFile
 
 plugins {
   alias(libs.plugins.android.application)
@@ -20,6 +21,10 @@ android {
     versionName = "1.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+    ndk {
+      abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+    }
   }
 
   // Do not remove or modify these signingConfigs. They are necessary for building, installing,
@@ -63,6 +68,20 @@ android {
     compose = true
     buildConfig = true
   }
+  androidResources {
+    noCompress += listOf("onnx", "tflite", "txt")
+  }
+  packaging {
+    jniLibs {
+      useLegacyPackaging = true
+      pickFirsts += listOf(
+        "**/libonnxruntime.so",
+        "**/libsherpa-onnx-jni.so",
+        "**/libsherpa-onnx-c-api.so",
+        "**/libsherpa-onnx-cxx-api.so"
+      )
+    }
+  }
   testOptions { unitTests { isIncludeAndroidResources = true } }
   dependenciesInfo {
     includeInApk = false
@@ -80,9 +99,61 @@ secrets {
 
 googleServices { missingGoogleServicesStrategy = MissingGoogleServicesStrategy.WARN }
 
+tasks.register("verifySherpaRuntimeAssets") {
+  val libsDir = layout.projectDirectory.dir("libs").asFile
+  val kwsDir = layout.projectDirectory.dir("src/main/assets/kws-model").asFile
+  doLast {
+    val aarFiles = libsDir.listFiles { f -> f.isFile && f.name.startsWith("sherpa-onnx") && f.name.endsWith(".aar") }
+    if (aarFiles.isNullOrEmpty()) {
+      throw GradleException("Missing official Sherpa-ONNX Android AAR in app/libs/.")
+    }
+    val aarFile = aarFiles.first()
+    val requiredAbis = listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")
+    val requiredNativeLibs = listOf(
+      "libsherpa-onnx-jni.so",
+      "libonnxruntime.so",
+      "libsherpa-onnx-c-api.so",
+      "libsherpa-onnx-cxx-api.so"
+    )
+    ZipFile(aarFile).use { zip ->
+      val entryNames = zip.entries().asSequence().map { it.name }.toSet()
+      if (!entryNames.contains("classes.jar")) {
+        throw GradleException("Invalid Sherpa-ONNX AAR (${aarFile.name}): missing classes.jar")
+      }
+      for (abi in requiredAbis) {
+        for (soName in requiredNativeLibs) {
+          val expectedEntry = "jni/$abi/$soName"
+          val entry = zip.getEntry(expectedEntry)
+          if (entry == null || entry.size <= 0L) {
+            throw GradleException("Missing or empty native library '$expectedEntry' inside ${aarFile.name}")
+          }
+        }
+      }
+    }
+    val requiredModels = listOf(
+      "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+      "decoder-epoch-12-avg-2-chunk-16-left-64.onnx",
+      "joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+      "tokens.txt",
+      "keywords.txt"
+    )
+    requiredModels.forEach { modelName ->
+      val f = File(kwsDir, modelName)
+      if (!f.exists() || f.length() <= 0L) {
+        throw GradleException("Missing or empty required Sherpa-ONNX KWS asset: ${f.path}")
+      }
+    }
+  }
+}
+
+tasks.named("preBuild") {
+  dependsOn("verifySherpaRuntimeAssets")
+}
+
 // Some unused dependencies are commented out below instead of being removed.
 // This makes it easy to add them back in the future if needed.
 dependencies {
+  implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.jar", "*.aar"))))
   implementation(platform(libs.androidx.compose.bom))
   implementation(platform(libs.firebase.bom))
   implementation(libs.accompanist.permissions)

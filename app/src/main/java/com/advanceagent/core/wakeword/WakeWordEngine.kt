@@ -110,9 +110,12 @@ class WakeWordEngine(
         return detected
     }
 
+    val jniBridge: SherpaOnnxJniBridge
+        get() = sherpaEngine.jniBridge
+
     /**
-     * Starts the foreground microphone service ([WakeWordForegroundService]) for continuous
-     * offline wake-word detection.
+     * Starts the foreground microphone service ([WakeWordForegroundService] / [com.advanceagent.core.service.VoiceInteractionService])
+     * for continuous offline wake-word detection.
      */
     fun startForegroundMicrophoneService(): Boolean {
         val ctx = context ?: run {
@@ -144,6 +147,7 @@ class WakeWordEngine(
                     action = WakeWordForegroundService.ACTION_COMPLETE_SHUTDOWN
                 }
                 ctx.stopService(stopIntent)
+                com.advanceagent.core.service.VoiceInteractionService.stopForegroundListening(ctx)
             } catch (_: Exception) {
             }
         }

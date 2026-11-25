@@ -197,6 +197,12 @@
             android:foregroundServiceType="microphone" />
 
         <service
+            android:name="com.advanceagent.core.service.VoiceInteractionService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
+        <service
             android:name="com.advanceagent.core.ui.orb.FloatingOrbService"
             android:enabled="true"
             android:exported="false" />

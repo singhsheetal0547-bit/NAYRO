@@ -1,0 +1,87 @@
+name: NAYRO Android CI & Sherpa-ONNX Verification
+
+on:
+  push:
+    branches: [main, 'fix/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nayro-android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Verify Sherpa-ONNX Assets & Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Set up Android SDK tools without interactive license prompt
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
+          packages: ''
+
+      - name: Install exact Android SDK required by this repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +o pipefail
+          yes | sdkmanager --licenses >/dev/null
+          set -o pipefail
+          sdkmanager --install "platforms;android-36.1" "build-tools;36.0.0" "platform-tools"
+
+      - name: Validate Gradle wrapper
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --version
+
+      - name: Verify Sherpa-ONNX runtime assets and native .so libraries before APK build
+        run: ./gradlew verifySherpaRuntimeAssets
+
+      - name: Generate and verify CI debug keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
+          if [ ! -f "$KEYSTORE" ]; then
+            keytool -genkeypair -v -keystore "$KEYSTORE" -storetype JKS -storepass android -keypass android -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          test -s "$KEYSTORE"
+
+      - name: Run unit tests before APK packaging
+        run: ./gradlew --no-daemon --stacktrace :app:testDebugUnitTest
+
+      - name: Build final NAYRO debug APK
+        run: ./gradlew --no-daemon --stacktrace --warning-mode all :app:assembleDebug
+
+      - name: Inspect built APK for Sherpa-ONNX native .so libraries and KWS model assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+          APK_LIST="$(unzip -l "$APK")"
+          echo "$APK_LIST" | grep -q "lib/arm64-v8a/libsherpa-onnx-jni.so"
+          echo "$APK_LIST" | grep -q "lib/arm64-v8a/libonnxruntime.so"
+          echo "$APK_LIST" | grep -q "assets/kws-model/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+          echo "$APK_LIST" | grep -q "assets/kws-model/decoder-epoch-12-avg-2-chunk-16-left-64.onnx"
+          echo "$APK_LIST" | grep -q "assets/kws-model/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+          echo "$APK_LIST" | grep -q "assets/kws-model/tokens.txt"
+          echo "$APK_LIST" | grep -q "assets/kws-model/keywords.txt"

@@ -399,7 +399,7 @@ class NayroVoiceInteractionService : VoiceInteractionService() {
         val dspNote = if (hasPrivilegedDsp) {
             "Privileged hotword permissions present; VoiceInteractionService ready."
         } else {
-            "VoiceInteractionService active for system/lock-screen assist. Hardware DSP hotword requires privileged system permissions; using local MFCC+DTW fallback when Background Listening is enabled."
+            "VoiceInteractionService active for system/lock-screen assist. Hardware DSP hotword requires privileged system permissions; using local MFCC+DTW fallback and Sherpa-ONNX native KWS when Background Listening is enabled."
         }
         ScreenOffWakeCapabilityManager.setServiceActive(
             active = true,

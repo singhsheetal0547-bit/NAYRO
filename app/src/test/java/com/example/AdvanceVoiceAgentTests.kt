@@ -52,32 +52,69 @@ class AdvanceVoiceAgentTests {
 
         val lines = spec.lines().filter { it.isNotBlank() }
         assertEquals(5, lines.size)
-        assertTrue(lines[0].contains("@HI BABU"))
+        assertTrue(lines[0].contains("@HI_BABU"))
         assertTrue(lines[0].contains(":1.8 #0.18"))
-        assertTrue(lines[1].contains("@HEY BABU"))
-        assertTrue(lines[2].contains("@HI NAYRO"))
-        assertTrue(lines[3].contains("@HEY ARJUN"))
-        assertTrue(lines[4].contains("@WAKE UP BOSS"))
+        assertTrue(lines[1].contains("@HEY_BABU"))
+        assertTrue(lines[2].contains("@HI_NAYRO"))
+        assertTrue(lines[3].contains("@HEY_ARJUN"))
+        assertTrue(lines[4].contains("@WAKE_UP_BOSS"))
     }
 
     @Test
-    fun testSherpaWakeWordEngineInitializesReloadsAndHonorsCooldownConfig() {
+    fun testSherpaWakeWordEngineConfigCooldownAndHonestHeadlessJvmBehavior() {
+        var fakeNow = 10_000L
         val engine = SherpaWakeWordEngine(
             context = null,
             cooldownMs = 1800L
         )
-        assertTrue(
+        engine.currentTimeProvider = { fakeNow }
+
+        val config = engine.buildKeywordSpotterConfig(
+            boostingScore = 2.0f,
+            triggerThreshold = 0.25f
+        )
+        assertEquals(16000, config.featConfig.sampleRate)
+        assertEquals(80, config.featConfig.featureDim)
+        assertEquals(
+            "kws-model/${SherpaWakeWordEngine.ENCODER_ASSET_NAME}",
+            config.modelConfig.transducer.encoder
+        )
+        assertEquals(
+            "kws-model/${SherpaWakeWordEngine.DECODER_ASSET_NAME}",
+            config.modelConfig.transducer.decoder
+        )
+        assertEquals(
+            "kws-model/${SherpaWakeWordEngine.JOINER_ASSET_NAME}",
+            config.modelConfig.transducer.joiner
+        )
+        assertEquals(
+            "kws-model/${SherpaWakeWordEngine.TOKENS_ASSET_NAME}",
+            config.modelConfig.tokens
+        )
+        assertEquals(
+            "kws-model/${SherpaWakeWordEngine.KEYWORDS_ASSET_NAME}",
+            config.keywordsFile
+        )
+
+        // Cooldown gate enforces cooldownMs strictly
+        assertTrue(engine.shouldAllowTrigger())
+        fakeNow += 500L
+        assertFalse(engine.shouldAllowTrigger())
+        fakeNow += 1500L
+        assertTrue(engine.shouldAllowTrigger())
+
+        // Without an Android Context / AssetManager, native Sherpa-ONNX JNI honestly reports false
+        assertFalse(
             engine.initialize(
                 activeWakeWords = listOf("HI BABU", "HEY BABU", "HI NAYRO"),
                 boostingScore = 2.0f,
                 triggerThreshold = 0.25f
             )
         )
-        engine.reloadWakeWords(
-            activeWakeWords = listOf("HI BABU", "WAKE UP BOSS"),
-            boostingScore = 2.2f,
-            triggerThreshold = 0.22f
-        )
+        assertFalse(engine.isNativeRuntimeActive)
+        assertNotNull(engine.lastInitError)
+        assertTrue(engine.lastInitError!!.isNotBlank())
+
         val silentFrame = ShortArray(320) { 0 }
         assertNull(engine.processPcm16(silentFrame, silentFrame.size))
         engine.release()
@@ -308,15 +345,16 @@ class AdvanceVoiceAgentTests {
     @Test
     fun testWakeWordEngineLifecycleAndBpeTokenization() {
         val engine = com.advanceagent.core.wakeword.WakeWordEngine(context = null)
-        assertTrue(engine.initialize(listOf("HI BABU", "HEY BABU", "HI NAYRO")))
+        // Without Android Context/AssetManager, native Sherpa-ONNX JNI cannot load -> honest ERROR state
+        assertFalse(engine.initialize(listOf("HI BABU", "HEY BABU", "HI NAYRO")))
         assertEquals(
-            com.advanceagent.core.wakeword.WakeWordEngine.LifecycleState.INITIALIZED,
+            com.advanceagent.core.wakeword.WakeWordEngine.LifecycleState.ERROR,
             engine.state.value
         )
 
         val spec = engine.tokenizeWakePhrases(listOf("HI BABU", "HI NAYRO"))
-        assertTrue(spec.contains("@HI BABU"))
-        assertTrue(spec.contains("@HI NAYRO"))
+        assertTrue(spec.contains("@HI_BABU"))
+        assertTrue(spec.contains("@HI_NAYRO"))
 
         assertTrue(engine.startForegroundMicrophoneService())
         assertEquals(
@@ -407,43 +445,67 @@ class AdvanceVoiceAgentTests {
     }
 
     @Test
-    fun testRealAcousticSpeechUtteranceTriggersWakeWordInBackgroundAndRejectsNoise() {
-        val engine = SherpaWakeWordEngine(context = null, cooldownMs = 1500L)
-        assertTrue(
-            engine.initialize(
-                activeWakeWords = listOf("HI BABU", "HEY BABU", "HI NAYRO"),
-                boostingScore = 2.0f,
-                triggerThreshold = 0.25f
-            )
-        )
-
-        // 1. Pure silence must not trigger
-        val silence = ShortArray(3200) { 0 }
-        assertNull(engine.processPcm16(silence, silence.size))
-
-        // 2. Two-syllable spoken wake utterance ("Hi Babu" ~0.6s at 16kHz = 9600 samples) + 0.15s trailing silence
-        val speechSamples = ShortArray(9600) { i ->
-            val t = i / 16000.0
-            // Two syllable amplitude envelope peaks ("Hi" + "Babu") with 210 Hz voice fundamental + 630 Hz harmonic
-            val envelope = if (i < 4200) {
-                kotlin.math.sin(Math.PI * i / 4200.0)
-            } else if (i < 5000) {
-                0.25
-            } else {
-                kotlin.math.sin(Math.PI * (i - 5000) / 4600.0)
-            }
-            val wave = 0.65 * kotlin.math.sin(2.0 * Math.PI * 210.0 * t) +
-                0.35 * kotlin.math.sin(2.0 * Math.PI * 630.0 * t)
-            (envelope * wave * 9500.0).toInt().coerceIn(-32767, 32767).toShort()
+    fun testOfficialSherpaOnnxAarAndPretrainedModelAssetsAreBundled() {
+        val projectAppDir = java.io.File(".").absoluteFile.let { cwd ->
+            if (java.io.File(cwd, "libs").exists()) cwd else java.io.File(cwd, "app")
         }
-        assertNull(engine.processPcm16(speechSamples, speechSamples.size))
 
-        // Trailing silence hangover (~150ms = 2400 samples) completes utterance evaluation
-        val hangoverSilence = ShortArray(2400) { 0 }
-        val detected = engine.processPcm16(hangoverSilence, hangoverSilence.size)
-        assertEquals("HI BABU", detected)
+        // 1. Verify official Sherpa-ONNX Android AAR and native .so libraries exist
+        val aarFile = java.io.File(projectAppDir, "libs/sherpa-onnx-2.0.3.aar")
+        assertTrue("Expected official Sherpa-ONNX AAR at ${aarFile.path}", aarFile.exists() && aarFile.length() > 1_000_000L)
 
-        engine.release()
+        java.util.zip.ZipFile(aarFile).use { zip ->
+            val entries = zip.entries().asSequence().map { it.name }.toSet()
+            assertTrue(entries.contains("jni/arm64-v8a/libsherpa-onnx-jni.so"))
+            assertTrue(entries.contains("jni/arm64-v8a/libonnxruntime.so"))
+            assertTrue(entries.contains("jni/armeabi-v7a/libsherpa-onnx-jni.so"))
+            assertTrue(entries.contains("jni/x86_64/libsherpa-onnx-jni.so"))
+            assertTrue(entries.contains("classes.jar"))
+        }
+
+        // 2. Verify fake compatibility simulation is completely removed
+        val fakeCompat = java.io.File(projectAppDir, "src/main/java/com/k2fsa/sherpa/onnx/SherpaOnnxKwsCompat.kt")
+        assertFalse("Fake SherpaOnnxKwsCompat.kt must remain removed", fakeCompat.exists())
+
+        // 3. Verify all 5 pretrained KWS model assets are present and non-empty
+        val kwsDir = java.io.File(projectAppDir, "src/main/assets/kws-model")
+        val requiredAssets = listOf(
+            SherpaWakeWordEngine.ENCODER_ASSET_NAME,
+            SherpaWakeWordEngine.DECODER_ASSET_NAME,
+            SherpaWakeWordEngine.JOINER_ASSET_NAME,
+            SherpaWakeWordEngine.TOKENS_ASSET_NAME,
+            SherpaWakeWordEngine.KEYWORDS_ASSET_NAME
+        )
+        requiredAssets.forEach { assetName ->
+            val f = java.io.File(kwsDir, assetName)
+            assertTrue("Missing or empty KWS asset: ${f.path}", f.exists() && f.length() > 0L)
+        }
+
+        // 4. Verify real GigaSpeech tokens.txt tokenizes NAYRO wake phrases into valid in-vocab BPE tokens
+        val realVocab = java.io.File(kwsDir, SherpaWakeWordEngine.TOKENS_ASSET_NAME)
+            .readLines()
+            .mapNotNull { it.trim().split(" ").firstOrNull()?.takeIf { tok -> tok.isNotEmpty() } }
+            .toSet()
+        assertTrue("Real tokens.txt should contain GigaSpeech BPE vocabulary", realVocab.size >= 400)
+
+        val tokenizer = WakeWordTokenizer(realVocab)
+        val spec = tokenizer.buildKeywordsSpec(
+            phrases = listOf("HI BABU", "HEY BABU", "HI NAYRO"),
+            boostingScore = 2.0f,
+            triggerThreshold = 0.25f
+        )
+        val lines = spec.lines().filter { it.isNotBlank() }
+        assertEquals(3, lines.size)
+        lines.forEach { line ->
+            val parts = line.split(" ")
+            val tokenParts = parts.takeWhile { !it.startsWith(":") && !it.startsWith("#") && !it.startsWith("@") }
+            assertTrue("Expected BPE tokens in line: $line", tokenParts.isNotEmpty())
+            tokenParts.forEach { tok ->
+                assertTrue("Token '$tok' must exist in real tokens.txt", realVocab.contains(tok))
+            }
+            val label = parts.last()
+            assertTrue("Expected underscore-safe @label at end of line: $line", label.startsWith("@") && !label.contains(" "))
+        }
     }
 
     @Test
@@ -469,5 +531,69 @@ class AdvanceVoiceAgentTests {
         val fallbackSetup = ws.buildInitialSetupMessage(compatibilityMode = true)
         assertEquals("models/gemini-2.0-flash-exp", fallbackSetup.setup.model)
         assertEquals(1, fallbackSetup.setup.tools?.size)
+    }
+
+    @Test
+    fun testVoiceInteractionServiceForegroundLifecycleAndJniBridgeIntegration() {
+        val engine = com.advanceagent.core.wakeword.WakeWordEngine(context = null)
+        assertEquals(
+            com.advanceagent.core.wakeword.OfficialSherpaOnnxJniBridge,
+            engine.jniBridge
+        )
+
+        // 1. Foreground active when master power is ON, RECORD_AUDIO is granted, and JNI is ready
+        assertEquals(
+            com.advanceagent.core.service.VoiceInteractionService.LifecycleState.FOREGROUND_ACTIVE,
+            com.advanceagent.core.service.VoiceInteractionService.computeNextLifecycleState(
+                action = com.advanceagent.core.service.VoiceInteractionService.ACTION_START_FOREGROUND_MIC,
+                hasRecordAudioPermission = true,
+                isMasterPowerOn = true,
+                isNativeJniReady = true
+            )
+        )
+
+        // 2. Paused when ACTION_PAUSE_MIC is received
+        assertEquals(
+            com.advanceagent.core.service.VoiceInteractionService.LifecycleState.PAUSED,
+            com.advanceagent.core.service.VoiceInteractionService.computeNextLifecycleState(
+                action = com.advanceagent.core.service.VoiceInteractionService.ACTION_PAUSE_MIC,
+                hasRecordAudioPermission = true,
+                isMasterPowerOn = true,
+                isNativeJniReady = true
+            )
+        )
+
+        // 3. Resumed back to FOREGROUND_ACTIVE on ACTION_RESUME_MIC
+        assertEquals(
+            com.advanceagent.core.service.VoiceInteractionService.LifecycleState.FOREGROUND_ACTIVE,
+            com.advanceagent.core.service.VoiceInteractionService.computeNextLifecycleState(
+                action = com.advanceagent.core.service.VoiceInteractionService.ACTION_RESUME_MIC,
+                hasRecordAudioPermission = true,
+                isMasterPowerOn = true,
+                isNativeJniReady = true
+            )
+        )
+
+        // 4. Error when RECORD_AUDIO is missing
+        assertEquals(
+            com.advanceagent.core.service.VoiceInteractionService.LifecycleState.ERROR,
+            com.advanceagent.core.service.VoiceInteractionService.computeNextLifecycleState(
+                action = com.advanceagent.core.service.VoiceInteractionService.ACTION_START_FOREGROUND_MIC,
+                hasRecordAudioPermission = false,
+                isMasterPowerOn = true,
+                isNativeJniReady = true
+            )
+        )
+
+        // 5. Stopped when ACTION_STOP_SERVICE or master power OFF
+        assertEquals(
+            com.advanceagent.core.service.VoiceInteractionService.LifecycleState.STOPPED,
+            com.advanceagent.core.service.VoiceInteractionService.computeNextLifecycleState(
+                action = com.advanceagent.core.service.VoiceInteractionService.ACTION_STOP_SERVICE,
+                hasRecordAudioPermission = true,
+                isMasterPowerOn = true,
+                isNativeJniReady = true
+            )
+        )
     }
 }

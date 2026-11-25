@@ -51,5 +51,6 @@ object AgentPowerManager {
         } catch (_: Exception) {
         }
         context.stopService(Intent(context, WakeWordForegroundService::class.java))
+        VoiceInteractionService.stopForegroundListening(context)
     }
 }
