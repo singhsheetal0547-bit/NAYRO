@@ -182,7 +182,10 @@ class SherpaWakeWordEngine(
                     .uppercase()
                 val matchedPhrase = phraseByAlias[alias]
                     ?: activePhrases.firstOrNull { it.uppercase() == normalized }
-                    ?: activePhrases.firstOrNull()
+                    ?: run {
+                        Log.w(TAG, "Sherpa returned an unknown keyword label; ignoring it: $rawKeyword")
+                        return null
+                    }
 
                 lastTriggerTimestampMs = now
                 lastDetectionLatencyMs = ((System.nanoTime() - startedAt) / 1_000_000L).coerceAtLeast(1L)
