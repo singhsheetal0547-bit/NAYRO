@@ -182,38 +182,34 @@ class DualActivationAndProvidersRegressionTests {
     }
 
     @Test
-    fun testVoiceProviderRouterSelectsDeepgramWithKeyAndFallsBackToAndroidWhenDeleted() = runBlocking {
+    fun testVoiceProviderRouterKeepsAndroidSystemSttEvenIfLegacyDeepgramKeyExists() = runBlocking {
         val storage = EncryptedStorageManager(context = null)
         val router = VoiceProviderRouter(context = null, encryptedStorageManager = storage)
 
-        // Default is Android SpeechRecognizer
         assertEquals(SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER, router.status.value.effectiveSttEngine)
         assertTrue(router.status.value.localWakeWordCloudIndependent)
 
-        // Selecting Deepgram without a key must automatically fall back to Android STT
-        val noKeyStatus = router.selectSttEngine(SpeechRecognitionEngineType.DEEPGRAM_CLOUD)
-        assertEquals(SpeechRecognitionEngineType.DEEPGRAM_CLOUD, noKeyStatus.selectedSttEngine)
-        assertEquals(SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER, noKeyStatus.effectiveSttEngine)
-        assertNotNull(noKeyStatus.fallbackActiveReason)
+        // Legacy Deepgram selections are migrated to Android system recognition.
+        val selectedStatus = router.selectSttEngine(SpeechRecognitionEngineType.DEEPGRAM_CLOUD)
+        assertEquals(SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER, selectedStatus.selectedSttEngine)
+        assertEquals(SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER, selectedStatus.effectiveSttEngine)
+        assertNull(selectedStatus.fallbackActiveReason)
         assertTrue(router.resolveActiveSttProvider() === router.androidSttProvider)
 
-        // Test connection without key fails honestly
+        // The dormant legacy key management path must never route microphone audio to Deepgram.
         val (noKeyOk, noKeyMsg) = router.testDeepgramConnection()
         assertFalse(noKeyOk)
         assertTrue(noKeyMsg.contains("No Deepgram API key", ignoreCase = true))
 
-        // Add Deepgram API key -> routes to Deepgram Cloud STT
         val savedStatus = router.saveDeepgramApiKey("dg_test_key_12345")
         assertTrue(savedStatus.hasDeepgramKey)
-        assertEquals(SpeechRecognitionEngineType.DEEPGRAM_CLOUD, savedStatus.effectiveSttEngine)
-        assertNull(savedStatus.fallbackActiveReason)
-        assertTrue(router.resolveActiveSttProvider() === router.deepgramSttProvider)
+        assertEquals(SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER, savedStatus.selectedSttEngine)
+        assertEquals(SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER, savedStatus.effectiveSttEngine)
+        assertTrue(router.resolveActiveSttProvider() === router.androidSttProvider)
 
-        // Edit Deepgram API key
         router.saveDeepgramApiKey("dg_updated_key_99999")
         assertEquals("dg_updated_key_99999", storage.getApiKey(DeepgramSpeechRecognitionProvider.PROVIDER_ID))
 
-        // Delete Deepgram API key -> immediately falls back to Android SpeechRecognizer
         val deletedStatus = router.deleteDeepgramApiKey()
         assertFalse(deletedStatus.hasDeepgramKey)
         assertEquals(SpeechRecognitionEngineType.ANDROID_SPEECH_RECOGNIZER, deletedStatus.effectiveSttEngine)
