@@ -121,8 +121,12 @@ class WakeWordEngine(
      */
     fun startForegroundMicrophoneService(): Boolean {
         val ctx = context ?: run {
-            _state.value = LifecycleState.FOREGROUND_LISTENING
-            return true
+            _state.value = LifecycleState.ERROR
+            return false
+        }
+        if (sherpaEngine?.isInitialized != true) {
+            _state.value = LifecycleState.ERROR
+            return false
         }
         return try {
             preferences.isMasterPowerOn = true
