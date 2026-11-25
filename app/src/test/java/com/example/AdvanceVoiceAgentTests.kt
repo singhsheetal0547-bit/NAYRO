@@ -61,22 +61,26 @@ class AdvanceVoiceAgentTests {
     }
 
     @Test
-    fun testSherpaWakeWordEngineInitializesReloadsAndHonorsCooldownConfig() {
+    fun testSherpaWakeWordEngineFailsClosedWithoutAndroidContext() {
         val engine = SherpaWakeWordEngine(
             context = null,
             cooldownMs = 1800L
         )
-        assertTrue(
+        assertFalse(
             engine.initialize(
                 activeWakeWords = listOf("HI BABU", "HEY BABU", "HI NAYRO"),
                 boostingScore = 2.0f,
                 triggerThreshold = 0.25f
             )
         )
-        engine.reloadWakeWords(
-            activeWakeWords = listOf("HI BABU", "WAKE UP BOSS"),
-            boostingScore = 2.2f,
-            triggerThreshold = 0.22f
+        assertFalse(engine.isInitialized)
+        assertTrue(engine.lastErrorMessage.orEmpty().contains("Android Context"))
+        assertFalse(
+            engine.reloadWakeWords(
+                activeWakeWords = listOf("HI BABU", "WAKE UP BOSS"),
+                boostingScore = 2.2f,
+                triggerThreshold = 0.22f
+            )
         )
         val silentFrame = ShortArray(320) { 0 }
         assertNull(engine.processPcm16(silentFrame, silentFrame.size))
@@ -306,21 +310,23 @@ class AdvanceVoiceAgentTests {
     }
 
     @Test
-    fun testWakeWordEngineLifecycleAndBpeTokenization() {
+    fun testWakeWordEngineRequiresAndroidNativeRuntimeAndKeepsBpeTokenizationTestable() {
         val engine = com.advanceagent.core.wakeword.WakeWordEngine(context = null)
-        assertTrue(engine.initialize(listOf("HI BABU", "HEY BABU", "HI NAYRO")))
+        assertFalse(engine.initialize(listOf("HI BABU", "HEY BABU", "HI NAYRO")))
         assertEquals(
-            com.advanceagent.core.wakeword.WakeWordEngine.LifecycleState.INITIALIZED,
+            com.advanceagent.core.wakeword.WakeWordEngine.LifecycleState.ERROR,
             engine.state.value
         )
 
+        // The fallback vocabulary is only for deterministic tokenization tests; it does not
+        // simulate native wake detection or a running microphone service.
         val spec = engine.tokenizeWakePhrases(listOf("HI BABU", "HI NAYRO"))
         assertTrue(spec.contains("@HI BABU"))
         assertTrue(spec.contains("@HI NAYRO"))
 
-        assertTrue(engine.startForegroundMicrophoneService())
+        assertFalse(engine.startForegroundMicrophoneService())
         assertEquals(
-            com.advanceagent.core.wakeword.WakeWordEngine.LifecycleState.FOREGROUND_LISTENING,
+            com.advanceagent.core.wakeword.WakeWordEngine.LifecycleState.ERROR,
             engine.state.value
         )
 
