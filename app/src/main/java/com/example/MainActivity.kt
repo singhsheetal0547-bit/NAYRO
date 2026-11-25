@@ -309,16 +309,18 @@ class MainActivity : ComponentActivity() {
                         backgroundVoiceController.refreshState()
                     },
                     onStartForegroundService = {
+                        // This onboarding action explicitly opts the user into background wake listening.
+                        // Persist that choice before starting the microphone foreground service so the
+                        // background toggle, service state, and wake engine cannot disagree.
                         val micPerm = android.Manifest.permission.RECORD_AUDIO
-                        voiceAgentServiceWrapper.requestStartAgentService(
-                            context = this,
-                            autoCaptureSpeech = false,
-                            onRequestMicrophonePermission = {
-                                lastRequestedPermissionString = micPerm
-                                permissionManager.markRuntimePermissionRequested(micPerm)
-                                requestSinglePermissionLauncher.launch(micPerm)
-                            }
-                        )
+                        if (permissionManager.isMicrophoneGranted()) {
+                            backgroundVoiceController.enableBackgroundListening(this)
+                        } else {
+                            pendingEnableBackgroundAfterMicGrant = true
+                            lastRequestedPermissionString = micPerm
+                            permissionManager.markRuntimePermissionRequested(micPerm)
+                            requestSinglePermissionLauncher.launch(micPerm)
+                        }
                     },
                     onStopForegroundService = {
                         voiceAgentServiceWrapper.stopAgentService(this)
