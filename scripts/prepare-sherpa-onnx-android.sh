@@ -29,9 +29,9 @@ verify_aar() {
     "com/k2fsa/sherpa/onnx/KeywordSpotter.class" \
     "com/k2fsa/sherpa/onnx/KeywordSpotterConfig.class" \
     "com/k2fsa/sherpa/onnx/OnlineStream.class" \
-    "com/k2fsa/sherpa/onnx/FeatureConfig.class" \\
-    "com/k2fsa/sherpa/onnx/KeywordSpotterResult.class" \\
-    "com/k2fsa/sherpa/onnx/OnlineModelConfig.class" \\
+    "com/k2fsa/sherpa/onnx/FeatureConfig.class" \
+    "com/k2fsa/sherpa/onnx/KeywordSpotterResult.class" \
+    "com/k2fsa/sherpa/onnx/OnlineModelConfig.class" \
     "com/k2fsa/sherpa/onnx/OnlineTransducerModelConfig.class"; do
     jar tf "${nested_jar}" | grep -Fxq "${class_file}" || return 1
   done
