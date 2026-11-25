@@ -413,9 +413,9 @@ class AdvanceVoiceAgentTests {
     }
 
     @Test
-    fun testRealAcousticSpeechUtteranceTriggersWakeWordInBackgroundAndRejectsNoise() {
+    fun testSherpaWakeWordEngineNeverFabricatesDetectionFromSyntheticPcmWithoutAndroidRuntime() {
         val engine = SherpaWakeWordEngine(context = null, cooldownMs = 1500L)
-        assertTrue(
+        assertFalse(
             engine.initialize(
                 activeWakeWords = listOf("HI BABU", "HEY BABU", "HI NAYRO"),
                 boostingScore = 2.0f,
@@ -423,45 +423,32 @@ class AdvanceVoiceAgentTests {
             )
         )
 
-        // 1. Pure silence must not trigger
         val silence = ShortArray(3200) { 0 }
         assertNull(engine.processPcm16(silence, silence.size))
 
-        // 2. Two-syllable spoken wake utterance ("Hi Babu" ~0.6s at 16kHz = 9600 samples) + 0.15s trailing silence
-        val speechSamples = ShortArray(9600) { i ->
-            val t = i / 16000.0
-            // Two syllable amplitude envelope peaks ("Hi" + "Babu") with 210 Hz voice fundamental + 630 Hz harmonic
-            val envelope = if (i < 4200) {
-                kotlin.math.sin(Math.PI * i / 4200.0)
-            } else if (i < 5000) {
-                0.25
-            } else {
-                kotlin.math.sin(Math.PI * (i - 5000) / 4600.0)
-            }
-            val wave = 0.65 * kotlin.math.sin(2.0 * Math.PI * 210.0 * t) +
-                0.35 * kotlin.math.sin(2.0 * Math.PI * 630.0 * t)
-            (envelope * wave * 9500.0).toInt().coerceIn(-32767, 32767).toShort()
-        }
-        assertNull(engine.processPcm16(speechSamples, speechSamples.size))
-
-        // Trailing silence hangover (~150ms = 2400 samples) completes utterance evaluation
-        val hangoverSilence = ShortArray(2400) { 0 }
-        val detected = engine.processPcm16(hangoverSilence, hangoverSilence.size)
-        assertEquals("HI BABU", detected)
-
+        // A synthetic two-tone waveform is not a spoken keyword. Without Android Context and
+        // the native Sherpa runtime, the production recognizer must remain inactive.
+        val syntheticVoiceLikeWave = ShortArray(9600) { i ->
+            val timeSeconds = i / 16000.0
+            (0.55 * kotlin.math.sin(2.0 * Math.PI * 210.0 * timeSeconds) +
+                0.25 * kotlin.math.sin(2.0 * Math.PI * 630.0 * timeSeconds)) * 9000.0
+        }.toShortArray()
+        assertNull(engine.processPcm16(syntheticVoiceLikeWave, syntheticVoiceLikeWave.size))
+        assertFalse(engine.isInitialized)
+        assertTrue(engine.lastErrorMessage.orEmpty().contains("Android Context"))
         engine.release()
     }
 
     @Test
     fun testGeminiLiveWebSocketCompatibilitySetupAndDefaultModel() {
         val prefs = SecurePreferences()
-        assertEquals("models/gemini-2.0-flash-exp", SecurePreferences.DEFAULT_MODEL)
-        assertEquals("models/gemini-2.0-flash-exp", prefs.geminiModel)
+        assertEquals("models/gemini-3.8-live", SecurePreferences.DEFAULT_MODEL)
+        assertEquals("models/gemini-3.8-live", prefs.geminiModel)
         assertTrue(prefs.isMasterPowerOn)
 
         val ws = com.advanceagent.core.network.GeminiLiveWebSocket(
             apiKey = "test_key",
-            modelId = "models/gemini-2.5-flash-native-audio-preview-09-2025",
+            modelId = "models/gemini-3.8-live",
             voiceName = "Puck",
             userName = "Boss",
             onAudioReceived = {},
@@ -470,10 +457,10 @@ class AdvanceVoiceAgentTests {
             onStateChanged = {}
         )
         val primarySetup = ws.buildInitialSetupMessage(compatibilityMode = false)
-        assertEquals("models/gemini-2.5-flash-native-audio-preview-09-2025", primarySetup.setup.model)
+        assertEquals("models/gemini-3.8-live", primarySetup.setup.model)
 
         val fallbackSetup = ws.buildInitialSetupMessage(compatibilityMode = true)
-        assertEquals("models/gemini-2.0-flash-exp", fallbackSetup.setup.model)
+        assertEquals("models/gemini-3.8-live", fallbackSetup.setup.model)
         assertEquals(1, fallbackSetup.setup.tools?.size)
     }
 }
