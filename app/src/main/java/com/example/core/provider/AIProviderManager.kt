@@ -56,7 +56,7 @@ class AIProviderManager(
                 type = ProviderType.GEMINI,
                 name = "Google Gemini Developer API",
                 baseUrl = "https://generativelanguage.googleapis.com",
-                modelId = "gemini-2.5-flash",
+                modelId = "gemini-3.8-flash",
                 priority = 1,
                 isEnabled = true,
                 hasKeySaved = false
