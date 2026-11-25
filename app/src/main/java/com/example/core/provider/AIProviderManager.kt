@@ -157,7 +157,26 @@ class AIProviderManager(
     private fun restorePersistedProviderMetadata() {
         val storage = encryptedStorageManager ?: return
         val restored = _configuredProviders.value.map { cfg ->
-            val savedModel = storage.getPreference("provider_model_${cfg.id}", "").ifBlank { cfg.modelId }
+            val persistedModel = storage.getPreference("provider_model_${cfg.id}", "").trim()
+            val normalizedPersistedModel = persistedModel.removePrefix("models/")
+            val retiredGeminiModel = cfg.id == "gemini_default" &&
+                normalizedPersistedModel in setOf(
+                    "gemini-2.0-flash",
+                    "gemini-2.0-flash-001",
+                    "gemini-2.0-flash-lite",
+                    "gemini-2.0-flash-lite-001",
+                    "gemini-2.0-flash-exp",
+                    "gemini-2.5-flash",
+                    "gemini-2.5-pro"
+                )
+            val savedModel = if (persistedModel.isBlank() || retiredGeminiModel) {
+                cfg.modelId
+            } else {
+                persistedModel
+            }
+            if (retiredGeminiModel) {
+                storage.savePreference("provider_model_${cfg.id}", cfg.modelId)
+            }
             val savedUrl = storage.getPreference("provider_url_${cfg.id}", "").ifBlank { cfg.baseUrl }
             val savedPriority = storage.getPreference("provider_priority_${cfg.id}", "").toIntOrNull() ?: cfg.priority
             val savedEnabledStr = storage.getPreference("provider_enabled_${cfg.id}", "")
