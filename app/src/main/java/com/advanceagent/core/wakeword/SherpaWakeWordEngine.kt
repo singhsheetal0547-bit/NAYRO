@@ -16,7 +16,7 @@ import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
  * Initialization failures are surfaced; no wake word is fabricated by a fallback.
  */
 class SherpaWakeWordEngine(
-    private val context: Context,
+    private val context: Context?,
     private val modelDirInAssets: String = "kws-model",
     var cooldownMs: Long = 2200L
 ) {
@@ -50,11 +50,16 @@ class SherpaWakeWordEngine(
             "tokens.txt",
             "keywords.txt"
         )
+        val assetManager = context?.assets
+        if (assetManager == null) {
+            lastErrorMessage = "Android Context is unavailable; Sherpa-ONNX native inference requires an Android runtime."
+            return false
+        }
         return try {
-            val names = context.assets.list(modelDirInAssets)?.toSet().orEmpty()
+            val names = assetManager.list(modelDirInAssets)?.toSet().orEmpty()
             required.all { name ->
                 if (name !in names) return@all false
-                context.assets.open("$modelDirInAssets/$name").use { it.read() >= 0 }
+                assetManager.open("$modelDirInAssets/$name").use { it.read() >= 0 }
             }
         } catch (e: Throwable) {
             lastErrorMessage = "Sherpa model assets are unavailable: ${e.message ?: e.javaClass.simpleName}"
@@ -71,6 +76,12 @@ class SherpaWakeWordEngine(
         release()
         lastErrorMessage = null
 
+        val appContext = context
+        if (appContext == null) {
+            lastErrorMessage = "Android Context is unavailable; native Sherpa-ONNX initialization is not possible in a headless JVM test."
+            Log.e(TAG, lastErrorMessage!!)
+            return false
+        }
         if (!areAssetsAvailable()) {
             lastErrorMessage = lastErrorMessage
                 ?: "Missing encoder/decoder/joiner/tokens/keywords in assets/$modelDirInAssets."
@@ -104,7 +115,7 @@ class SherpaWakeWordEngine(
                 keywordsThreshold = triggerThreshold
             )
 
-            val nativeSpotter = KeywordSpotter(assetManager = context.assets, config = config)
+            val nativeSpotter = KeywordSpotter(assetManager = appContext.assets, config = config)
             val nativeStream = nativeSpotter.createStream()
 
             spotter = nativeSpotter
