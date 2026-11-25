@@ -5,9 +5,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="${ROOT_DIR}/app"
 KWS_DIR="${APP_DIR}/src/main/assets/kws-model"
 
-# This is the single source of truth for the pinned AAR checksum, official API classes,
-# JNI libraries and supported ABIs. It also downloads the AAR if a local checkout lacks it.
-bash "${ROOT_DIR}/scripts/prepare-sherpa-onnx-android.sh"
+# The workflow/local setup step runs prepare-sherpa-onnx-android.sh first. That script
+# verifies the pinned SHA-256, official Kotlin API classes, JNI libraries and all ABIs.
+AAR_FILE="${APP_DIR}/libs/sherpa-onnx-2.0.3.aar"
+if [[ ! -s "${AAR_FILE}" ]]; then
+  echo "ERROR: Verified Sherpa-ONNX AAR is missing. Run: bash scripts/prepare-sherpa-onnx-android.sh" >&2
+  exit 1
+fi
+echo "Verified Sherpa-ONNX AAR is present: ${AAR_FILE}"
 
 for model_file in \
   "encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx" \
